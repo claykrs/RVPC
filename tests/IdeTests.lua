@@ -4,6 +4,10 @@
 const fs = require("@lune/fs")
 const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
 const Ide = require("../core/Ide")
+const Memory = require("../core/Memory")
+const Cpu = require("../core/Cpu")
+const Pic = require("../core/Pic")
+const Machine = require("../core/Machine")
 
 const TESTS = {}
 
@@ -304,6 +308,9 @@ T("ata_identify_32m_geometry", function(expect)
 	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY did not assert DRQ")
 	const words = readWords(ide, 256)
 	expect(words[61] == 0 and words[62] == 1, "LBA28 capacity words are not 65536")
+	expect(band(words[50], 0x0100) ~= 0, "DMA capability bit missing")
+	expect(band(words[64], 0x0007) == 0x0007, "multiword DMA modes missing")
+	expect(band(words[83], 0x0100) ~= 0, "word82 DMA bit missing")
 	expect(words[2] == 65, "cylinders=" .. words[2])
 	expect(words[4] == 16, "heads=" .. words[4])
 	expect(words[7] == 63, "sectors/track=" .. words[7])
@@ -607,6 +614,208 @@ T("ata_mbr_boot_partition", function(expect)
 	end
 	buffer.writeu8(hdd, 446, 0)
 	expect(Ide.findBootPartition(hdd) == nil, "inactive MBR returned a boot partition")
+end)
+
+local function pciRead32(m, device, func, offset)
+	m.cpu.io.out32(0xCF8, bor(0x80000000, lshift(device, 11), lshift(func, 8), band(offset, 0xFC)))
+	return m.cpu.io.in32(0xCFC)
+end
+
+local function pciWrite32(m, device, func, offset, value)
+	m.cpu.io.out32(0xCF8, bor(0x80000000, lshift(device, 11), lshift(func, 8), band(offset, 0xFC)))
+	m.cpu.io.out32(0xCFC, value)
+end
+
+local function readPortBytes(io, port, count)
+	const out = buffer.create(count)
+	local index = 0
+	while index + 1 < count do
+		buffer.writeu16(out, index, io.in16(port))
+		index += 2
+	end
+	if index < count then
+		buffer.writeu8(out, index, io.in8(port))
+	end
+	return out
+end
+
+local function sendAtaCommand(m, base, lba, count, command)
+	const io = m.cpu.io
+	io.out8(base + 6, 0xE0)
+	io.out8(base + 2, band(count, 0xFF))
+	io.out8(base + 3, band(lba, 0xFF))
+	io.out8(base + 4, band(rshift(lba, 8), 0xFF))
+	io.out8(base + 5, band(rshift(lba, 16), 0xFF))
+	io.out8(base + 7, command)
+end
+
+T("piix3_pci_topology_and_bar_sizing", function(expect)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+	})
+	expect(pciRead32(m, 1, 0, 0x00) == 0x70008086, "ISA bridge ID")
+	expect(pciRead32(m, 1, 0, 0x08) == 0x06010000, "ISA bridge class")
+	expect(pciRead32(m, 1, 0, 0x0C) == 0x00800000, "ISA bridge multifunction header")
+	expect(pciRead32(m, 1, 1, 0x00) == 0x70108086, "IDE ID")
+	expect(pciRead32(m, 1, 1, 0x08) == 0x01018000, "IDE class/prog_if")
+	expect(pciRead32(m, 1, 1, 0x3C) == 0x0000010E, "IDE IRQ14/INTA#")
+
+	const bars = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
+	const masks = { 0xFFFFFFF9, 0xFFFFFFFF, 0xFFFFFFF9, 0xFFFFFFFF, 0xFFFFFFF1 }
+	for index = 1, 5 do
+		const offset = 0x10 + (index - 1) * 4
+		expect(
+			pciRead32(m, 1, 1, offset) == bor(bars[index], 1),
+			("BAR%d default=%08X"):format(index - 1, pciRead32(m, 1, 1, offset))
+		)
+		pciWrite32(m, 1, 1, offset, 0xFFFFFFFF)
+		expect(
+			pciRead32(m, 1, 1, offset) == masks[index],
+			("BAR%d size mask=%08X"):format(index - 1, pciRead32(m, 1, 1, offset))
+		)
+		pciWrite32(m, 1, 1, offset, bars[index])
+		expect(
+			pciRead32(m, 1, 1, offset) == bor(bars[index], 1),
+			("BAR%d restore=%08X"):format(index - 1, pciRead32(m, 1, 1, offset))
+		)
+	end
+end)
+
+T("ata_secondary_channel_and_irq15", function(expect)
+	const hdd = makeHdd()
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Pic = Pic, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		hdd2 = hdd,
+	})
+	expect(m.ide2 ~= nil, "secondary IDE missing")
+	if not m.ide2 then
+		return
+	end
+	expect(m.ide2.base == 0x170, ("secondary base=%04X"):format(m.ide2.base))
+	expect(m.ide2.irq == 15, ("secondary irq=%d"):format(m.ide2.irq))
+	const io = m.cpu.io
+
+	io.out8(0x176, 0xE0)
+	io.out8(0x177, 0xEC)
+	expect(band(io.in8(0x177), 0x08) ~= 0, "secondary IDENTIFY did not assert DRQ")
+	const words = {}
+	for index = 1, 256 do
+		words[index] = io.in16(0x170)
+	end
+	expect(words[1] == 0x0040, ("secondary word0=%04X"):format(words[1]))
+	expect(words[61] == 2048 and words[62] == 0, "secondary capacity is not 1 MiB")
+	expect(m.ide2:takeIrq(), "secondary IDENTIFY IRQ missing")
+
+	sendAtaCommand(m, 0x170, 63, 1, 0x20)
+	const sector = readPortBytes(io, 0x170, 512)
+	expect(buffer.readu8(sector, 0) == 0xA0, "secondary read marker")
+	expect(m.ide2.irqPending, "secondary read IRQ not pending")
+
+	m.pic.master.imr = 0
+	m.pic.slave.imr = 0
+	m.cpu.halted = true
+	m.cpu.flags = bor(band(m.cpu.flags, 0xFFFF), 0x202)
+	m.cpu.ss = 0
+	m.cpu:setSP(0x7000)
+	m:run(1)
+	expect(m.irqCount == 1, "irqCount=" .. m.irqCount)
+	expect(band(m.pic.slave.isr, 0x80) ~= 0, "IRQ15 not in service")
+	expect(band(m.pic.master.isr, 0x04) ~= 0, "IRQ15 cascade not in service")
+	expect(not m.ide2:takeIrq(), "secondary IRQ was not consumed by Machine.run")
+end)
+
+T("absent_drive_reports_abrt_without_irq", function(expect)
+	const ide = Ide.new({ hdd = makeHdd() })
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xEC)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "absent drive did not report ABRT")
+	expect(not ide.irqPending, "absent drive asserted the channel IRQ")
+end)
+
+T("ata_nien_suppresses_irq", function(expect)
+	const ide = Ide.new({ hdd = makeHdd() })
+	ide.deviceControl = 0x02
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x20)
+	expect(ide.irqPending, "PIO read did not latch IRQ")
+	expect(not ide:takeIrq(), "nIEN did not suppress the IRQ")
+	ide.deviceControl = 0
+	expect(ide:takeIrq(), "IRQ did not appear after clearing nIEN")
+end)
+
+T("piix3_bmdma_read_write", function(expect)
+	const hdd = makeHdd()
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		hdd = hdd,
+	})
+	const io = m.cpu.io
+	const bm = 0xC000
+
+	-- PRDT at 0x40000, one 512-byte entry at 0x50000, EOT set.
+	m.mem:write32(0x40000, 0x50000)
+	m.mem:write32(0x40004, bor(0x80000000, 512))
+	io.out32(bm + 4, 0x40000)
+	io.out8(bm + 2, 0x06)
+	io.out8(bm, 0x09) -- start + disk-to-memory
+	sendAtaCommand(m, 0x1F0, 0, 1, 0xC8)
+	expect(band(io.in8(0x1F7), 0x09) == 0, "DMA read left DRQ/ERR set")
+	expect(band(io.in8(bm + 2), 0x04) ~= 0, "BMIDE read INT missing")
+	expect(band(io.in8(bm + 2), 0x01) == 0, "BMIDE read still active")
+	compareBytes(expect, "BMIDE read", m.mem:copyTo(0x50000, 512), 0, hdd, 0, 512)
+	expect(m.ide:takeIrq(), "BMIDE read IRQ missing")
+
+	const source = buffer.create(512)
+	for index = 0, 511 do
+		buffer.writeu8(source, index, (index * 7 + 3) % 256)
+	end
+	m.mem:copyFrom(0x51000, source)
+	m.mem:write32(0x40000, 0x51000)
+	m.mem:write32(0x40004, bor(0x80000000, 512))
+	io.out8(bm + 2, 0x06)
+	io.out8(bm, 0x01) -- start + memory-to-disk
+	sendAtaCommand(m, 0x1F0, 1, 1, 0xCA)
+	expect(band(io.in8(0x1F7), 0x09) == 0, "DMA write left DRQ/ERR set")
+	expect(band(io.in8(bm + 2), 0x04) ~= 0, "BMIDE write INT missing")
+	compareBytes(expect, "BMIDE write", hdd, 512, source, 0, 512)
+	expect(m.ide:diskDirty(), "DMA write did not mark the disk dirty")
+	local first, last = m.ide:dirtySectorRange()
+	expect(first == 1 and last == 1, ("DMA dirty=%s..%s"):format(tostring(first), tostring(last)))
+	expect(m.ide:takeIrq(), "BMIDE write IRQ missing")
+end)
+
+T("atapi_bmdma_read", function(expect)
+	const iso = makeIso()
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		cdrom = iso,
+	})
+	const io = m.cpu.io
+	m.mem:write32(0x40000, 0x60000)
+	m.mem:write32(0x40004, bor(0x80000000, 2048))
+	io.out32(0xC004, 0x40000)
+	io.out8(0xC002, 0x06)
+	io.out8(0xC000, 0x09) -- start + disk-to-memory
+	io.out8(0x1F6, 0xF0) -- slave (CD)
+	io.out8(0x1F1, 0x01) -- PACKET DMA bit
+	io.out8(0x1F7, 0xA0)
+	const packet = { 0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 }
+	for index = 1, 12, 2 do
+		io.out16(0x1F0, bor(packet[index], lshift(packet[index + 1] or 0, 8)))
+	end
+	expect(band(io.in8(0x1F7), 0x08) == 0, "ATAPI DMA left DRQ set")
+	expect(band(io.in8(0xC002), 0x04) ~= 0, "ATAPI DMA INT missing")
+	const got = m.mem:copyTo(0x60000, 2048)
+	expect(buffer.readu8(got, 0) == 0x46 and buffer.readu8(got, 3) == 0x45, "ATAPI DMA image")
+	expect(m.ide:takeIrq(), "ATAPI DMA IRQ missing")
 end)
 
 if realIso then

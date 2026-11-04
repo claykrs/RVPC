@@ -12,6 +12,8 @@ local FwCfg = require("../core/FwCfg")
 local Ide = require("../core/Ide")
 local Kbc = require("../core/Kbc")
 local Fpu = require("../core/Fpu")
+local Dma = require("../core/Dma")
+local Sb16 = require("../core/Sb16")
 local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
@@ -34,6 +36,8 @@ local ispTests = require("../tests/IspTests")
 local vgaSinkTests = require("../tests/VgaSinkTests")
 local networkTests = require("../tests/NetworkTests")
 local vbeTests = require("../tests/VbeTests")
+local dmaTests = require("../tests/DmaTests")
+local sb16Tests = require("../tests/Sb16Tests")
 local inputMapTests = require("../tests/InputMapTests")
 
 const deps = {
@@ -48,6 +52,8 @@ const deps = {
 	Ide = Ide,
 	Kbc = Kbc,
 	Fpu = Fpu,
+	Dma = Dma,
+	Sb16 = Sb16,
 	Ne2000 = Ne2000,
 	Isp = Isp,
 	Xms = Xms,
@@ -110,6 +116,8 @@ runDirectSuite("isp", ispTests)
 runDirectSuite("vga", vgaSinkTests)
 runDirectSuite("network", networkTests)
 runDirectSuite("vbe", vbeTests)
+runDirectSuite("dma", dmaTests)
+runDirectSuite("sb16", sb16Tests)
 runDirectSuite("inputmap", inputMapTests)
 
 print(("passed assertions: %d"):format(passed))

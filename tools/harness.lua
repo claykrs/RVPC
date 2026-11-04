@@ -18,6 +18,8 @@ const FwCfg = require("../core/FwCfg")
 const Ide = require("../core/Ide")
 const Kbc = require("../core/Kbc")
 const Fpu = require("../core/Fpu")
+const Dma = require("../core/Dma")
+const Sb16 = require("../core/Sb16")
 const Ne2000 = require("../core/Ne2000")
 const Isp = require("../core/Isp")
 const Xms = require("../core/Xms")
@@ -86,6 +88,8 @@ const machine = Machine.new({
 	Ide = Ide,
 	Kbc = Kbc,
 	Fpu = Fpu,
+	Dma = Dma,
+	Sb16 = Sb16,
 	Ne2000 = Ne2000,
 	Isp = Isp,
 	Xms = Xms,
@@ -452,6 +456,18 @@ if machine.ide then
 			machine.ide.identifyCount,
 			machine.ide.packetCount,
 			machine.ide.selectedIndex
+		)
+	)
+end
+if machine.ide2 then
+	print(
+		("IDE2: commands=%d last=%02X identify=%d packet=%d selected=%d irq=%d"):format(
+			machine.ide2.commandCount,
+			machine.ide2.lastCommand,
+			machine.ide2.identifyCount,
+			machine.ide2.packetCount,
+			machine.ide2.selectedIndex,
+			machine.ide2.irq
 		)
 	)
 end

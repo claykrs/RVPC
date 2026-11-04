@@ -34,6 +34,8 @@ export type Deps = {
 	Ide: any?,
 	Kbc: any?,
 	Fpu: any?,
+	Dma: any?,
+	Sb16: any?,
 	Ne2000: any?,
 	Isp: any?,
 	Xms: any?,
@@ -58,7 +60,10 @@ export type Config = {
 	vgaRom: buffer?,
 	hdd: buffer?,
 	cdrom: buffer?,
+	hdd2: buffer?,
+	cdrom2: buffer?,
 	network: NetworkConfig?,
+	audioSink: ((samples: buffer) -> ())?,
 }
 
 export type Machine = typeof(setmetatable(
@@ -71,8 +76,11 @@ export type Machine = typeof(setmetatable(
 		cmos: any?,
 		fwcfg: any?,
 		ide: any?,
+		ide2: any?,
 		kbc: any?,
 		fpu: any?,
+		dma: any?,
+		sb16: any?,
 		ne2000: any?,
 		isp: any?,
 		xms: any?,
@@ -81,6 +89,11 @@ export type Machine = typeof(setmetatable(
 		exitCode: number?,
 		config: Config,
 		pciAddress: number,
+		vgaBar: number,
+		ideBars: { number },
+		ideBarProbe: { boolean },
+		ideCommand: number,
+		sb16Clock: number,
 		lastInPort: number,
 		lastOutPort: number,
 		lastOutValue: number,
@@ -144,24 +157,57 @@ local function vgaDword(machine: any, offset: number): number
 	return 0
 end
 
--- PIIX3-style IDE function at 00:01.0. prog_if=0 makes SeaBIOS use the legacy
--- 0x1F0/0x3F6 task file instead of PCI BARs.
--- Only the primary channel is modelled: 0x170/0x376 and IRQ15 are absent, so
--- those ports read as open bus. The Win98 installer path uses the primary
--- master HDD plus the primary slave CD-ROM pair.
-local function ideDword(offset: number): number
+-- PIIX3 topology: ISA bridge at 00:01.0 (multifunction), IDE at 00:01.1.
+-- The IDE function advertises bus-master capability (prog_if 0x80) while both
+-- channels remain in legacy mode, so SeaBIOS and the Win98 PIIX3 driver use
+-- 0x1F0/0x3F6/IRQ14 and 0x170/0x376/IRQ15.
+const IDE_BAR_DEFAULTS = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
+const IDE_BAR_SIZES = { 8, 2, 8, 2, 16 }
+
+local function isaBridgeDword(offset: number): number
+	if offset == 0x00 then
+		return 0x70008086 -- Intel PIIX3 ISA bridge
+	elseif offset == 0x04 then
+		return 0x00000007 -- I/O + memory + bus master decode
+	elseif offset == 0x08 then
+		return 0x06010000 -- ISA bridge, revision 0
+	elseif offset == 0x0C then
+		return 0x00800000 -- header type 0x80: multifunction device
+	elseif offset == 0x2C then
+		return 0x11001AF4 -- Red Hat/QEMU subsystem
+	end
+	return 0
+end
+
+local function ideBarMask(index: number): number
+	return bit32.bnot(IDE_BAR_SIZES[index] - 1)
+end
+
+local function ideBarDword(machine: any, index: number): number
+	const mask = ideBarMask(index)
+	if machine.ideBarProbe[index] then
+		return bor(mask, 1)
+	end
+	const base = machine.ideBars[index] or IDE_BAR_DEFAULTS[index]
+	return bor(band(base, mask), 1)
+end
+
+local function ideDword(machine: any, offset: number): number
 	if offset == 0x00 then
 		return 0x70108086 -- Intel PIIX3 IDE
 	elseif offset == 0x04 then
-		return 0x00000007
+		return bor(band(machine.ideCommand or 0x00000007, 0xFFFF), 0x02800000)
 	elseif offset == 0x08 then
-		return 0x01010000 -- IDE controller, legacy programming interface
+		return 0x01018000 -- IDE controller, bus-master programming interface
 	elseif offset == 0x0C then
-		return 0x00000000
+		return 0x00000000 -- type 0 header, single function
+	elseif offset >= 0x10 and offset <= 0x20 and band(offset, 3) == 0 then
+		const index = math.floor((offset - 0x10) / 4) + 1
+		return ideBarDword(machine, index)
 	elseif offset == 0x2C then
 		return 0x11001AF4
 	elseif offset == 0x3C then
-		return 0x00000E00 -- IRQ14
+		return 0x0000010E -- interrupt line 14, INTA#
 	end
 	return 0
 end
@@ -178,7 +224,9 @@ local function pciRead(machine: any, address: number): number
 		if device == 0 and functionNumber == 0 then
 			return hostBridgeDword(machine, offset)
 		elseif device == 1 and functionNumber == 0 then
-			return ideDword(offset)
+			return isaBridgeDword(offset)
+		elseif device == 1 and functionNumber == 1 then
+			return ideDword(machine, offset)
 		elseif device == 2 and functionNumber == 0 then
 			return vgaDword(machine, offset)
 		end
@@ -200,6 +248,33 @@ local function pciWrite(machine: any, address: number, value: number)
 			machine.vgaBar = 0xFFC00000
 		else
 			machine.vgaBar = band(value, 0xFFC00000)
+		end
+		return
+	end
+	if bus == 0 and device == 1 and functionNumber == 1 then
+		if offset == 0x04 then
+			machine.ideCommand = band(value, 0xFFFFFFFF)
+			return
+		end
+		if offset >= 0x10 and offset <= 0x20 and band(offset, 3) == 0 then
+			const index = math.floor((offset - 0x10) / 4) + 1
+			const mask = ideBarMask(index)
+			if value == 0xFFFFFFFF then
+				machine.ideBarProbe[index] = true
+				return
+			end
+			machine.ideBarProbe[index] = false
+			const base = band(value, mask)
+			machine.ideBars[index] = base
+			if index == 5 then
+				if machine.ide then
+					machine.ide.bmBase = base
+				end
+				if machine.ide2 then
+					machine.ide2.bmBase = base + 8
+				end
+			end
+			return
 		end
 		return
 	end
@@ -243,7 +318,21 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		self.fwcfg = deps.FwCfg.new(self.mem.size, cfg.vgaRom)
 	end
 	if deps.Ide then
-		self.ide = deps.Ide.new({ hdd = cfg.hdd, cdrom = cfg.cdrom })
+		self.ide = deps.Ide.new({
+			hdd = cfg.hdd,
+			cdrom = cfg.cdrom,
+			mem = self.mem,
+			bmBase = 0xC000,
+		})
+		self.ide2 = deps.Ide.new({
+			hdd = cfg.hdd2,
+			cdrom = cfg.cdrom2,
+			base = 0x170,
+			altBase = 0x376,
+			irq = deps.Ide.IRQ_SECONDARY or 15,
+			mem = self.mem,
+			bmBase = 0xC008,
+		})
 	end
 	const network = cfg.network
 	const networkEnabled = network == nil or network.enabled ~= false
@@ -266,6 +355,30 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	if deps.Fpu then
 		self.fpu = deps.Fpu.new()
 	end
+	if deps.Dma then
+		self.dma = deps.Dma.new({
+			read8 = function(address: number): number
+				return self.mem:read8(address)
+			end,
+			read16 = function(address: number): number
+				return self.mem:read16(address)
+			end,
+			write8 = function(address: number, value: number)
+				self.mem:write8(address, value)
+			end,
+			write16 = function(address: number, value: number)
+				self.mem:write16(address, value)
+			end,
+		})
+	end
+	if deps.Sb16 then
+		self.sb16 = deps.Sb16.new({
+			dma = self.dma,
+			dmaChannel = 1,
+			irq = 5,
+			sink = cfg.audioSink or function(_samples: buffer) end,
+		})
+	end
 	if deps.Uart then
 		self.uart = deps.Uart.new(cfg.serial)
 	end
@@ -274,6 +387,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	end
 	self.pciAddress = 0
 	self.vgaBar = 0xE0000000
+	self.ideBars = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
+	self.ideBarProbe = { false, false, false, false, false }
+	self.ideCommand = 0x00000007
+	self.sb16Clock = 0
 	self.hostConfig = {}
 	self.lastInPort = 0
 	self.lastOutPort = 0
@@ -295,11 +412,43 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.fwcfg and (port == 0x510 or port == 0x511) then
 				return self.fwcfg:in8(port)
 			end
+			if
+				self.dma
+				and (
+					port <= 0x0F
+					or (port >= 0xC0 and port <= 0xDF)
+					or port == 0x81
+					or port == 0x82
+					or port == 0x83
+					or port == 0x87
+					or port == 0x89
+					or port == 0x8A
+					or port == 0x8B
+				)
+			then
+				return self.dma:in8(port)
+			end
+			if
+				self.sb16
+				and ((port >= 0x220 and port <= 0x22F) or port == 0x388 or port == 0x389)
+			then
+				return self.sb16:in8(port)
+			end
 			if self.kbc and (port == 0x60 or port == 0x64) then
 				return self.kbc:in8(port)
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
 				return self.ide:in8(port)
+			end
+			if self.ide2 and ((port >= 0x170 and port <= 0x177) or port == 0x376) then
+				return self.ide2:in8(port)
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				return self.ide:bmIn8(port)
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				return self.ide2:bmIn8(port)
 			end
 			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
 				return self.ne2000:in8(port)
@@ -351,6 +500,16 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.ide and port == 0x1F0 then
 				return self.ide:in16(port)
 			end
+			if self.ide2 and port == 0x170 then
+				return self.ide2:in16(port)
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				return self.ide:bmIn16(port)
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				return self.ide2:bmIn16(port)
+			end
 			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
 				return self.ne2000:in16(port)
 			end
@@ -369,6 +528,19 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return self.pciAddress
 			elseif port == PCI_DATA then
 				return pciRead(self, self.pciAddress)
+			end
+			if self.ide and port == 0x1F0 then
+				return bor(self.ide:in16(port), lshift(self.ide:in16(port), 16))
+			end
+			if self.ide2 and port == 0x170 then
+				return bor(self.ide2:in16(port), lshift(self.ide2:in16(port), 16))
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				return self.ide:bmIn32(port)
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				return self.ide2:bmIn32(port)
 			end
 			return bor(
 				io.in8(port),
@@ -389,12 +561,49 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.fwcfg:out8(port, value)
 				return
 			end
+			if
+				self.dma
+				and (
+					port <= 0x0F
+					or (port >= 0xC0 and port <= 0xDF)
+					or port == 0x81
+					or port == 0x82
+					or port == 0x83
+					or port == 0x87
+					or port == 0x89
+					or port == 0x8A
+					or port == 0x8B
+				)
+			then
+				self.dma:out8(port, value)
+				return
+			end
+			if
+				self.sb16
+				and ((port >= 0x220 and port <= 0x22F) or port == 0x388 or port == 0x389)
+			then
+				self.sb16:out8(port, value)
+				return
+			end
 			if self.kbc and (port == 0x60 or port == 0x64) then
 				self.kbc:out8(port, value)
 				return
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
 				self.ide:out8(port, value)
+				return
+			end
+			if self.ide2 and ((port >= 0x170 and port <= 0x177) or port == 0x376) then
+				self.ide2:out8(port, value)
+				return
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				self.ide:bmOut8(port, value)
+				return
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				self.ide2:bmOut8(port, value)
 				return
 			end
 			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
@@ -461,6 +670,19 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.ide:out16(port, value)
 				return
 			end
+			if self.ide2 and port == 0x170 then
+				self.ide2:out16(port, value)
+				return
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				self.ide:bmOut16(port, value)
+				return
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				self.ide2:bmOut16(port, value)
+				return
+			end
 			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
 				self.ne2000:out16(port, value)
 				return
@@ -484,6 +706,25 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return
 			elseif port == PCI_DATA then
 				pciWrite(self, self.pciAddress, value)
+				return
+			end
+			if self.ide and port == 0x1F0 then
+				self.ide:out16(port, band(value, 0xFFFF))
+				self.ide:out16(port, band(rshift(value, 16), 0xFFFF))
+				return
+			end
+			if self.ide2 and port == 0x170 then
+				self.ide2:out16(port, band(value, 0xFFFF))
+				self.ide2:out16(port, band(rshift(value, 16), 0xFFFF))
+				return
+			end
+			const bmBase = self.ideBars[5]
+			if bmBase ~= 0 and self.ide and port >= bmBase and port <= bmBase + 7 then
+				self.ide:bmOut32(port, value)
+				return
+			end
+			if bmBase ~= 0 and self.ide2 and port >= bmBase + 8 and port <= bmBase + 15 then
+				self.ide2:bmOut32(port, value)
 				return
 			end
 			io.out8(port, band(value, 0xFF))
@@ -527,12 +768,22 @@ function Machine.reset(self: Machine)
 	if self.ide then
 		self.ide:reset()
 	end
+	if self.ide2 then
+		self.ide2:reset()
+	end
 	if self.ne2000 then
 		self.ne2000:reset()
 	end
 	if self.kbc then
 		self.kbc:reset()
 	end
+	if self.dma then
+		self.dma:reset()
+	end
+	if self.sb16 then
+		self.sb16:resetDsp()
+	end
+	self.sb16Clock = 0
 	self.exitCode = nil
 end
 
@@ -577,8 +828,18 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			if self.ide and self.ide:takeIrq() then
 				self.pic:raise(14)
 			end
+			if self.ide2 and self.ide2:takeIrq() then
+				self.pic:raise(15)
+			end
 			if self.ne2000 and self.ne2000:takeIrq() then
 				self.pic:raise(10)
+			end
+			if self.sb16 and self.sb16:takeIrq() then
+				self.pic:raise(5)
+			end
+			self.sb16Clock += 1
+			if self.sb16 and self.sb16Clock % 1024 == 0 then
+				self.sb16:tick()
 			end
 		end
 		if self.cpu.halted then

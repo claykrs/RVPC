@@ -13,18 +13,15 @@ const Ide = {}
 Ide.__index = Ide
 
 const DATA = 0x1F0
-const ERROR = 0x1F1
-const FEATURES = 0x1F1
-const SECTOR_COUNT = 0x1F2
-const LBA0 = 0x1F3
-const LBA1 = 0x1F4
-const LBA2 = 0x1F5
-const DRIVE_HEAD = 0x1F6
-const STATUS = 0x1F7
-const COMMAND = 0x1F7
 const ALT_STATUS = 0x3F6
-const DEVICE_CONTROL = 0x3F6
 const IRQ = 14
+const IRQ_SECONDARY = 15
+const BM_CMD_START = 0x01
+const BM_CMD_MEMWRITE = 0x08
+const BM_STATUS_ACTIVE = 0x01
+const BM_STATUS_ERROR = 0x02
+const BM_STATUS_INT = 0x04
+const BM_STATUS_DMA_CAP = 0x20
 
 const ST_ERR = 0x01
 const ST_DRQ = 0x08
@@ -34,6 +31,10 @@ const ST_DRDY = 0x40
 const ATA_IDENTIFY = 0xEC
 const ATA_READ = 0x20
 const ATA_WRITE = 0x30
+const ATA_READ_DMA = 0xC8
+const ATA_WRITE_DMA = 0xCA
+const ATA_READ_DMA_EXT = 0x25
+const ATA_WRITE_DMA_EXT = 0x35
 const ATA_FLUSH = 0xE7
 const ATA_SET_FEATURES = 0xEF
 const ATA_IDENTIFY_PACKET = 0xA1
@@ -79,6 +80,11 @@ export type Transfer = {
 export type Config = {
 	hdd: buffer?,
 	cdrom: buffer?,
+	base: number?,
+	altBase: number?,
+	irq: number?,
+	bmBase: number?,
+	mem: any?,
 }
 
 export type Ide = typeof(setmetatable(
@@ -87,6 +93,14 @@ export type Ide = typeof(setmetatable(
 		slave: Drive,
 		selected: Drive,
 		selectedIndex: number,
+		base: number,
+		altBase: number,
+		irq: number,
+		bmBase: number,
+		mem: any?,
+		bmCmd: number,
+		bmStatus: number,
+		bmPrdt: number,
 		lba: number,
 		sectorCount: number,
 		driveHead: number,
@@ -94,6 +108,8 @@ export type Ide = typeof(setmetatable(
 		transfer: Transfer?,
 		packet: buffer,
 		packetPos: number,
+		features: number,
+		atapiDma: boolean,
 		irqPending: boolean,
 		lastError: number,
 		senseKey: number,
@@ -114,6 +130,12 @@ export type Ide = typeof(setmetatable(
 		out8: (self: Ide, port: number, value: number) -> (),
 		in16: (self: Ide, port: number) -> number,
 		out16: (self: Ide, port: number, value: number) -> (),
+		bmIn8: (self: Ide, port: number) -> number,
+		bmOut8: (self: Ide, port: number, value: number) -> (),
+		bmIn16: (self: Ide, port: number) -> number,
+		bmOut16: (self: Ide, port: number, value: number) -> (),
+		bmIn32: (self: Ide, port: number) -> number,
+		bmOut32: (self: Ide, port: number, value: number) -> (),
 		takeIrq: (self: Ide) -> boolean,
 		reset: (self: Ide) -> (),
 	},
@@ -138,6 +160,14 @@ function Ide.new(config: Config?): Ide
 	self.slave = newDrive("cdrom", cfg.cdrom, cfg.cdrom ~= nil)
 	self.selected = self.master
 	self.selectedIndex = 0
+	self.base = cfg.base or DATA
+	self.altBase = cfg.altBase or ALT_STATUS
+	self.irq = cfg.irq or IRQ
+	self.bmBase = cfg.bmBase or 0xC000
+	self.mem = cfg.mem
+	self.bmCmd = 0
+	self.bmStatus = BM_STATUS_DMA_CAP
+	self.bmPrdt = 0
 	self.lba = 0
 	self.sectorCount = 0
 	self.driveHead = 0
@@ -145,6 +175,8 @@ function Ide.new(config: Config?): Ide
 	self.transfer = nil
 	self.packet = buffer.create(16)
 	self.packetPos = 0
+	self.features = 0
+	self.atapiDma = false
 	self.irqPending = false
 	self.lastError = 0
 	self.senseKey = 0
@@ -166,6 +198,8 @@ function Ide.reset(self: Ide)
 	self.selectedIndex = 0
 	self.transfer = nil
 	self.packetPos = 0
+	self.features = 0
+	self.atapiDma = false
 	self.irqPending = false
 	self.deviceControl = 0
 	self.master.status = if self.master.present then bor(ST_DRDY, ST_DSC) else 0
@@ -176,6 +210,9 @@ function Ide.reset(self: Ide)
 	self.senseAsc = 0
 	self.senseAscq = 0
 	self.mediaLocked = false
+	self.bmCmd = 0
+	self.bmStatus = BM_STATUS_DMA_CAP
+	self.bmPrdt = 0
 end
 
 local function putWord(buf: buffer, index: number, value: number)
@@ -212,9 +249,10 @@ local function identify(drive: Drive): buffer
 	if drive.kind == "cdrom" then
 		putWord(out, 0, 0x85C0) -- ATAPI packet device
 		putWord(out, 1, 0)
-		putWord(out, 49, 0x0200) -- LBA supported
+		putWord(out, 49, 0x0300) -- DMA + LBA supported
+		putWord(out, 63, 0x0007) -- multiword DMA modes 0-2
 		putWord(out, 80, 0x0004) -- ATA/ATAPI-2
-		putWord(out, 82, 0x0000)
+		putWord(out, 82, 0x0100) -- DMA
 		putAtaString(out, 54, "RVPC VIRTUAL CD", 40)
 		return out
 	end
@@ -229,11 +267,14 @@ local function identify(drive: Drive): buffer
 	putWord(out, 1, cylinders) -- cylinders
 	putWord(out, 3, heads) -- heads
 	putWord(out, 6, sectorsPerTrack) -- sectors/track
-	putWord(out, 49, 0x0200) -- LBA
+	putWord(out, 49, 0x0300) -- DMA + LBA
 	putWord(out, 60, band(total, 0xFFFF))
 	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
+	putWord(out, 63, 0x0007) -- multiword DMA modes 0-2
+	putWord(out, 65, 0x0078) -- 120 ns minimum multiword DMA cycle
+	putWord(out, 66, 0x0078)
 	putWord(out, 80, 0x0004) -- ATA-2
-	putWord(out, 82, 0x4000) -- LBA
+	putWord(out, 82, 0x4100) -- DMA + LBA
 	putAtaString(out, 54, "RVPC VIRTUAL HDD", 40)
 	return out
 end
@@ -244,10 +285,22 @@ local function finish(self: Ide, status: number)
 	self.irqPending = true
 end
 
+local dmaFinish: (self: Ide, ok: boolean) -> ()
+local dmaBufferToGuest: (self: Ide, data: buffer) -> boolean
+
 local function beginRead(self: Ide, data: buffer)
 	const length = buffer.len(data)
 	if length == 0 then
 		finish(self, bor(ST_DRDY, ST_DSC))
+		return
+	end
+	if self.atapiDma then
+		self.atapiDma = false
+		self.bmStatus = bor(
+			band(self.bmStatus, bit32.bnot(bor(BM_STATUS_ERROR, BM_STATUS_INT))),
+			BM_STATUS_ACTIVE
+		)
+		dmaFinish(self, dmaBufferToGuest(self, data))
 		return
 	end
 	self.transfer = {
@@ -311,6 +364,142 @@ end
 -- the image is clean.
 function Ide.dirtySectorRange(self: Ide): (number?, number?)
 	return self.dirtyFirstSector, self.dirtyLastSector
+end
+
+-- BDMA helpers. The bus-master engine walks the guest's PRDT in physical
+-- memory and moves whole ATA sectors. Memory access is injected through the
+-- host-owned Memory object; the IDE core never touches a filesystem.
+local function memRead32(mem: any, addr: number): number
+	return mem:read32(addr)
+end
+
+local function memCopyTo(mem: any, addr: number, length: number): buffer
+	return mem:copyTo(addr, length)
+end
+
+local function memCopyFrom(mem: any, addr: number, data: buffer)
+	mem:copyFrom(addr, data)
+end
+
+local function dmaReady(self: Ide, read: boolean): boolean
+	if not self.mem or self.bmPrdt == 0 or band(self.bmCmd, BM_CMD_START) == 0 then
+		return false
+	end
+	return (band(self.bmCmd, BM_CMD_MEMWRITE) ~= 0) == read
+end
+
+function dmaBufferToGuest(self: Ide, data: buffer): boolean
+	const mem = self.mem
+	if not mem then
+		return false
+	end
+	local address = self.bmPrdt
+	local offset = 0
+	const total = buffer.len(data)
+	local entries = 0
+	while offset < total and entries < 4096 do
+		const bufferAddress = memRead32(mem, address)
+		const sizeWord = memRead32(mem, address + 4)
+		local count = band(sizeWord, 0xFFFE)
+		if count == 0 then
+			count = 0x10000
+		end
+		const last = band(sizeWord, 0x80000000) ~= 0
+		const chunk = math.min(count, total - offset)
+		if chunk > 0 then
+			const piece = buffer.create(chunk)
+			buffer.copy(piece, 0, data, offset, chunk)
+			memCopyFrom(mem, bufferAddress, piece)
+			offset += chunk
+		end
+		address += 8
+		entries += 1
+		if last then
+			break
+		end
+	end
+	return offset == total
+end
+
+local function dmaGuestToBuffer(self: Ide, data: buffer): boolean
+	const mem = self.mem
+	if not mem then
+		return false
+	end
+	local address = self.bmPrdt
+	local offset = 0
+	const total = buffer.len(data)
+	local entries = 0
+	while offset < total and entries < 4096 do
+		const bufferAddress = memRead32(mem, address)
+		const sizeWord = memRead32(mem, address + 4)
+		local count = band(sizeWord, 0xFFFE)
+		if count == 0 then
+			count = 0x10000
+		end
+		const last = band(sizeWord, 0x80000000) ~= 0
+		const chunk = math.min(count, total - offset)
+		if chunk > 0 then
+			const piece = memCopyTo(mem, bufferAddress, chunk)
+			buffer.copy(data, offset, piece, 0, chunk)
+			offset += chunk
+		end
+		address += 8
+		entries += 1
+		if last then
+			break
+		end
+	end
+	return offset == total
+end
+
+function dmaFinish(self: Ide, ok: boolean)
+	if ok then
+		self.selected.status = bor(ST_DRDY, ST_DSC)
+		self.bmStatus = bor(
+			band(self.bmStatus, bit32.bnot(bor(BM_STATUS_ACTIVE, BM_STATUS_ERROR))),
+			BM_STATUS_INT
+		)
+	else
+		self.selected.error = 0x04
+		self.lastError = 0x04
+		self.selected.status = bor(ST_DRDY, ST_ERR)
+		self.bmStatus =
+			bor(band(self.bmStatus, bit32.bnot(BM_STATUS_ACTIVE)), BM_STATUS_ERROR, BM_STATUS_INT)
+	end
+	self.transfer = nil
+	self.irqPending = true
+end
+
+local function dmaRead(self: Ide, drive: Drive, lba: number, count: number)
+	const image = drive.image
+	if not image then
+		dmaFinish(self, false)
+		return
+	end
+	self.bmStatus =
+		bor(band(self.bmStatus, bit32.bnot(bor(BM_STATUS_ERROR, BM_STATUS_INT))), BM_STATUS_ACTIVE)
+	const data = buffer.create(count * 512)
+	buffer.copy(data, 0, image, lba * 512, count * 512)
+	dmaFinish(self, dmaBufferToGuest(self, data))
+end
+
+local function dmaWrite(self: Ide, drive: Drive, lba: number, count: number)
+	const image = drive.image
+	if not image then
+		dmaFinish(self, false)
+		return
+	end
+	self.bmStatus =
+		bor(band(self.bmStatus, bit32.bnot(bor(BM_STATUS_ERROR, BM_STATUS_INT))), BM_STATUS_ACTIVE)
+	const data = buffer.create(count * 512)
+	if not dmaGuestToBuffer(self, data) then
+		dmaFinish(self, false)
+		return
+	end
+	buffer.copy(image, lba * 512, data, 0, count * 512)
+	markDiskDirty(self, lba, count)
+	dmaFinish(self, true)
 end
 
 local function failCommand(self: Ide, errorCode: number)
@@ -803,10 +992,18 @@ local function command(self: Ide, cmd: number)
 	self.lastCommand = cmd
 	const drive = self.selected
 	if not drive.present then
-		failCommand(self, 0x04)
+		-- No device on this position: report ABRT without asserting the shared
+		-- channel IRQ. SeaBIOS probes both secondary positions and must not
+		-- leave a stale IRQ15 pending for Windows.
+		drive.error = 0x04
+		self.lastError = 0x04
+		drive.status = bor(ST_DRDY, ST_ERR)
+		self.transfer = nil
+		self.irqPending = false
 		return
 	end
 	self.transfer = nil
+	self.atapiDma = false
 	drive.error = 0
 	self.lastError = 0
 	if cmd == ATA_IDENTIFY then
@@ -825,7 +1022,7 @@ local function command(self: Ide, cmd: number)
 		end
 		beginRead(self, identify(drive))
 		self.irqPending = true
-	elseif cmd == ATA_READ then
+	elseif cmd == ATA_READ or cmd == ATA_READ_DMA or cmd == ATA_READ_DMA_EXT then
 		const count = if self.sectorCount == 0 then 256 else self.sectorCount
 		const image = drive.image
 		const total = capacitySectors(drive, 512)
@@ -833,11 +1030,20 @@ local function command(self: Ide, cmd: number)
 			failCommand(self, 0x10)
 			return
 		end
+		const canDma = dmaReady(self, true)
+		if cmd ~= ATA_READ and (drive.kind ~= "hdd" or not canDma) then
+			failCommand(self, 0x04)
+			return
+		end
+		if canDma then
+			dmaRead(self, drive, self.lba, count)
+			return
+		end
 		const data = buffer.create(count * 512)
 		buffer.copy(data, 0, image, self.lba * 512, count * 512)
 		beginRead(self, data)
 		self.irqPending = true
-	elseif cmd == ATA_WRITE then
+	elseif cmd == ATA_WRITE or cmd == ATA_WRITE_DMA or cmd == ATA_WRITE_DMA_EXT then
 		if drive.kind ~= "hdd" then
 			failCommand(self, 0x04)
 			return
@@ -849,8 +1055,15 @@ local function command(self: Ide, cmd: number)
 			failCommand(self, 0x10)
 			return
 		end
-		beginWrite(self, self.lba, count * 512)
-		self.irqPending = true
+		if cmd == ATA_WRITE and not dmaReady(self, false) then
+			beginWrite(self, self.lba, count * 512)
+			self.irqPending = true
+			return
+		elseif dmaReady(self, false) then
+			dmaWrite(self, drive, self.lba, count)
+			return
+		end
+		failCommand(self, 0x04)
 	elseif cmd == ATA_PACKET then
 		self.packetCount += 1
 		if drive.kind ~= "cdrom" then
@@ -858,6 +1071,7 @@ local function command(self: Ide, cmd: number)
 			return
 		end
 		self.packetPos = 0
+		self.atapiDma = band(self.features, 0x01) ~= 0 and dmaReady(self, true)
 		drive.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
 	elseif
 		cmd == ATA_FLUSH
@@ -927,7 +1141,8 @@ end
 
 function Ide.out8(self: Ide, port: number, value: number)
 	value = band(value, 0xFF)
-	if port == DATA then
+	const offset = port - self.base
+	if offset == 0 then
 		if self.transfer and self.transfer.write then
 			writeDataByte(self, value)
 		elseif
@@ -941,60 +1156,61 @@ function Ide.out8(self: Ide, port: number, value: number)
 				atapiPacket(self)
 			end
 		end
-	elseif port == FEATURES then
-		-- Features register is only used by SET FEATURES; nothing to store.
-	elseif port == SECTOR_COUNT then
+	elseif offset == 1 then
+		self.features = value
+	elseif offset == 2 then
 		self.sectorCount = value
-	elseif port == LBA0 then
+	elseif offset == 3 then
 		self.lba = bor(band(self.lba, 0xFFFFF00), value)
-	elseif port == LBA1 then
+	elseif offset == 4 then
 		self.lba = bor(band(self.lba, 0xFFFF00FF), lshift(value, 8))
-	elseif port == LBA2 then
+	elseif offset == 5 then
 		self.lba = bor(band(self.lba, 0xFF00FFFF), lshift(value, 16))
-	elseif port == DRIVE_HEAD then
+	elseif offset == 6 then
 		self.driveHead = value
 		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
 		self.selected = if self.selectedIndex == 0 then self.master else self.slave
 		if band(value, 0x40) ~= 0 then
 			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
 		end
-	elseif port == COMMAND then
+	elseif offset == 7 then
 		command(self, value)
-	elseif port == DEVICE_CONTROL then
+	elseif port == self.altBase then
 		self.deviceControl = value
 	end
 end
 
 function Ide.in8(self: Ide, port: number): number
-	if port == DATA then
+	const offset = port - self.base
+	if offset == 0 then
 		return readDataByte(self)
-	elseif port == ERROR then
+	elseif offset == 1 then
 		return self.selected.error
-	elseif port == SECTOR_COUNT then
+	elseif offset == 2 then
 		return self.sectorCount
-	elseif port == LBA0 then
+	elseif offset == 3 then
 		return band(self.lba, 0xFF)
-	elseif port == LBA1 then
+	elseif offset == 4 then
 		return band(rshift(self.lba, 8), 0xFF)
-	elseif port == LBA2 then
+	elseif offset == 5 then
 		return band(rshift(self.lba, 16), 0xFF)
-	elseif port == DRIVE_HEAD then
+	elseif offset == 6 then
 		return self.driveHead
-	elseif port == STATUS or port == ALT_STATUS then
+	elseif offset == 7 or port == self.altBase then
 		return self.selected.status
 	end
 	return 0xFF
 end
 
 function Ide.in16(self: Ide, port: number): number
-	if port == DATA then
+	if port == self.base then
 		return readDataWord(self)
 	end
 	return bor(self:in8(port), lshift(self:in8(port + 1), 8))
 end
 
 function Ide.out16(self: Ide, port: number, value: number)
-	if port == DATA then
+	if port == self.base then
 		if self.transfer and self.transfer.write then
 			writeDataWord(self, value)
 		elseif
@@ -1014,11 +1230,87 @@ function Ide.out16(self: Ide, port: number, value: number)
 	self:out8(port + 1, band(rshift(value, 8), 0xFF))
 end
 
+function Ide.bmIn8(self: Ide, port: number): number
+	const offset = port - self.bmBase
+	if offset == 0 then
+		return self.bmCmd
+	elseif offset == 2 then
+		return self.bmStatus
+	elseif offset >= 4 and offset <= 7 then
+		return band(rshift(self.bmPrdt, (offset - 4) * 8), 0xFF)
+	end
+	return 0
+end
+
+function Ide.bmOut8(self: Ide, port: number, value: number)
+	value = band(value, 0xFF)
+	const offset = port - self.bmBase
+	if offset == 0 then
+		self.bmCmd = band(value, 0x09)
+		if band(value, BM_CMD_START) == 0 then
+			self.bmStatus = band(self.bmStatus, bit32.bnot(BM_STATUS_ACTIVE))
+		end
+	elseif offset == 1 then
+		-- Reserved.
+	elseif offset == 2 then
+		-- Writing 1 clears interrupt/error; command/capability bits survive.
+		self.bmStatus = band(self.bmStatus, bit32.bnot(band(value, 0x06)))
+	elseif offset >= 4 and offset <= 7 then
+		const shift = (offset - 4) * 8
+		const mask = lshift(0xFF, shift)
+		self.bmPrdt =
+			band(bor(band(self.bmPrdt, bit32.bnot(mask)), lshift(value, shift)), 0xFFFFFFFC)
+	end
+end
+
+function Ide.bmIn16(self: Ide, port: number): number
+	const offset = port - self.bmBase
+	if offset == 0 then
+		return self.bmCmd
+	elseif offset == 2 then
+		return self.bmStatus
+	elseif offset >= 4 and offset <= 7 then
+		return bor(self:bmIn8(port), lshift(self:bmIn8(port + 1), 8))
+	end
+	return 0xFFFF
+end
+
+function Ide.bmOut16(self: Ide, port: number, value: number)
+	const offset = port - self.bmBase
+	if offset == 0 then
+		self:bmOut8(port, band(value, 0xFF))
+		self:bmOut8(port + 2, band(rshift(value, 16), 0xFF))
+		return
+	end
+	self:bmOut8(port, band(value, 0xFF))
+	self:bmOut8(port + 1, band(rshift(value, 8), 0xFF))
+end
+
+function Ide.bmIn32(self: Ide, port: number): number
+	const offset = port - self.bmBase
+	if offset == 0 then
+		return bor(self.bmCmd, lshift(self.bmStatus, 16))
+	elseif offset == 4 then
+		return self.bmPrdt
+	end
+	return 0xFFFFFFFF
+end
+
+function Ide.bmOut32(self: Ide, port: number, value: number)
+	const offset = port - self.bmBase
+	if offset == 0 then
+		self:bmOut8(port, band(value, 0xFF))
+		self:bmOut8(port + 2, band(rshift(value, 16), 0xFF))
+	elseif offset == 4 then
+		self.bmPrdt = band(value, 0xFFFFFFFC)
+	end
+end
+
 function Ide.takeIrq(self: Ide): boolean
 	if not self.irqPending then
 		return false
 	end
-	if band(self.deviceControl, 0x04) ~= 0 then
+	if band(self.deviceControl, 0x02) ~= 0 then
 		return false
 	end
 	self.irqPending = false
@@ -1063,5 +1355,6 @@ function Ide.findBootPartition(image: buffer): Partition?
 end
 
 Ide.IRQ = IRQ
+Ide.IRQ_SECONDARY = IRQ_SECONDARY
 
 return Ide
