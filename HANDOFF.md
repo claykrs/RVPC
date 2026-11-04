@@ -65,21 +65,30 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   (`0x510/0x511`) providing e820/bootorder/vgarom files.
 - **Firmware:** real SeaBIOS `rel-1.17.0` + SeaVGABIOS `rel-1.17.0` staged in
   `roms/` (gitignored). `tools/harness.lua` loads both.
-- **Measured boot:** `F000:B757`, 6M steps, 8 IRQs, 0 page faults. VGA text:
-  SeaBIOS banner, two failed hard-disk attempts, then
-  `No bootable device.  Retrying in 60 seconds.` — expected with no IDE yet.
-- **Tests:** `lune run tools/check.lua` passes; 64 assertions cover memory/A20,
-  paging translation/fault, V86, PIC/PIT/CMOS and existing smoke tests.
+- **M0 hardening (commit `7986985`):** V86 interrupt delivery clears VM before
+  the ring-0 stack switch; IRETD/RETF pop the correct 16/32-bit frame slots;
+  #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
+  are correct. CPU, 386 frame and XMS suites are in the gate again.
+- **Tests:** `lune run tools/check.lua` passes with 333 assertions.
+- **M1 working tree (in progress):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
+  (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
+  FreeDOS ISO. SeaBIOS reaches its boot menu and starts the CD entry.
 
 ### Next blockers
 
-1. IDE/ATAPI PIO: identify/read, MBR/partition parsing; let SeaBIOS boot an
-   empty HDD or the Win98 SE CD. This is the immediate M0→M1 step.
-2. 8042 keyboard/PS2 mouse + IRQ1/IRQ12: boot menu and install-time input.
-3. VGA modes 12h/13h and the EditableImage sink; text mode 3 currently works
-   through SeaVGABIOS, but no mode 12h/13h pipeline exists yet.
-4. Then 386 PM stress (TSS/task gates, exception precision), x87, and the
+1. FreeDOS boot: the earlier tiny El Torito floppy-emulation CD faulted at
+   `F000:85ED` (`bad FF /7`, PC `F000:85EF`, after 6M steps). The BIOS code at
+   that address had been correctly shadowed; execution entered the middle of
+   the 32-bit `CALL` at `F000:85E9`. The current harness uses the FreeDOS
+   LiveCD image and passes 7M steps without that fault. Finish the LiveCD boot
+   path and add a regression for the boot-entry thunk.
+2. IDE/ATAPI sector streaming and MBR/partition reads for the Win98 SE CD.
+3. 8042 keyboard/PS2 mouse + IRQ1/IRQ12 (module exists; verify guest input).
+4. VGA modes 12h/13h and the EditableImage sink; text mode 3 works through
+   SeaVGABIOS, but no mode 12h/13h pipeline is wired to the client yet.
+5. Then 386 PM stress (TSS/task gates, exception precision), x87, and the
    Win98 installer path.
+
 
 ## Hard rules
 

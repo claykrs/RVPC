@@ -157,3 +157,26 @@ The only local files intentionally left out are:
 
 This report file is committed as the relay/docs commit directly after the code
 commit.
+
+## Post-M0 hardening (commit `7986985`)
+
+A follow-up pass corrected several architectural details found while auditing
+M0:
+
+- V86 interrupt delivery now clears the VM flag before switching to the ring-0
+  stack and reloading CS/SS, so the frame is written with supervisor rights and
+  the selectors resolve through the GDT.
+- 32-bit interrupt/trap and IRET frames use 32-bit slots for CS, SS and the
+  V86 ESP/segment state; 16-bit frames keep 16-bit slots. RETF uses the same
+  operand-size rule.
+- #PF and synchronous exceptions save the faulting instruction's CS:EIP, so a
+  handler can map the page and IRETD re-executes the access. `pageFault` still
+  unwinds the partially executed instruction.
+- `TEST EAX,imm32`, PIC fixed-priority/ISR blocking, slave non-specific EOI,
+  the Memory aperture word boundary, and a 16 MiB default RAM size.
+- The legacy 8086 CPU suite, XMS suite and a new `tests/Cpu386Tests.lua` are
+  back in `tools/check.lua`: 333 assertions.
+
+M1 work (IDE/ATAPI, 8042/PS2, PAM locking) is in the working tree at the time
+of writing; see `HANDOFF.md` for its exact boot state and blockers.
+
