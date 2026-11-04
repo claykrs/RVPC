@@ -13,6 +13,7 @@ local Kbc = require("../core/Kbc")
 local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
+local Ne2000 = require("../core/Ne2000")
 local Machine = require("../core/Machine")
 local smokeTests = require("../tests/SmokeTests")
 local cpuTests = require("../tests/CpuTests")
@@ -22,6 +23,9 @@ local memoryTests = require("../tests/MemoryTests")
 local systemTests = require("../tests/SystemTests")
 local ideTests = require("../tests/IdeTests")
 local kbcTests = require("../tests/KbcTests")
+local uartTests = require("../tests/UartTests")
+local lptTests = require("../tests/LptTests")
+local ne2000Tests = require("../tests/Ne2000Tests")
 
 const deps = {
 	Memory = Memory,
@@ -33,6 +37,7 @@ const deps = {
 	FwCfg = FwCfg,
 	Ide = Ide,
 	Kbc = Kbc,
+	Ne2000 = Ne2000,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -85,6 +90,9 @@ runDirectSuite("memory", memoryTests)
 runDirectSuite("system", systemTests)
 runDirectSuite("ide", ideTests)
 runDirectSuite("kbc", kbcTests)
+runDirectSuite("uart", uartTests)
+runDirectSuite("lpt", lptTests)
+runDirectSuite("ne2000", ne2000Tests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then
