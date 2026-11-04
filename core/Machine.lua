@@ -29,6 +29,8 @@ export type Deps = {
 	Pit: any?,
 	Cmos: any?,
 	FwCfg: any?,
+	Ide: any?,
+	Kbc: any?,
 	Xms: any?,
 	Uart: any?,
 	Lpt: any?,
@@ -42,6 +44,8 @@ export type Config = {
 	timerInterval: number?,
 	rom: buffer?,
 	vgaRom: buffer?,
+	hdd: buffer?,
+	cdrom: buffer?,
 }
 
 export type Machine = typeof(setmetatable(
@@ -53,6 +57,8 @@ export type Machine = typeof(setmetatable(
 		pit: any?,
 		cmos: any?,
 		fwcfg: any?,
+		ide: any?,
+		kbc: any?,
 		xms: any?,
 		uart: any?,
 		lpt: any?,
@@ -70,6 +76,10 @@ export type Machine = typeof(setmetatable(
 		debugText: (self: Machine) -> string,
 		bootPc: (self: Machine) -> string,
 		deliverInterrupt: (self: Machine) -> boolean,
+		pressKey: (self: Machine, scancode: number) -> (),
+		releaseKey: (self: Machine, scancode: number) -> (),
+		mouseMove: (self: Machine, dx: number, dy: number, buttons: number?) -> (),
+		injectBdaKey: (self: Machine, scan: number, ascii: number) -> boolean,
 	},
 	Machine
 ))
@@ -77,7 +87,7 @@ export type Machine = typeof(setmetatable(
 -- A tiny 440FX host bridge so SeaBIOS's northbridge probe finds something
 -- plausible. There is no real PCI device behind it yet; absent devices read as
 -- all-ones, which is what the configuration mechanism reports on an empty bus.
-local function hostBridgeDword(offset: number): number
+local function hostBridgeDword(machine: any, offset: number): number
 	if offset == 0x00 then
 		return 0x12378086 -- Intel 440FX, vendor 8086 device 1237
 	elseif offset == 0x04 then
@@ -89,7 +99,9 @@ local function hostBridgeDword(offset: number): number
 	elseif offset == 0x2C then
 		return 0x11001AF4 -- Red Hat/QEMU subsystem, as SeaBIOS expects
 	end
-	return 0
+	-- PAM/PAM shadow-control bytes are written by SeaBIOS's
+	-- make_bios_writable/make_bios_readonly paths.
+	return machine.hostConfig[offset] or 0
 end
 
 -- Bochs/QEMU stdvga-compatible PCI VGA device at 00:02.0. The VGA BIOS option
@@ -114,7 +126,26 @@ local function vgaDword(offset: number): number
 	return 0
 end
 
-local function pciRead(address: number): number
+-- PIIX3-style IDE function at 00:01.1. prog_if=0 makes SeaBIOS use the legacy
+-- 0x1F0/0x3F6 task file instead of PCI BARs.
+local function ideDword(offset: number): number
+	if offset == 0x00 then
+		return 0x70108086 -- Intel PIIX3 IDE
+	elseif offset == 0x04 then
+		return 0x00000007
+	elseif offset == 0x08 then
+		return 0x01010000 -- IDE controller, legacy programming interface
+	elseif offset == 0x0C then
+		return 0x00000000
+	elseif offset == 0x2C then
+		return 0x11001AF4
+	elseif offset == 0x3C then
+		return 0x00000E00 -- IRQ14
+	end
+	return 0
+end
+
+local function pciRead(machine: any, address: number): number
 	if band(address, 0x80000000) == 0 then
 		return 0xFFFFFFFF
 	end
@@ -122,14 +153,36 @@ local function pciRead(address: number): number
 	const device = band(rshift(address, 11), 0x1F)
 	const functionNumber = band(rshift(address, 8), 0x07)
 	const offset = band(address, 0xFC)
-	if bus == 0 and functionNumber == 0 then
-		if device == 0 then
-			return hostBridgeDword(offset)
-		elseif device == 2 then
+	if bus == 0 then
+		if device == 0 and functionNumber == 0 then
+			return hostBridgeDword(machine, offset)
+		elseif device == 1 and functionNumber == 0 then
+			return ideDword(offset)
+		elseif device == 2 and functionNumber == 0 then
 			return vgaDword(offset)
 		end
 	end
 	return 0xFFFFFFFF
+end
+
+local function pciWrite(machine: any, address: number, value: number)
+	if band(address, 0x80000000) == 0 then
+		return
+	end
+	const bus = band(rshift(address, 16), 0xFF)
+	const device = band(rshift(address, 11), 0x1F)
+	const functionNumber = band(rshift(address, 8), 0x07)
+	const offset = band(address, 0xFC)
+	if bus ~= 0 or device ~= 0 or functionNumber ~= 0 then
+		return
+	end
+	if offset == 0x58 or offset == 0x5C then
+		machine.hostConfig[offset] = band(value, 0xFFFFFFFF)
+		-- PAM0 bit 4 set with read-only encoding (0x10/0x11) is SeaBIOS's
+		-- "make_bios_readonly" state for F0000-FFFFF.
+		const pam0 = band(rshift(machine.hostConfig[0x58] or 0, 8), 0xFF)
+		machine.mem:lockLowRom(band(pam0, 0x30) == 0x10)
+	end
 end
 
 function Machine.new(deps: Deps, config: Config?): Machine
@@ -159,6 +212,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	if deps.FwCfg then
 		self.fwcfg = deps.FwCfg.new(self.mem.size, cfg.vgaRom)
 	end
+	if deps.Ide then
+		self.ide = deps.Ide.new({ hdd = cfg.hdd, cdrom = cfg.cdrom })
+	end
+	if deps.Kbc then
+		self.kbc = deps.Kbc.new()
+	end
 	if deps.Uart then
 		self.uart = deps.Uart.new(cfg.serial)
 	end
@@ -166,6 +225,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		self.lpt = deps.Lpt.new(cfg.printer)
 	end
 	self.pciAddress = 0
+	self.hostConfig = {}
 	self.lastInPort = 0
 	self.lastOutPort = 0
 	self.lastOutValue = 0
@@ -176,7 +236,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		return band(rshift(self.pciAddress, index * 8), 0xFF)
 	end
 	local function pciDataByte(index: number): number
-		return band(rshift(pciRead(self.pciAddress), index * 8), 0xFF)
+		return band(rshift(pciRead(self, self.pciAddress), index * 8), 0xFF)
 	end
 
 	local io: any
@@ -185,6 +245,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			self.lastInPort = port
 			if self.fwcfg and (port == 0x510 or port == 0x511) then
 				return self.fwcfg:in8(port)
+			end
+			if self.kbc and (port == 0x60 or port == 0x64) then
+				return self.kbc:in8(port)
+			end
+			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
+				return self.ide:in8(port)
 			end
 			if self.vga and port >= 0x3C0 and port <= 0x3DF then
 				return self.vga:in8(port)
@@ -227,10 +293,13 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.fwcfg and port == 0x510 then
 				return self.fwcfg:in16(port)
 			end
+			if self.ide and port == 0x1F0 then
+				return self.ide:in16(port)
+			end
 			if port == PCI_ADDRESS then
 				return band(self.pciAddress, 0xFFFF)
 			elseif port == PCI_DATA then
-				return band(pciRead(self.pciAddress), 0xFFFF)
+				return band(pciRead(self, self.pciAddress), 0xFFFF)
 			end
 			return bor(io.in8(port), lshift(io.in8(band(port + 1, 0xFFFF)), 8))
 		end,
@@ -238,7 +307,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if port == PCI_ADDRESS then
 				return self.pciAddress
 			elseif port == PCI_DATA then
-				return pciRead(self.pciAddress)
+				return pciRead(self, self.pciAddress)
 			end
 			return bor(
 				io.in8(port),
@@ -257,6 +326,14 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.fwcfg and (port == 0x510 or port == 0x511) then
 				self.fwcfg:out8(port, value)
+				return
+			end
+			if self.kbc and (port == 0x60 or port == 0x64) then
+				self.kbc:out8(port, value)
+				return
+			end
+			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
+				self.ide:out8(port, value)
 				return
 			end
 			if self.vga and port >= 0x3C0 and port <= 0x3DF then
@@ -311,6 +388,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.fwcfg:out16(port, value)
 				return
 			end
+			if self.ide and port == 0x1F0 then
+				self.ide:out16(port, value)
+				return
+			end
 			if port == PCI_ADDRESS then
 				self.pciAddress = bor(band(self.pciAddress, 0xFFFF0000), band(value, 0xFFFF))
 				return
@@ -325,6 +406,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.pciAddress = band(value, 0xFFFFFFFF)
 				return
 			elseif port == PCI_DATA then
+				pciWrite(self, self.pciAddress, value)
 				return
 			end
 			io.out8(port, band(value, 0xFF))
@@ -360,6 +442,12 @@ function Machine.reset(self: Machine)
 	if self.pit then
 		self.pit:reset()
 	end
+	if self.ide then
+		self.ide:reset()
+	end
+	if self.kbc then
+		self.kbc:reset()
+	end
 	self.exitCode = nil
 end
 
@@ -392,6 +480,19 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				self.pic:raise(0)
 			end
 		end
+		if self.pic then
+			if self.kbc then
+				if self.kbc:takeIrq1() then
+					self.pic:raise(1)
+				end
+				if self.kbc:takeIrq12() then
+					self.pic:raise(12)
+				end
+			end
+			if self.ide and self.ide:takeIrq() then
+				self.pic:raise(14)
+			end
+		end
 		if self.cpu.halted then
 			if not self:deliverInterrupt() then
 				idle += 1
@@ -419,6 +520,41 @@ end
 
 function Machine.debugText(self: Machine): string
 	return table.concat(self.debugLog)
+end
+
+function Machine.pressKey(self: Machine, scancode: number)
+	if self.kbc then
+		self.kbc:pressKey(scancode)
+	end
+end
+
+function Machine.releaseKey(self: Machine, scancode: number)
+	if self.kbc then
+		self.kbc:releaseKey(scancode)
+	end
+end
+
+function Machine.mouseMove(self: Machine, dx: number, dy: number, buttons: number?)
+	if self.kbc then
+		self.kbc:mouseMove(dx, dy, buttons)
+	end
+end
+
+-- Diagnostic input path for harnesses that need to drive SeaBIOS before its
+-- own PS/2 IRQ handler is installed. Real host input should use pressKey.
+function Machine.injectBdaKey(self: Machine, scan: number, ascii: number): boolean
+	const head = self.mem:read16(0x41A)
+	const tail = self.mem:read16(0x41C)
+	local next = tail + 2
+	if next > 0x3D then
+		next = 0x1E
+	end
+	if next == head then
+		return false
+	end
+	self.mem:write16(0x400 + tail, bor(band(ascii, 0xFF), lshift(band(scan, 0xFF), 8)))
+	self.mem:write16(0x41C, next)
+	return true
 end
 
 function Machine.outputText(self: Machine): string

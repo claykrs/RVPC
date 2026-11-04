@@ -15,6 +15,8 @@ const Pic = require("../core/Pic")
 const Pit = require("../core/Pit")
 const Cmos = require("../core/Cmos")
 const FwCfg = require("../core/FwCfg")
+const Ide = require("../core/Ide")
+const Kbc = require("../core/Kbc")
 const Xms = require("../core/Xms")
 const Uart = require("../core/Uart")
 const Lpt = require("../core/Lpt")
@@ -22,6 +24,8 @@ const Machine = require("../core/Machine")
 
 const BIOS_PATH = "roms/bios-256k.bin"
 const VGA_ROM_PATH = "roms/vgabios-stdvga.bin"
+const CDROM_PATH = "media/FD13LIVE.iso"
+const HDD_PATH = "media/hdd.img"
 
 if not fs.isFile(BIOS_PATH) then
 	print("missing " .. BIOS_PATH)
@@ -43,6 +47,18 @@ else
 	print("  https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/vgabios-stdvga.bin")
 end
 
+local hdd = nil
+if fs.isFile(HDD_PATH) then
+	hdd = buffer.fromstring(fs.readFile(HDD_PATH))
+end
+
+local cdrom = nil
+if fs.isFile(CDROM_PATH) then
+	cdrom = buffer.fromstring(fs.readFile(CDROM_PATH))
+else
+	print("warning: " .. CDROM_PATH .. " not found; only the blank HDD is attached")
+end
+
 const machine = Machine.new({
 	Memory = Memory,
 	Cpu = Cpu,
@@ -51,6 +67,8 @@ const machine = Machine.new({
 	Pit = Pit,
 	Cmos = Cmos,
 	FwCfg = FwCfg,
+	Ide = Ide,
+	Kbc = Kbc,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -59,12 +77,21 @@ const machine = Machine.new({
 	cpu = { cpuLevel = "486" },
 	rom = bios,
 	vgaRom = vgaRom,
+	hdd = hdd,
+	cdrom = cdrom,
 })
 
 print(
 	("SeaBIOS %d bytes, RAM %d MiB"):format(
 		buffer.len(bios),
 		math.floor(machine.mem.size / (1024 * 1024))
+	)
+)
+machine.cpu.traceEnabled = true
+print(
+	("IDE: HDD %s, CD %s"):format(
+		if hdd then ("%d KiB"):format(math.floor(buffer.len(hdd) / 1024)) else "absent",
+		if cdrom then ("%d KiB"):format(math.floor(buffer.len(cdrom) / 1024)) else "absent"
 	)
 )
 print("reset vector " .. machine:bootPc())
@@ -86,6 +113,7 @@ const chunk = 2_000_000
 local executed = 0
 local lastScreen = ""
 local lastPrint = 0
+local menuSelected = false
 
 while executed < budget do
 	const want = math.min(chunk, budget - executed)
@@ -96,6 +124,24 @@ while executed < budget do
 		print(
 			("FAULT at %s after %d steps: %s"):format(machine:bootPc(), executed, tostring(result))
 		)
+		print("trace:")
+		const trace = machine.cpu:traceDump(4096)
+		local first = nil
+		for index, pc in trace do
+			if pc == "F000:00000000" then
+				first = index
+				break
+			end
+		end
+		if first then
+			for index = math.max(1, first - 24), math.min(#trace, first + 16) do
+				print("  " .. trace[index])
+			end
+		else
+			for _, pc in machine.cpu:traceDump(48) do
+				print("  " .. pc)
+			end
+		end
 		break
 	end
 	executed += result
@@ -111,10 +157,18 @@ while executed < budget do
 		lastPrint = executed
 		print(("... %dM steps at %s"):format(math.floor(executed / 1_000_000), machine:bootPc()))
 	end
+	if not menuSelected and string.find(screen, "Select boot device", 1, true) then
+		print("selecting boot entry 1 (CD)")
+		if machine:injectBdaKey(0x02, string.byte("1")) then
+			menuSelected = true
+		end
+	end
 	if
-		string.find(screen, "No bootable", 1, true)
-		or string.find(screen, "Booting from", 1, true)
-		or (string.find(screen, "SeaBIOS", 1, true) and executed >= 6_000_000)
+		string.find(screen, "FreeDOS", 1, true)
+		or string.find(screen, "KERNEL", 1, true)
+		or string.find(screen, "A:\\>", 1, true)
+		or string.find(screen, "C:\\>", 1, true)
+		or string.find(screen, "No bootable", 1, true)
 	then
 		break
 	end
@@ -135,9 +189,90 @@ print(
 		machine.cpu.pageFaults
 	)
 )
+print(
+	("INT counts: 08=%d 09=%d 21=%d 74=%d"):format(
+		machine.cpu.intCounts[0x08] or 0,
+		machine.cpu.intCounts[0x09] or 0,
+		machine.cpu.intCounts[0x21] or 0,
+		machine.cpu.intCounts[0x74] or 0
+	)
+)
+print(
+	("IVT21=%04X:%04X IVT09=%04X:%04X"):format(
+		machine.mem:read16(0x21 * 4 + 2),
+		machine.mem:read16(0x21 * 4),
+		machine.mem:read16(0x09 * 4 + 2),
+		machine.mem:read16(0x09 * 4)
+	)
+)
+print(
+	("csBase=%08X cs=%04X ssBase=%08X"):format(
+		machine.cpu.segBase.cs,
+		machine.cpu.cs,
+		machine.cpu.segBase.ss
+	)
+)
+print(
+	("PAM58=%08X locked=%s"):format(
+		machine.hostConfig[0x58] or 0,
+		tostring(machine.mem.lowRomLocked)
+	)
+)
+if machine.pic then
+	print(
+		("PIC: master imr=%02X isr=%02X irr=%02X slave imr=%02X isr=%02X irr=%02X"):format(
+			machine.pic.master.imr,
+			machine.pic.master.isr,
+			machine.pic.master.irr,
+			machine.pic.slave.imr,
+			machine.pic.slave.isr,
+			machine.pic.slave.irr
+		)
+	)
+end
+if machine.kbc then
+	print(
+		("KBC: queue=%d config=%02X irq1=%s irq12=%s"):format(
+			#machine.kbc.queue,
+			machine.kbc.config,
+			tostring(machine.kbc:takeIrq1()),
+			tostring(machine.kbc:takeIrq12())
+		)
+	)
+	print("KBC trace: " .. table.concat(machine.kbc.trace, " "))
+end
+if machine.ide then
+	print(
+		("IDE: commands=%d last=%02X identify=%d packet=%d selected=%d"):format(
+			machine.ide.commandCount,
+			machine.ide.lastCommand,
+			machine.ide.identifyCount,
+			machine.ide.packetCount,
+			machine.ide.selectedIndex
+		)
+	)
+end
 if #debug > 0 then
 	print("---- firmware debug console (0x402) ----")
 	print(debug)
+end
+if machine.vga and not machine.vga:isTextMode() then
+	const width = machine.vga:width()
+	const height = machine.vga:height()
+	const pixels = machine.vga:snapshotRGBA()
+	local rows = { ("P6\n%d %d\n255\n"):format(width, height) }
+	for y = 0, height - 1 do
+		const row = table.create(width * 3)
+		for x = 0, width - 1 do
+			const source = (y * width + x) * 4
+			row[x * 3 + 1] = string.char(buffer.readu8(pixels, source))
+			row[x * 3 + 2] = string.char(buffer.readu8(pixels, source + 1))
+			row[x * 3 + 3] = string.char(buffer.readu8(pixels, source + 2))
+		end
+		rows[#rows + 1] = table.concat(row)
+	end
+	fs.writeFile("tools/out/screen.ppm", table.concat(rows))
+	print(("graphics screen: %dx%d -> tools/out/screen.ppm"):format(width, height))
 end
 print("---- screen ----")
 print(screen)

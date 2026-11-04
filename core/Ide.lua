@@ -1,0 +1,582 @@
+--!strict
+-- Ide.lua -- primary IDE channel: ATA-2 PIO hard disk + ATAPI CD-ROM.
+--
+-- The controller exposes the classic task-file ports (0x1F0-0x1F7, 0x3F6)
+-- with a master HDD and slave CD-ROM. Commands complete synchronously; PIO
+-- data sits in a one-command buffer and IRQ14 is raised when DRQ/DRDY is ready.
+-- The drive images are host-supplied buffers (core never touches the
+-- filesystem).
+
+const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
+
+const Ide = {}
+Ide.__index = Ide
+
+const DATA = 0x1F0
+const ERROR = 0x1F1
+const FEATURES = 0x1F1
+const SECTOR_COUNT = 0x1F2
+const LBA0 = 0x1F3
+const LBA1 = 0x1F4
+const LBA2 = 0x1F5
+const DRIVE_HEAD = 0x1F6
+const STATUS = 0x1F7
+const COMMAND = 0x1F7
+const ALT_STATUS = 0x3F6
+const DEVICE_CONTROL = 0x3F6
+const IRQ = 14
+
+const ST_ERR = 0x01
+const ST_DRQ = 0x08
+const ST_DSC = 0x10
+const ST_DRDY = 0x40
+
+const ATA_IDENTIFY = 0xEC
+const ATA_READ = 0x20
+const ATA_WRITE = 0x30
+const ATA_FLUSH = 0xE7
+const ATA_SET_FEATURES = 0xEF
+const ATA_IDENTIFY_PACKET = 0xA1
+const ATA_PACKET = 0xA0
+const ATA_DIAGNOSTIC = 0x90
+const ATA_INIT_PARAMS = 0x91
+const ATA_NOP = 0x00
+
+export type Partition = {
+	index: number,
+	status: number,
+	kind: number,
+	lba: number,
+	sectors: number,
+}
+
+export type Drive = {
+	present: boolean,
+	kind: string, -- "hdd" | "cdrom"
+	image: buffer?,
+	status: number,
+	error: number,
+	model: string,
+}
+
+export type Transfer = {
+	buffer: buffer,
+	pos: number,
+	length: number,
+	write: boolean,
+	lba: number,
+}
+
+export type Config = {
+	hdd: buffer?,
+	cdrom: buffer?,
+}
+
+export type Ide = typeof(setmetatable(
+	{} :: {
+		master: Drive,
+		slave: Drive,
+		selected: Drive,
+		selectedIndex: number,
+		lba: number,
+		sectorCount: number,
+		driveHead: number,
+		deviceControl: number,
+		transfer: Transfer?,
+		packet: buffer,
+		packetPos: number,
+		irqPending: boolean,
+		lastError: number,
+		commandCount: number,
+		lastCommand: number,
+		identifyCount: number,
+		packetCount: number,
+		in8: (self: Ide, port: number) -> number,
+		out8: (self: Ide, port: number, value: number) -> (),
+		in16: (self: Ide, port: number) -> number,
+		out16: (self: Ide, port: number, value: number) -> (),
+		takeIrq: (self: Ide) -> boolean,
+		reset: (self: Ide) -> (),
+	},
+	Ide
+))
+
+local function newDrive(kind: string, image: buffer?, present: boolean): Drive
+	return {
+		present = present,
+		kind = kind,
+		image = image,
+		status = if present then bor(ST_DRDY, ST_DSC) else 0,
+		error = 0,
+		model = if kind == "hdd" then "RVDM98 VIRTUAL HDD" else "RVDM98 VIRTUAL CD",
+	}
+end
+
+function Ide.new(config: Config?): Ide
+	const cfg = (config or {}) :: Config
+	local self = setmetatable({}, Ide) :: any
+	self.master = newDrive("hdd", cfg.hdd, cfg.hdd ~= nil)
+	self.slave = newDrive("cdrom", cfg.cdrom, cfg.cdrom ~= nil)
+	self.selected = self.master
+	self.selectedIndex = 0
+	self.lba = 0
+	self.sectorCount = 0
+	self.driveHead = 0
+	self.deviceControl = 0
+	self.transfer = nil
+	self.packet = buffer.create(12)
+	self.packetPos = 0
+	self.irqPending = false
+	self.lastError = 0
+	self.commandCount = 0
+	self.lastCommand = 0
+	self.identifyCount = 0
+	self.packetCount = 0
+	return self
+end
+
+function Ide.reset(self: Ide)
+	self.selected = self.master
+	self.selectedIndex = 0
+	self.transfer = nil
+	self.packetPos = 0
+	self.irqPending = false
+	self.deviceControl = 0
+	self.master.status = if self.master.present then bor(ST_DRDY, ST_DSC) else 0
+	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
+	self.master.error = 0
+	self.slave.error = 0
+end
+
+local function putWord(buf: buffer, index: number, value: number)
+	buffer.writeu16(buf, index * 2, band(value, 0xFFFF))
+end
+
+local function putAtaString(buf: buffer, byteOffset: number, text: string, length: number)
+	for index = 0, length - 1 do
+		const byte = if index < #text then string.byte(text, index + 1) :: number else 32
+		buffer.writeu8(buf, byteOffset + index, byte)
+	end
+end
+
+local function capacitySectors(drive: Drive, blockSize: number): number
+	const image = drive.image
+	if not image then
+		return 0
+	end
+	return math.floor(buffer.len(image) / blockSize)
+end
+
+local function identify(drive: Drive): buffer
+	const out = buffer.create(512)
+	if drive.kind == "cdrom" then
+		putWord(out, 0, 0x85C0) -- ATAPI packet device
+		putWord(out, 1, 0)
+		putWord(out, 49, 0x0200) -- LBA supported
+		putWord(out, 80, 0x0000)
+		putWord(out, 82, 0x0000)
+		putAtaString(out, 54, "RVDM98 VIRTUAL CD", 40)
+		return out
+	end
+	putWord(out, 0, 0x0040)
+	putWord(out, 1, 16383) -- cylinders
+	putWord(out, 3, 16) -- heads
+	putWord(out, 6, 63) -- sectors/track
+	putWord(out, 49, 0x0200) -- LBA
+	const total = capacitySectors(drive, 512)
+	putWord(out, 60, band(total, 0xFFFF))
+	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
+	putWord(out, 80, 0x0004) -- ATA-2
+	putWord(out, 82, 0x4000) -- LBA
+	putAtaString(out, 54, "RVDM98 VIRTUAL HDD", 40)
+	return out
+end
+
+local function finish(self: Ide, status: number)
+	self.selected.status = status
+	self.transfer = nil
+	self.irqPending = true
+end
+
+local function beginRead(self: Ide, data: buffer)
+	self.transfer = {
+		buffer = data,
+		pos = 0,
+		length = buffer.len(data),
+		write = false,
+		lba = self.lba,
+	}
+	self.selected.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
+end
+
+local function beginWrite(self: Ide, lba: number, length: number)
+	self.transfer = {
+		buffer = buffer.create(length),
+		pos = 0,
+		length = length,
+		write = true,
+		lba = lba,
+	}
+	self.selected.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
+end
+
+local function failCommand(self: Ide, errorCode: number)
+	self.selected.error = errorCode
+	self.lastError = errorCode
+	self.selected.status = bor(ST_DRDY, ST_ERR)
+	self.transfer = nil
+	self.irqPending = true
+end
+
+local function readBE32(buf: buffer, offset: number): number
+	return bor(
+		lshift(buffer.readu8(buf, offset), 24),
+		lshift(buffer.readu8(buf, offset + 1), 16),
+		lshift(buffer.readu8(buf, offset + 2), 8),
+		buffer.readu8(buf, offset + 3)
+	)
+end
+
+local function readBE16(buf: buffer, offset: number): number
+	return bor(lshift(buffer.readu8(buf, offset), 8), buffer.readu8(buf, offset + 1))
+end
+
+local function putBE32(buf: buffer, offset: number, value: number)
+	buffer.writeu8(buf, offset, band(rshift(value, 24), 0xFF))
+	buffer.writeu8(buf, offset + 1, band(rshift(value, 16), 0xFF))
+	buffer.writeu8(buf, offset + 2, band(rshift(value, 8), 0xFF))
+	buffer.writeu8(buf, offset + 3, band(value, 0xFF))
+end
+
+local function putBE16(buf: buffer, offset: number, value: number)
+	buffer.writeu8(buf, offset, band(rshift(value, 8), 0xFF))
+	buffer.writeu8(buf, offset + 1, band(value, 0xFF))
+end
+
+local function atapiPacket(self: Ide)
+	const drive = self.selected
+	if drive.kind ~= "cdrom" or not drive.image then
+		failCommand(self, 0x04)
+		return
+	end
+	const op = buffer.readu8(self.packet, 0)
+	const image = drive.image
+	if op == 0x28 then -- READ(10)
+		const lba = readBE32(self.packet, 2)
+		local count = readBE16(self.packet, 7)
+		if count == 0 then
+			finish(self, bor(ST_DRDY, ST_DSC))
+			return
+		end
+		const total = capacitySectors(drive, 2048)
+		if lba >= total or lba + count > total then
+			failCommand(self, 0x21) -- LBA out of range
+			return
+		end
+		if count > 256 then
+			count = 256
+		end
+		const data = buffer.create(count * 2048)
+		buffer.copy(data, 0, image, lba * 2048, count * 2048)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x25 then -- READ CAPACITY(10)
+		const total = capacitySectors(drive, 2048)
+		const data = buffer.create(8)
+		putBE32(data, 0, math.max(0, total - 1))
+		putBE32(data, 4, 2048)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x12 then -- INQUIRY
+		const data = buffer.create(36)
+		buffer.writeu8(data, 0, 0x05) -- CD-ROM
+		buffer.writeu8(data, 1, 0x80) -- removable
+		buffer.writeu8(data, 4, 31)
+		putAtaString(data, 8, "RVDM98", 8)
+		putAtaString(data, 16, "VIRTUAL CD", 16)
+		putAtaString(data, 32, "1.0", 4)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x43 then -- READ TOC/PMA/ATIP (format 0)
+		const total = capacitySectors(drive, 2048)
+		const data = buffer.create(4 + 8 * 2)
+		putBE16(data, 0, 4 + 8 * 2)
+		buffer.writeu8(data, 2, 1) -- first track
+		buffer.writeu8(data, 3, 1) -- last track
+		-- Track 1 starts at LBA 0.
+		buffer.writeu8(data, 4 + 1, 0x14)
+		buffer.writeu8(data, 4 + 2, 1)
+		-- Leadout track 0xAA starts after the last data sector.
+		buffer.writeu8(data, 12 + 1, 0x14)
+		buffer.writeu8(data, 12 + 2, 0xAA)
+		putBE32(data, 12 + 4, total)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x1A then -- MODE SENSE(6), no block descriptors
+		const data = buffer.create(4)
+		buffer.writeu8(data, 0, 3)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x03 then -- REQUEST SENSE
+		const data = buffer.create(18)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif op == 0x00 or op == 0x1B or op == 0x1E then
+		finish(self, bor(ST_DRDY, ST_DSC))
+	else
+		failCommand(self, 0x05) -- illegal request
+	end
+end
+
+local function command(self: Ide, cmd: number)
+	self.commandCount += 1
+	self.lastCommand = cmd
+	const drive = self.selected
+	if not drive.present then
+		failCommand(self, 0x04)
+		return
+	end
+	drive.error = 0
+	self.lastError = 0
+	if cmd == ATA_IDENTIFY then
+		self.identifyCount += 1
+		if drive.kind ~= "hdd" then
+			failCommand(self, 0x04)
+			return
+		end
+		beginRead(self, identify(drive))
+		self.irqPending = true
+	elseif cmd == ATA_IDENTIFY_PACKET then
+		self.identifyCount += 1
+		if drive.kind ~= "cdrom" then
+			failCommand(self, 0x04)
+			return
+		end
+		beginRead(self, identify(drive))
+		self.irqPending = true
+	elseif cmd == ATA_READ then
+		const count = if self.sectorCount == 0 then 256 else self.sectorCount
+		const image = drive.image
+		const total = capacitySectors(drive, 512)
+		if not image or self.lba >= total or self.lba + count > total then
+			failCommand(self, 0x10)
+			return
+		end
+		const data = buffer.create(count * 512)
+		buffer.copy(data, 0, image, self.lba * 512, count * 512)
+		beginRead(self, data)
+		self.irqPending = true
+	elseif cmd == ATA_WRITE then
+		const count = if self.sectorCount == 0 then 256 else self.sectorCount
+		const image = drive.image
+		const total = capacitySectors(drive, 512)
+		if not image or self.lba >= total or self.lba + count > total then
+			failCommand(self, 0x10)
+			return
+		end
+		beginWrite(self, self.lba, count * 512)
+		self.irqPending = true
+	elseif cmd == ATA_PACKET then
+		self.packetCount += 1
+		if drive.kind ~= "cdrom" then
+			failCommand(self, 0x04)
+			return
+		end
+		self.packetPos = 0
+		drive.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
+	elseif
+		cmd == ATA_FLUSH
+		or cmd == ATA_SET_FEATURES
+		or cmd == ATA_INIT_PARAMS
+		or cmd == ATA_NOP
+	then
+		finish(self, bor(ST_DRDY, ST_DSC))
+	elseif cmd == ATA_DIAGNOSTIC then
+		self.master.error = 0
+		self.slave.error = 0
+		finish(self, bor(ST_DRDY, ST_DSC))
+	else
+		failCommand(self, 0x04)
+	end
+end
+
+local function readDataByte(self: Ide): number
+	const transfer = self.transfer
+	if not transfer or transfer.write or transfer.pos >= transfer.length then
+		return 0xFF
+	end
+	const value = buffer.readu8(transfer.buffer, transfer.pos)
+	transfer.pos += 1
+	if transfer.pos >= transfer.length then
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
+	return value
+end
+
+local function readDataWord(self: Ide): number
+	const transfer = self.transfer
+	if not transfer or transfer.write or transfer.pos + 1 >= transfer.length then
+		return 0xFFFF
+	end
+	const value = buffer.readu16(transfer.buffer, transfer.pos)
+	transfer.pos += 2
+	if transfer.pos >= transfer.length then
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
+	return value
+end
+
+local function writeDataByte(self: Ide, value: number)
+	const transfer = self.transfer
+	if not transfer or not transfer.write or transfer.pos >= transfer.length then
+		return
+	end
+	buffer.writeu8(transfer.buffer, transfer.pos, band(value, 0xFF))
+	transfer.pos += 1
+	if transfer.pos >= transfer.length then
+		const drive = self.selected
+		const image = drive.image
+		if image then
+			buffer.copy(image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
+		end
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
+end
+
+local function writeDataWord(self: Ide, value: number)
+	const transfer = self.transfer
+	if not transfer or not transfer.write or transfer.pos + 1 >= transfer.length then
+		return
+	end
+	buffer.writeu16(transfer.buffer, transfer.pos, band(value, 0xFFFF))
+	transfer.pos += 2
+	if transfer.pos >= transfer.length then
+		const drive = self.selected
+		const image = drive.image
+		if image then
+			buffer.copy(image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
+		end
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
+end
+
+function Ide.out8(self: Ide, port: number, value: number)
+	value = band(value, 0xFF)
+	if port == DATA then
+		if self.transfer and self.transfer.write then
+			writeDataByte(self, value)
+		elseif self.packetPos < 12 and band(self.selected.status, ST_DRQ) ~= 0 then
+			buffer.writeu8(self.packet, self.packetPos, value)
+			self.packetPos += 1
+			if self.packetPos == 12 then
+				atapiPacket(self)
+			end
+		end
+	elseif port == FEATURES then
+		-- Features register is only used by SET FEATURES; nothing to store.
+	elseif port == SECTOR_COUNT then
+		self.sectorCount = value
+	elseif port == LBA0 then
+		self.lba = bor(band(self.lba, 0xFFFFF00), value)
+	elseif port == LBA1 then
+		self.lba = bor(band(self.lba, 0xFFFF00FF), lshift(value, 8))
+	elseif port == LBA2 then
+		self.lba = bor(band(self.lba, 0xFF00FFFF), lshift(value, 16))
+	elseif port == DRIVE_HEAD then
+		self.driveHead = value
+		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
+		self.selected = if self.selectedIndex == 0 then self.master else self.slave
+		if band(value, 0x40) ~= 0 then
+			self.lba = bor(band(self.lba, 0xFF000000), lshift(band(value, 0x0F), 24))
+		end
+	elseif port == COMMAND then
+		command(self, value)
+	elseif port == DEVICE_CONTROL then
+		self.deviceControl = value
+	end
+end
+
+function Ide.in8(self: Ide, port: number): number
+	if port == DATA then
+		return readDataByte(self)
+	elseif port == ERROR then
+		return self.selected.error
+	elseif port == SECTOR_COUNT then
+		return self.sectorCount
+	elseif port == LBA0 then
+		return band(self.lba, 0xFF)
+	elseif port == LBA1 then
+		return band(rshift(self.lba, 8), 0xFF)
+	elseif port == LBA2 then
+		return band(rshift(self.lba, 16), 0xFF)
+	elseif port == DRIVE_HEAD then
+		return self.driveHead
+	elseif port == STATUS or port == ALT_STATUS then
+		return self.selected.status
+	end
+	return 0xFF
+end
+
+function Ide.in16(self: Ide, port: number): number
+	if port == DATA then
+		return readDataWord(self)
+	end
+	return bor(self:in8(port), lshift(self:in8(port + 1), 8))
+end
+
+function Ide.out16(self: Ide, port: number, value: number)
+	if port == DATA then
+		if self.transfer and self.transfer.write then
+			writeDataWord(self, value)
+		elseif self.packetPos + 1 < 12 and band(self.selected.status, ST_DRQ) ~= 0 then
+			buffer.writeu16(self.packet, self.packetPos, band(value, 0xFFFF))
+			self.packetPos += 2
+			if self.packetPos >= 12 then
+				atapiPacket(self)
+			end
+		end
+		return
+	end
+	self:out8(port, band(value, 0xFF))
+	self:out8(port + 1, band(rshift(value, 8), 0xFF))
+end
+
+function Ide.takeIrq(self: Ide): boolean
+	if not self.irqPending then
+		return false
+	end
+	if band(self.deviceControl, 0x04) ~= 0 then
+		return false
+	end
+	self.irqPending = false
+	return true
+end
+
+-- Parse the four primary MBR partition entries. SeaBIOS normally does this
+-- itself; the helper is also used by tests and the host disk UI.
+function Ide.parseMbr(image: buffer): { Partition }
+	local partitions: { Partition } = {}
+	if buffer.len(image) < 512 or buffer.readu16(image, 510) ~= 0xAA55 then
+		return partitions
+	end
+	for index = 0, 3 do
+		const offset = 446 + index * 16
+		const kind = buffer.readu8(image, offset + 4)
+		const lba = buffer.readu32(image, offset + 8)
+		const sectors = buffer.readu32(image, offset + 12)
+		if kind ~= 0 and sectors ~= 0 then
+			partitions[#partitions + 1] = {
+				index = index,
+				status = buffer.readu8(image, offset),
+				kind = kind,
+				lba = lba,
+				sectors = sectors,
+			}
+		end
+	end
+	return partitions
+end
+
+Ide.IRQ = IRQ
+
+return Ide

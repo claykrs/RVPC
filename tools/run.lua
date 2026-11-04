@@ -8,13 +8,20 @@ local Pic = require("../core/Pic")
 local Pit = require("../core/Pit")
 local Cmos = require("../core/Cmos")
 local FwCfg = require("../core/FwCfg")
+local Ide = require("../core/Ide")
+local Kbc = require("../core/Kbc")
 local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
 local Machine = require("../core/Machine")
 local smokeTests = require("../tests/SmokeTests")
+local cpuTests = require("../tests/CpuTests")
+local cpu386Tests = require("../tests/Cpu386Tests")
+local xmsTests = require("../tests/XmsTests")
 local memoryTests = require("../tests/MemoryTests")
 local systemTests = require("../tests/SystemTests")
+local ideTests = require("../tests/IdeTests")
+local kbcTests = require("../tests/KbcTests")
 
 const deps = {
 	Memory = Memory,
@@ -24,6 +31,8 @@ const deps = {
 	Pit = Pit,
 	Cmos = Cmos,
 	FwCfg = FwCfg,
+	Ide = Ide,
+	Kbc = Kbc,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -69,8 +78,13 @@ local function runDirectSuite(prefix, tests)
 end
 
 runSuite("smoke", smokeTests)
+runSuite("cpu", cpuTests)
+runDirectSuite("cpu386", cpu386Tests)
+runSuite("xms", xmsTests)
 runDirectSuite("memory", memoryTests)
 runDirectSuite("system", systemTests)
+runDirectSuite("ide", ideTests)
+runDirectSuite("kbc", kbcTests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then

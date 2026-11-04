@@ -111,10 +111,16 @@ end
 function FwCfg.new(memorySize: number, vgaRom: buffer?): FwCfg
 	local self = setmetatable({}, FwCfg) :: any
 	const e820 = buildE820(memorySize)
-	const bootOrder = "hd\0cdrom\0floppy\0rom\0"
+	-- SeaBIOS matches bootorder entries against enumerated /pci paths. Put the
+	-- slave ATAPI CD first, then the master HDD, so a blank disk cannot mask a
+	-- bootable ISO.
+	const bootOrder = "/pci@i0cf8/*@1/drive@0/disk@1\n/pci@i0cf8/*@1/drive@0/disk@0\n"
 	const files = {
 		{ name = "etc/e820", select = 0x20, data = e820 },
-		{ name = "etc/bootorder", select = 0x21, data = bootOrder },
+		{ name = "bootorder", select = 0x21, data = bootOrder },
+		-- <0 disables the timed "Press ESC" wait and goes straight to the
+		-- device list; useful for headless diagnostics.
+		{ name = "etc/boot-menu-wait", select = 0x23, data = u32le(0xFFFFFFFF) },
 	}
 	if vgaRom then
 		files[#files + 1] = {
@@ -130,7 +136,7 @@ function FwCfg.new(memorySize: number, vgaRom: buffer?): FwCfg
 		[NOGRAPHIC] = u16le(0),
 		[NB_CPUS] = u16le(1),
 		[NUMA] = u64le(0),
-		[BOOT_MENU] = u16le(0),
+		[BOOT_MENU] = u16le(1),
 		[MAX_CPUS] = u16le(1),
 		[FILE_DIR] = buildDirectory(files),
 		[ACPI_TABLES] = u16le(0),

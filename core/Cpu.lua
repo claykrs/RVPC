@@ -125,6 +125,9 @@ export type Cpu = {
 	lastIoStringCount: number,
 	lastIoStringPort: number,
 	intCounts: { [number]: number },
+	traceEnabled: boolean,
+	trace: { string },
+	traceIndex: number,
 	gdtr: { base: number, limit: number },
 	idtr: { base: number, limit: number },
 	ldtr: number,
@@ -222,6 +225,7 @@ export type Cpu = {
 	pmInterrupt: (self: Cpu, n: number, errorCode: number?, software: boolean?) -> (),
 	executeStep: (self: Cpu) -> number,
 	step: (self: Cpu) -> number,
+	traceDump: (self: Cpu, count: number) -> { string },
 	dump: (self: Cpu) -> { [string]: number },
 }
 
@@ -323,6 +327,9 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.lastIoStringCount = 0
 	self.lastIoStringPort = 0
 	self.intCounts = {}
+	self.traceEnabled = false
+	self.trace = {}
+	self.traceIndex = 0
 	self.defaultInts = {}
 	self.stubSeg = nil
 	self.intStubs = {}
@@ -3869,6 +3876,10 @@ end
 -- Paging faults unwind the faulting instruction after #PF has been delivered.
 -- The pcall is only paid while CR0.PG is set; real-mode/PM bring-up stays fast.
 function Cpu.step(self: Cpu): number
+	if self.traceEnabled then
+		self.traceIndex = (self.traceIndex % 4096) + 1
+		self.trace[self.traceIndex] = ("%04X:%08X"):format(self.cs, self.ip)
+	end
 	if not self:pagingEnabled() then
 		return (self :: any):executeStep()
 	end
@@ -3883,6 +3894,16 @@ function Cpu.step(self: Cpu): number
 		error(result, 0)
 	end
 	return result :: number
+end
+
+function Cpu.traceDump(self: Cpu, count: number): { string }
+	const out: { string } = {}
+	const total = math.min(count, #self.trace)
+	for index = total, 1, -1 do
+		const slot = ((self.traceIndex - index) % 4096) + 1
+		out[#out + 1] = self.trace[slot] or "?"
+	end
+	return out
 end
 
 function Cpu.dump(self: Cpu): { [string]: number }
