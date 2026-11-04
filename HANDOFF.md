@@ -69,27 +69,28 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   the ring-0 stack switch; IRETD/RETF pop the correct 16/32-bit frame slots;
   #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
   are correct. CPU, 386 frame and XMS suites are in the gate again.
-- **Tests:** `lune run tools/check.lua` passes with 333 assertions.
+- **Tests:** `lune run tools/check.lua` passes with 600 assertions.
 - **M1 bring-up (commit `4fbd3bc`):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
   (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
   FreeDOS LiveCD. SeaBIOS detects both drives, shows its boot menu, and starts
   the CD entry.
-- **Measured M1 fault (commit `docs: add M1 relay report`):** selecting the
-  FreeDOS LiveCD entry gives `bad FF /7` at `F000:85ED`, PC `F000:85EF`, after
-  6M steps (38 IRQs, 0 page faults). The trace shows the real-mode IRQ thunk
-  `F000:D2EC` → generic EOI `F000:FA67` → IRET to `F000:0000`; the interrupt
-  return frame is wrong. Full evidence and next actions are in
-  `docs/M1-REPORT.md`.
+- **ATAPI command set (commit `acae154`):** READ(10/12/16), GET CONFIGURATION,
+  MODE SENSE 6/10, READ TOC formats, READ HEADER, VERIFY/SEEK and correct
+  sense/status. Real FD13LIVE El Torito LBA 17/403/404 reads are byte-exact.
+- **Network (commit `ea7f43d`):** `Ne2000.lua` (DP8390 registers, remote DMA,
+  ring, IRQ mask) and `Isp.lua` (ARP, IPv4/ICMP, DHCP, DNS) with link tests.
+- **Video (commit `ea7f43d`):** `VgaSink.lua` dirty-region presenter and
+  `roblox/ui/VgaView.lua` EditableImage/ImageLabel adapter. Input/client bridge
+  is in progress.
 
 ### Next blockers
 
-1. Fix the real-mode IRQ return frame during the VGA/option-ROM boot thunk;
-   add a regression that raises IRQ0 inside an INT10 frame and checks IRET.
-2. Finish ATAPI boot: verify the El Torito no-emulation entry and get a
-   FreeDOS banner or `A:\>` prompt.
-3. Wire the VGA EditableImage sink and UserInputService keyboard/mouse bridge
-   (KBC modules and tests already exist; SeaBIOS IRQ1 currently EOIs without
-   reading 0x60).
+1. SeaBIOS boot selection: the IRQ return-frame bug is fixed, but the BEV list
+   still starts at the floppy fallback instead of `boot_cdrom`. ACPI/PNP0303 and
+   fw_cfg bootorder are the current leads.
+2. Once CD boot is selected, get the FreeDOS banner or the next fault with
+   PC/register evidence. ATAPI El Torito reads are already byte-exact.
+3. Finish the Roblox input/client bridge around the new `VgaView`/`VgaSink`.
 4. Then IDE writes/MBR partitions, SVGA, x87, and the Win98 SE installer path.
 
 
