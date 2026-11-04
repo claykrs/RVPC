@@ -1,0 +1,10 @@
+std = "luau"
+
+[lints]
+# Handlers rebind cs/ip/ax-style locals on purpose; shadowing is not a defect
+# in an emulator this dense.
+shadowing = "allow"
+
+
+[config]
+empty_if = { comments_count = true }

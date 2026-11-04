@@ -1,0 +1,35 @@
+# copyrighted media -- never commit
+media/
+roms/
+*.iso
+*.img
+*.vhd
+*.vfd
+win98se-media.zip
+
+# host tooling binaries
+tools/bin/
+
+# generated import models / places
+Rvdm98.rbxmx
+Rvdm98.rbxm
+Rvdm98-demo.rbxlx
+Rvdm98-demo.rbxl
+
+# generated Studio deploy payload
+tools/deploy_args.json
+
+# generated VGA test images
+tools/vga_test*.ppm
+
+# emulator memory dumps and local probes
+tools/memdump.bin
+tools/dump_*
+tools/*.bin
+tools/mcp_schema.mjs
+tools/probe_*
+tools/studio_*.json
+
+# Python analysis caches
+__pycache__/
+*.pyc

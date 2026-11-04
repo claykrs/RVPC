@@ -1,0 +1,15 @@
+{
+	"name": "Rvdm98",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"Rvdm98": {
+				"$path": "core"
+			},
+			"Rvdm98Ui": {
+				"$path": "roblox/ui"
+			}
+		}
+	}
+}
