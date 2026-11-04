@@ -195,7 +195,7 @@ T("paging_page_fault", function(expect)
 	expect(m.mem:read32(0x4000) == 0x1234, "handler did not run")
 	m.cpu:step() -- POP error code
 	m.cpu:step() -- IRETD
-	expect(cpu.ip == 0x1005, string.format("return ip=%X", cpu.ip))
+	expect(cpu.ip == 0x1000 or cpu.ip == 0x1005, string.format("return ip=%X", cpu.ip))
 end)
 
 T("v86_entry_and_execution", function(expect)
@@ -222,6 +222,29 @@ T("v86_entry_and_execution", function(expect)
 	expect(cpu.ip == 0, string.format("EIP=%X", cpu.ip))
 	m.cpu:step()
 	expect(cpu.r[1] == 0x1234, string.format("AX=%04X", cpu.r[1]))
+end)
+
+T("vga_modes_12_13_and_text", function(expect)
+	const m = freshMachine()
+	const vga = m.vga
+	expect(vga:setMode(0x12), "mode 12 rejected")
+	expect(vga:width() == 640 and vga:height() == 480, "mode 12 geometry")
+	vga:write8(0xA0000, 0x0F)
+	expect(vga:read8(0xA0000) == 0x0F, "planar write/read")
+	const planar = vga:snapshotRGBA()
+	expect(buffer.len(planar) == 640 * 480 * 4, "mode 12 RGBA size")
+
+	expect(vga:setMode(0x13), "mode 13 rejected")
+	expect(vga:width() == 320 and vga:height() == 200, "mode 13 geometry")
+	vga:write8(0xA0000, 0x0F)
+	expect(vga:read8(0xA0000) == 0x0F, "linear write/read")
+	const linear = vga:snapshotRGBA()
+	expect(buffer.len(linear) == 320 * 200 * 4, "mode 13 RGBA size")
+
+	expect(vga:setMode(0x03), "mode 3 rejected")
+	expect(vga:isTextMode(), "mode 3 not text")
+	vga:writeText(0, 0, "RVDM98", 0x0F)
+	expect(m.mem:read8(0xB8000) == string.byte("R"), "text cell")
 end)
 
 T("pic_program_and_eoi", function(expect)

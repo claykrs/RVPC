@@ -54,6 +54,17 @@ function Xms.new(machine: any): Xms
 	machine.mem:write8(lshift(ENTRY_SEG, 4) + ENTRY_OFF, 0xCD)
 	machine.mem:write8(lshift(ENTRY_SEG, 4) + ENTRY_OFF + 1, 0x9F)
 	machine.mem:write8(lshift(ENTRY_SEG, 4) + ENTRY_OFF + 2, 0xCB)
+	-- The no-ROM test/hypervisor machine installs every IVT vector as a far
+	-- return at F000:0100. Hook the two DPMI-era services here so INT 2Fh and
+	-- the far XMS entry reach the driver without a DOS layer.
+	machine.cpu.defaultInts[0x2F] = function()
+		self:int2f()
+	end
+	machine.cpu.defaultInts[0x9F] = function()
+		self:dispatch()
+	end
+	machine.cpu:registerStub(0x2F, 0xF000, 0x0100)
+	machine.cpu:registerStub(0x9F, 0xF000, 0x0100)
 	return self
 end
 

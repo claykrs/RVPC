@@ -29,7 +29,7 @@ const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rsh
 const Memory = {}
 Memory.__index = Memory
 
-Memory.SIZE = 1024 * 1024
+Memory.SIZE = 16 * 1024 * 1024
 Memory.ROM_BASE = 0xE0000
 Memory.ROM_SIZE = 0x40000
 Memory.ROM_ALIAS = 0xF0000 -- legacy entry point inside the 256 KiB image
@@ -62,6 +62,7 @@ export type Memory = typeof(setmetatable(
 		romLowOffset: number,
 		romHighBase: number,
 		romShadowed: boolean,
+		lowRomLocked: boolean,
 	},
 	Memory
 ))
@@ -85,6 +86,7 @@ function Memory.new(size: number?): Memory
 		romLowOffset = 0,
 		romHighBase = 0,
 		romShadowed = false,
+		lowRomLocked = false,
 	}, Memory)
 end
 
@@ -123,6 +125,13 @@ end
 
 function Memory:hasRom(): boolean
 	return self.rom ~= nil
+end
+
+-- SeaBIOS locks the legacy BIOS shadow through the i440FX PAM registers just
+-- before boot. Keeping C0000-FFFFF writable after that lets a boot loader's
+-- El Torito image overwrite the running firmware.
+function Memory:lockLowRom(locked: boolean)
+	self.lowRomLocked = locked
 end
 
 -- Option ROMs are shadowed into the C0000-DFFFF expansion window. The window
@@ -226,7 +235,7 @@ function Memory:read16(addr: number): number
 	if self:isRam(addr, 2) then
 		return buffer.readu16(self.buf, addr)
 	end
-	if addr >= APERTURE_START and addr < APERTURE_END and self.aperture then
+	if addr >= APERTURE_START and addr + 1 <= APERTURE_END and self.aperture then
 		return self.aperture:read16(addr)
 	end
 	return bor(self:read8(addr), lshift(self:read8(addr + 1), 8))
@@ -243,6 +252,9 @@ end
 function Memory:write8(addr: number, value: number)
 	addr = self:translate(addr)
 	if self:isProtected(addr) then
+		return
+	end
+	if self.lowRomLocked and addr >= 0xC0000 and addr <= 0xFFFFF then
 		return
 	end
 	if self:isRam(addr, 1) then
@@ -265,11 +277,16 @@ function Memory:write16(addr: number, value: number)
 	if self:isProtected(addr) then
 		return
 	end
+	if self.lowRomLocked and addr <= 0xFFFFF and addr + 1 >= 0xC0000 then
+		self:write8(addr, band(value, 0xFF))
+		self:write8(addr + 1, band(rshift(value, 8), 0xFF))
+		return
+	end
 	if self:isRam(addr, 2) then
 		buffer.writeu16(self.buf, addr, band(value, 0xFFFF))
 		return
 	end
-	if addr >= APERTURE_START and addr < APERTURE_END and self.aperture then
+	if addr >= APERTURE_START and addr + 1 <= APERTURE_END and self.aperture then
 		self.aperture:write16(addr, value)
 		return
 	end
@@ -280,6 +297,12 @@ end
 function Memory:write32(addr: number, value: number)
 	addr = self:translate(addr)
 	if self:isProtected(addr) then
+		return
+	end
+	if self.lowRomLocked and addr <= 0xFFFFF and addr + 3 >= 0xC0000 then
+		for index = 0, 3 do
+			self:write8(addr + index, band(rshift(value, index * 8), 0xFF))
+		end
 		return
 	end
 	if self:isRam(addr, 4) then

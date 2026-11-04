@@ -113,6 +113,13 @@ export type Cpu = {
 	lastPageFault: { addr: number, errorCode: number, write: boolean, user: boolean }?,
 	inPageFault: boolean,
 	aborting: boolean,
+	-- Start of the instruction currently executing (architectural fault EIP) and
+	-- the pending fault context used when a #PF or synchronous exception frame
+	-- is built.
+	opIP: number,
+	opCS: number,
+	faultIP: number?,
+	faultCS: number?,
 	tsc: number,
 	lastIoStringDest: number,
 	lastIoStringCount: number,
@@ -173,6 +180,7 @@ export type Cpu = {
 		fetch: boolean,
 		present: boolean?
 	) -> (),
+	fault: (self: Cpu, n: number, errorCode: number?) -> (),
 	read8: (self: Cpu, addr: number, supervisor: boolean?) -> number,
 	read16: (self: Cpu, addr: number, supervisor: boolean?) -> number,
 	read32: (self: Cpu, addr: number, supervisor: boolean?) -> number,
@@ -306,6 +314,10 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.lastPageFault = nil
 	self.inPageFault = false
 	self.aborting = false
+	self.opIP = 0
+	self.opCS = 0
+	self.faultIP = nil
+	self.faultCS = nil
 	self.tsc = 0
 	self.lastIoStringDest = 0
 	self.lastIoStringCount = 0
@@ -381,6 +393,12 @@ function Cpu.pagingEnabled(self: Cpu): boolean
 	return band(self.cr0, CR0_PG) ~= 0
 end
 
+function Cpu.fault(self: Cpu, n: number, errorCode: number?)
+	self.faultIP = self.opIP
+	self.faultCS = self.opCS
+	self:interrupt(n, errorCode, false)
+end
+
 -- Deliver a page fault. The exception frame is built by the normal IDT path;
 -- the sentinel unwinds the faulting instruction so no partial architectural
 -- result escapes. Nested faults during frame construction are fatal.
@@ -408,6 +426,8 @@ function Cpu.pageFault(
 		errorCode = bor(errorCode, 16) -- 486 I/D bit
 	end
 	self.lastPageFault = { addr = addr, errorCode = errorCode, write = write, user = user }
+	self.faultIP = self.opIP
+	self.faultCS = self.opCS
 	if self.inPageFault then
 		self:tripleFault()
 		self.aborting = true
@@ -590,6 +610,12 @@ function Cpu.reset(self: Cpu)
 	self.dr = { 0, 0, 0, 0 }
 	self.inPageFault = false
 	self.aborting = false
+	self.faultIP = nil
+	self.faultCS = nil
+	self.opIP = 0
+	self.opCS = 0
+	self.tsc = 0
+	self.intCounts = {}
 	self.gdtr = { base = 0, limit = 0 }
 	self.idtr = { base = 0, limit = 0 }
 	self.ldtr = 0
@@ -957,6 +983,18 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		else band(offsetLow, 0xFFFF)
 	const v86 = self:isV86()
 	const savedFlags = self.flags
+	-- Synchronous exceptions restart at the faulting instruction. Software
+	-- INTs and hardware IRQs save the next instruction. IRET must be able to
+	-- retry a faulting access after the handler has mapped the page.
+	const savedIP = if software then self.ip else (self.faultIP or self.ip)
+	const savedCS = if software then self.cs else (self.faultCS or self.cs)
+	-- A V86 interrupt switches to ring 0 before the frame is written and before
+	-- SS/CS are reloaded from the GDT. Clearing VM here (the saved copy keeps
+	-- the guest's VM bit) makes the stack writes supervisor accesses and makes
+	-- loadSeg take the protected-mode descriptor path.
+	if v86 then
+		self.flags = band(self.flags, bnot(VM))
+	end
 	if targetRing < cpl then
 		if self.tr == 0 or self.trBase == 0 then
 			error(("#GP: INT %02X needs a loaded TSS for ring %d"):format(n, targetRing))
@@ -1014,8 +1052,8 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		writeStack(oldSs)
 		writeStack(oldSp)
 		writeStack(savedFlags)
-		writeStack(self.cs)
-		writeStack(self.ip)
+		writeStack(savedCS)
+		writeStack(savedIP)
 		if errorCode ~= nil then
 			writeStack(errorCode)
 		end
@@ -1025,8 +1063,8 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		self.ip = targetOffset
 	else
 		self:pushValue(savedFlags, frameWidth)
-		self:pushValue(self.cs, frameWidth)
-		self:pushValue(self.ip, frameWidth)
+		self:pushValue(savedCS, frameWidth)
+		self:pushValue(savedIP, frameWidth)
 		if errorCode ~= nil then
 			self:pushValue(errorCode, frameWidth)
 		end
@@ -1038,6 +1076,8 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 	if gateType == 0x06 or gateType == 0x0E then
 		self:setbits(IFF, false)
 	end
+	self.faultIP = nil
+	self.faultCS = nil
 end
 
 function Cpu.linear(self: Cpu, reg: string, off: number, size: number): number
@@ -2111,7 +2151,8 @@ H[0xA8] = function(cpu: any)
 	doALU(cpu, 4, cpu:rb(0), cpu:fetch8(), false)
 end
 H[0xA9] = function(cpu: any)
-	doALU(cpu, 4, cpu:rr(0), cpu:fetch16(), true)
+	const width = if cpu.operand32 then 32 else 16
+	doALU(cpu, 4, cpu:rrw(0), if width == 32 then cpu:fetch32() else cpu:fetch16(), width)
 end
 
 for i = 0, 7 do
@@ -2178,11 +2219,11 @@ end
 local function retf(cpu: any, extra: number)
 	const width = if cpu.operand32 then 4 else 2
 	const ip = cpu:popValue(width)
-	const csSel = cpu:pop16()
+	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	local outerSp, outerSs
 	if cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
 		outerSp = cpu:popValue(width)
-		outerSs = cpu:pop16()
+		outerSs = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	end
 	cpu.ip = ip
 	cpu:loadSeg("cs", csSel)
@@ -2217,19 +2258,28 @@ end
 H[0xCF] = function(cpu: any) -- IRET / IRETD
 	const width = if cpu.operand32 then 4 else 2
 	const ip = if width == 4 then cpu:pop32() else cpu:pop16()
-	const csSel = cpu:pop16()
+	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	const newFlags = if width == 4 then cpu:pop32() else cpu:pop16()
 	const wasEnabled = cpu:getF(IFF)
 	const targetV86 = band(newFlags, VM) ~= 0
 	local outerSp, outerSs
 	local outerSegs: { number }? = nil
 	if targetV86 and cpu:cpl() == 0 then
-		outerSp = cpu:pop32()
-		outerSs = cpu:pop16()
-		outerSegs = { cpu:pop32(), cpu:pop32(), cpu:pop32(), cpu:pop32() } -- ES DS FS GS
+		-- A V86 frame stores ESP, SS, ES, DS, FS and GS as 32-bit slots even
+		-- when the monitor's IRET is 32-bit. CS/SS are 16-bit selectors in the
+		-- low half of their slot.
+		if width == 4 then
+			outerSp = cpu:pop32()
+			outerSs = band(cpu:pop32(), 0xFFFF)
+			outerSegs = { cpu:pop32(), cpu:pop32(), cpu:pop32(), cpu:pop32() } -- ES DS FS GS
+		else
+			outerSp = cpu:pop16()
+			outerSs = band(cpu:pop16(), 0xFFFF)
+			outerSegs = { cpu:pop16(), cpu:pop16(), cpu:pop16(), cpu:pop16() }
+		end
 	elseif cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
-		outerSp = if width == 4 then cpu:pop32() else cpu:pop16()
-		outerSs = cpu:pop16()
+		outerSp = cpu:popValue(width)
+		outerSs = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	end
 	cpu.flags = bor(band(newFlags, cpu.flagMask), cpu.fixedFlags)
 	cpu.ip = ip
@@ -2304,7 +2354,7 @@ end
 H[0xD4] = function(cpu: any) -- AAM imm
 	local base = cpu:fetch8()
 	if base == 0 then
-		cpu:interrupt(0)
+		cpu:fault(0)
 		return
 	end
 	local al = cpu:rb(0)
@@ -2642,7 +2692,7 @@ local function group3(cpu: any, w: boolean)
 			const hi = cpu:rr32(2)
 			const lo = cpu:rr32(0)
 			if dv == 0 or hi >= dv then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			const q, rem = div64by32(hi, lo, dv)
@@ -2652,7 +2702,7 @@ local function group3(cpu: any, w: boolean)
 			const dv = cpu:readRM16(e)
 			const n = bor(lshift(cpu:rr(2), 16), cpu:rr(0))
 			if dv == 0 or n >= lshift(dv, 16) then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			cpu:wr(0, math.floor(n / dv))
@@ -2661,7 +2711,7 @@ local function group3(cpu: any, w: boolean)
 			const dv = cpu:readRM8(e)
 			const n = cpu:rr(0)
 			if dv == 0 or n >= lshift(dv, 8) then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			cpu:wb(0, math.floor(n / dv))
@@ -2671,7 +2721,7 @@ local function group3(cpu: any, w: boolean)
 		if width == 32 then
 			const dvSigned = sign32(cpu:readRM32(e))
 			if dvSigned == 0 then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			const nHi = cpu:rr32(2)
@@ -2684,14 +2734,14 @@ local function group3(cpu: any, w: boolean)
 			end
 			const magDiv = math.abs(dvSigned)
 			if magHi >= magDiv then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			local q, rem = div64by32(magHi, magLo, magDiv)
 			const negativeQ = negativeN ~= negativeD
 			if negativeQ then
 				if q > 0x80000000 then
-					cpu:interrupt(0)
+					cpu:fault(0)
 					return
 				end
 				q = band(0 - q, 0xFFFFFFFF)
@@ -2699,7 +2749,7 @@ local function group3(cpu: any, w: boolean)
 					rem = band(0 - rem, 0xFFFFFFFF)
 				end
 			elseif q > 0x7FFFFFFF then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			cpu:wr32(0, q)
@@ -2707,14 +2757,14 @@ local function group3(cpu: any, w: boolean)
 		elseif width == 16 then
 			const dv = sign16(cpu:readRM16(e))
 			if dv == 0 then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			const n = sign32(bor(lshift(cpu:rr(2), 16), cpu:rr(0)))
 			const q = truncDiv(n, dv)
 			const r = n - q * dv
 			if q < -0x8000 or q > 0x7FFF then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			cpu:wr(0, band(q, 0xFFFF))
@@ -2722,14 +2772,14 @@ local function group3(cpu: any, w: boolean)
 		else
 			const dv = sign8(cpu:readRM8(e))
 			if dv == 0 then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			const n = sign16(cpu:rr(0))
 			const q = truncDiv(n, dv)
 			const r = n - q * dv
 			if q < -0x80 or q > 0x7F then
-				cpu:interrupt(0)
+				cpu:fault(0)
 				return
 			end
 			cpu:wb(0, band(q, 0xFF))
@@ -2910,7 +2960,7 @@ local function bound(cpu: any)
 	const lower = sign16(cpu:read16(addr))
 	const upper = sign16(cpu:read16(addr + 2))
 	if index < lower or index > upper then
-		cpu:interrupt(5)
+		cpu:fault(5)
 	end
 end
 local function imulImm(cpu: any, wide: boolean)
@@ -3312,7 +3362,7 @@ H0F[0x00] = function(cpu: any)
 		const selector = cpu:readRM16(e)
 		const desc = readDescriptor(cpu, selector)
 		if not desc then
-			cpu:interrupt(13)
+			cpu:fault(13)
 			return
 		end
 		if e.reg == 2 then
@@ -3717,12 +3767,15 @@ function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boole
 		return
 	end
 	if lo ~= 0 or hi ~= 0 then
+		const returnIP = if software then self.ip else (self.faultIP or self.ip)
 		self:push16(self.flags)
 		self:push16(self.cs)
-		self:push16(self.ip)
+		self:push16(returnIP)
 		self.flags = bor(band(self.flags, bnot(bor(TF, IFF))), ALWAYS)
 		self.ip = lo
 		self.cs = hi
+		self.faultIP = nil
+		self.faultCS = nil
 		return
 	end
 	if not handler then
@@ -3753,6 +3806,10 @@ function Cpu.executeStep(self: Cpu): number
 	if self.irqDelay > 0 then
 		self.irqDelay -= 1
 	end
+	self.opIP = self.ip
+	self.opCS = self.cs
+	self.faultIP = nil
+	self.faultCS = nil
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil

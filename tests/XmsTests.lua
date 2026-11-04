@@ -57,6 +57,7 @@ T("xms_install_check_286", {
 })
 
 T("xms_install_check_8086_absent", {
+	config = { cpu = { cpuLevel = "8086" }, memorySize = 4 * 1024 * 1024 },
 	setup = function(m)
 		putCode(m, { 0xB8, 0x00, 0x43, 0xCD, 0x2F })
 		fresh(m)

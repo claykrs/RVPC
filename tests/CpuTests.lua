@@ -281,16 +281,17 @@ T("div_byte", {
 T("div_byte_overflow_interrupt0", {
 	setup = function(m)
 		putCode(m, { 0xB8, 0x00, 0x04, 0xB3, 0x01, 0xF6, 0xF3 }) -- AX=1024, BL=1, DIV BL
+		-- Vector 0 -> 0600:0500. The handler records dispatch and halts.
+		putData(m, 0x500, { 0xC6, 0x06, 0x00, 0x03, 0xAA, 0xF4 }) -- MOV BYTE [0300],AA; HLT
+		m.mem:write16(0, 0x0500)
+		m.mem:write16(2, 0x0600)
 		fresh(m)
 	end,
-	steps = 500,
+	steps = 50,
 	check = function(m, _cpu, expect)
-		expect(m.cpu.halted, "machine did not halt")
-		expect(m.exitCode == 0, "exitCode=" .. tostring(m.exitCode))
-		expect(
-			string.find(m:outputText(), "Divide overflow", 1, true) ~= nil,
-			"no divide overflow message"
-		)
+		expect(m.cpu.halted, "machine did not halt in #DE handler")
+		expect(m.cpu.intCounts[0] == 1, "INT0 count=" .. tostring(m.cpu.intCounts[0]))
+		expect(m.mem:read8(0x6300) == 0xAA, "divide-overflow handler did not run")
 	end,
 })
 
@@ -408,7 +409,9 @@ T("push_sp_quirk", {
 		m.cpu.r[5] = 0x1234
 	end,
 	check = function(_m, cpu, expect)
-		expect(cpu.r[1] == 0x1232, "AX=" .. cpu.r[1]) -- 8086 pushes decremented SP
+		-- 386/486 PUSH SP stores the value before the decrement; the decremented
+		-- form is the 8086 quirk only.
+		expect(cpu.r[1] == 0x1234, "AX=" .. cpu.r[1])
 		expect(cpu.r[5] == 0x1234, "SP=" .. cpu.r[5])
 	end,
 })
@@ -422,7 +425,9 @@ T("pushf_popf", {
 	check = function(m, cpu, expect)
 		expect(cpu:getF(1), "CF not restored by POPF")
 		local pushed = m.mem:read16(0x6000 + 0x7FE)
-		expect(band(pushed, 0xF002) == 0xF002, "pushed flags=" .. string.format("%04X", pushed))
+		-- 386+ real-mode FLAGS: reserved bits 12-15 read zero, bit 1 is set,
+		-- and STC set CF.
+		expect(band(pushed, 0xF003) == 0x0003, "pushed flags=" .. string.format("%04X", pushed))
 	end,
 })
 
@@ -531,14 +536,31 @@ T("int_iret_program_handler", {
 	end,
 })
 
-T("int21_print_a", {
+T("int21_dispatch_and_iret", {
 	setup = function(m)
-		putCode(m, { 0xB4, 0x02, 0xB2, 0x41, 0xCD, 0x21, 0xB8, 0x00, 0x4C, 0xCD, 0x21 })
+		putCode(m, { 0xB4, 0x02, 0xB2, 0x41, 0xCD, 0x21, 0xB8, 0x34, 0x12, 0xF4 })
+		-- Vector 21h -> 0600:0500. Handler saves AH/DL then IRETs.
+		putData(m, 0x500, {
+			0x88,
+			0x26,
+			0x00,
+			0x03, -- MOV [0300],AH
+			0x88,
+			0x16,
+			0x01,
+			0x03, -- MOV [0301],DL
+			0xCF, -- IRET
+		})
+		m.mem:write16(0x21 * 4, 0x0500)
+		m.mem:write16(0x21 * 4 + 2, 0x0600)
 		fresh(m)
 	end,
-	check = function(m, _cpu, expect)
-		expect(m:outputText() == "A", "output=" .. m:outputText())
-		expect(m.exitCode == 0, "exitCode=" .. tostring(m.exitCode))
+	steps = 20,
+	check = function(m, cpu, expect)
+		expect(m.mem:read8(0x6300) == 0x02, "AH not visible in INT 21 handler")
+		expect(m.mem:read8(0x6301) == 0x41, "DL not visible in INT 21 handler")
+		expect(cpu.r[1] == 0x1234, string.format("AX after IRET=%04X", cpu.r[1]))
+		expect(cpu.halted, "IRET did not return to caller")
 	end,
 })
 

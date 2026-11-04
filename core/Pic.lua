@@ -68,8 +68,24 @@ function Pic.reset(self: Pic)
 	self.pendingVector = nil
 end
 
+local function highestIsr(chip: Chip): number?
+	for bit = 0, 7 do
+		if band(chip.isr, lshift(1, bit)) ~= 0 then
+			return bit
+		end
+	end
+	return nil
+end
+
+-- The 8259 fixed-priority resolver: an in-service IRQ blocks itself and all
+-- lower-priority IRQs. Only a higher-priority request may preempt it. Ignoring
+-- ISR here would redeliver the same level and nest handlers incorrectly.
 local function bestIrq(chip: Chip): number?
-	const eligible = band(chip.irr, bnot(chip.imr))
+	local eligible = band(chip.irr, bnot(chip.imr))
+	const inService = highestIsr(chip)
+	if inService ~= nil then
+		eligible = band(eligible, lshift(1, inService) - 1)
+	end
 	if eligible == 0 then
 		return nil
 	end
@@ -136,20 +152,15 @@ function Pic.acknowledge(self: Pic): (number?, number?)
 	return self.master.vectorBase + masterIrq, masterIrq
 end
 
-local function highestIsr(chip: Chip): number?
-	for bit = 0, 7 do
-		if band(chip.isr, lshift(1, bit)) ~= 0 then
-			return bit
-		end
-	end
-	return nil
-end
-
 function Pic.eoi(self: Pic, irq: number?)
 	if irq ~= nil then
 		if irq >= 8 then
 			self.slave.isr = setBit(self.slave.isr, irq - 8, false)
-			self.master.isr = setBit(self.master.isr, 2, false)
+			-- Only release the cascade line once the slave has no in-service
+			-- interrupts left.
+			if self.slave.isr == 0 then
+				self.master.isr = setBit(self.master.isr, 2, false)
+			end
 		else
 			self.master.isr = setBit(self.master.isr, irq, false)
 		end
@@ -166,6 +177,19 @@ function Pic.eoi(self: Pic, irq: number?)
 		if slaveBit ~= nil then
 			self.slave.isr = setBit(self.slave.isr, slaveBit, false)
 		end
+	end
+end
+
+-- A non-specific EOI written to the slave command port clears the slave, not
+-- the master. This is the normal end of an IRQ8-15 handler sequence.
+local function eoiSlave(self: Pic)
+	const slaveBit = highestIsr(self.slave)
+	if slaveBit == nil then
+		return
+	end
+	self.slave.isr = setBit(self.slave.isr, slaveBit, false)
+	if self.slave.isr == 0 then
+		self.master.isr = setBit(self.master.isr, 2, false)
 	end
 end
 
@@ -189,6 +213,8 @@ local function writeChip(self: Pic, chip: Chip, port: number, value: number)
 		if band(value, 0x20) ~= 0 then
 			if band(value, 0x40) ~= 0 then
 				self:eoi(band(value, 7) + (if chip == self.slave then 8 else 0))
+			elseif chip == self.slave then
+				eoiSlave(self)
 			else
 				self:eoi(nil)
 			end
