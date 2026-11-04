@@ -31,6 +31,7 @@ export type Deps = {
 	FwCfg: any?,
 	Ide: any?,
 	Kbc: any?,
+	Fpu: any?,
 	Xms: any?,
 	Uart: any?,
 	Lpt: any?,
@@ -59,6 +60,7 @@ export type Machine = typeof(setmetatable(
 		fwcfg: any?,
 		ide: any?,
 		kbc: any?,
+		fpu: any?,
 		xms: any?,
 		uart: any?,
 		lpt: any?,
@@ -217,6 +219,9 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	end
 	if deps.Kbc then
 		self.kbc = deps.Kbc.new()
+	end
+	if deps.Fpu then
+		self.fpu = deps.Fpu.new()
 	end
 	if deps.Uart then
 		self.uart = deps.Uart.new(cfg.serial)
@@ -415,7 +420,11 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			io.out8(band(port + 3, 0xFFFF), band(rshift(value, 24), 0xFF))
 		end,
 	}
-	self.cpu = deps.Cpu.new(self.mem, io, cfg.cpu or { cpuLevel = "486" })
+	const cpuConfig = cfg.cpu or { cpuLevel = "486" }
+	if self.fpu then
+		cpuConfig.fpu = self.fpu
+	end
+	self.cpu = deps.Cpu.new(self.mem, io, cpuConfig)
 	self.cpu:reset()
 	if not self.mem:hasRom() then
 		-- Hypervisor fallback for the DOS-era unit tests: every vector returns

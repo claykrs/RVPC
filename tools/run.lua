@@ -11,6 +11,7 @@ local Cmos = require("../core/Cmos")
 local FwCfg = require("../core/FwCfg")
 local Ide = require("../core/Ide")
 local Kbc = require("../core/Kbc")
+local Fpu = require("../core/Fpu")
 local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
@@ -20,6 +21,7 @@ local Machine = require("../core/Machine")
 local smokeTests = require("../tests/SmokeTests")
 local cpuTests = require("../tests/CpuTests")
 local cpu386Tests = require("../tests/Cpu386Tests")
+local fpuTests = require("../tests/FpuTests")
 local xmsTests = require("../tests/XmsTests")
 local memoryTests = require("../tests/MemoryTests")
 local systemTests = require("../tests/SystemTests")
@@ -43,6 +45,7 @@ const deps = {
 	FwCfg = FwCfg,
 	Ide = Ide,
 	Kbc = Kbc,
+	Fpu = Fpu,
 	Ne2000 = Ne2000,
 	Isp = Isp,
 	Xms = Xms,
@@ -92,6 +95,7 @@ end
 runSuite("smoke", smokeTests)
 runSuite("cpu", cpuTests)
 runDirectSuite("cpu386", cpu386Tests)
+runDirectSuite("fpu", fpuTests)
 runSuite("xms", xmsTests)
 runDirectSuite("memory", memoryTests)
 runDirectSuite("system", systemTests)

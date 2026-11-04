@@ -5,6 +5,7 @@ const Rvpc = {}
 
 Rvpc.Memory = require(script.Memory)
 Rvpc.Cpu = require(script.Cpu)
+Rvpc.Fpu = require(script.Fpu)
 Rvpc.Vga = require(script.Vga)
 Rvpc.VgaSink = require(script.VgaSink)
 Rvpc.InputMap = require(script.InputMap)

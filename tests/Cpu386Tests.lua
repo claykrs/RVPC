@@ -347,4 +347,65 @@ T("pic_priority_and_slave_eoi", function(expect)
 	expect(pic.master.isr == 0, "slave EOI did not release cascade")
 end)
 
+T("sib_index_with_disp32", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	putCode(m, 0x1000, {
+		0xB8,
+		0x01,
+		0x00,
+		0x00,
+		0x00, -- MOV EAX,1
+		0xC7,
+		0x04,
+		0xC5,
+		0x00,
+		0x06,
+		0x00,
+		0x00,
+		0x44,
+		0x33,
+		0x22,
+		0x11, -- MOV DWORD [EAX*8+0x600],0x11223344
+		0xB8,
+		0x02,
+		0x00,
+		0x00,
+		0x00, -- MOV EAX,2
+		0xC7,
+		0x04,
+		0xC5,
+		0x00,
+		0x06,
+		0x00,
+		0x00,
+		0x88,
+		0x77,
+		0x66,
+		0x55, -- MOV DWORD [EAX*8+0x600],0x55667788
+		0xF4,
+	})
+	m:run(10)
+	expect(m.mem:read32(0x608) == 0x11223344, "EAX*8+600")
+	expect(m.mem:read32(0x610) == 0x55667788, "EAX*8+600 page 2")
+	expect(m.mem:read32(0x600) == 0, "index was dropped into slot 0")
+end)
+
+T("lldt_null_is_legal", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	putCode(m, 0x1000, {
+		0x31,
+		0xC0, -- XOR EAX,EAX
+		0x0F,
+		0x00,
+		0xD0, -- LLDT AX
+		0xF4,
+	})
+	m:run(4)
+	expect(m.cpu.ldtr == 0, "LDTR=" .. m.cpu.ldtr)
+	expect(m.cpu.tripleFaults == 0, "null LLDT faulted")
+	expect(m.cpu.halted, "LLDT did not complete")
+end)
+
 return TESTS

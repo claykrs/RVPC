@@ -17,6 +17,7 @@ const Cmos = require("../core/Cmos")
 const FwCfg = require("../core/FwCfg")
 const Ide = require("../core/Ide")
 const Kbc = require("../core/Kbc")
+const Fpu = require("../core/Fpu")
 const Xms = require("../core/Xms")
 const Uart = require("../core/Uart")
 const Lpt = require("../core/Lpt")
@@ -24,7 +25,9 @@ const Machine = require("../core/Machine")
 
 const BIOS_PATH = "roms/bios-256k.bin"
 const VGA_ROM_PATH = "roms/vgabios-stdvga.bin"
-const CDROM_PATH = "media/FD13LIVE.iso"
+const CDROM_PATH = if fs.isFile("media/freedos-boot.iso")
+	then "media/freedos-boot.iso"
+	else "media/FD13LIVE.iso"
 const HDD_PATH = "media/hdd.img"
 
 if not fs.isFile(BIOS_PATH) then
@@ -69,6 +72,7 @@ const machine = Machine.new({
 	FwCfg = FwCfg,
 	Ide = Ide,
 	Kbc = Kbc,
+	Fpu = Fpu,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -107,7 +111,7 @@ print(
 		)
 )
 
-local limitMillions = tonumber(process.args[1] or "") or 20
+local limitMillions = tonumber(process.args[1] or "") or 40
 const budget = limitMillions * 1_000_000
 const chunk = 2_000_000
 local executed = 0
@@ -297,7 +301,7 @@ while executed < budget do
 		end
 	end
 	if
-		string.find(screen, "FreeDOS", 1, true)
+		string.find(screen, "FreeCom", 1, true)
 		or string.find(screen, "KERNEL", 1, true)
 		or string.find(screen, "A:\\>", 1, true)
 		or string.find(screen, "C:\\>", 1, true)

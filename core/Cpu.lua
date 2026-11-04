@@ -18,6 +18,7 @@ const FIXEDFLAGS = bor(0xF000, ALWAYS) -- bits 15-12 plus bit 1 read as 1 on 808
 const FIXEDFLAGS_286 = ALWAYS -- 286 real mode: bits 12-15 read as 0
 
 const CR0_PE = 0x00000001
+const CR0_EM = 0x00000004
 const CR0_TS = 0x00000008
 const CR0_WP = 0x00010000
 const CR0_PG = 0x80000000
@@ -83,6 +84,7 @@ export type Cpu = {
 	mem: any,
 	io: Io,
 	config: any,
+	fpu: any?,
 	level: number,
 	fixedFlags: number,
 	flagMask: number,
@@ -285,6 +287,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 		out8 = function() end,
 	}
 	self.config = config or {}
+	self.fpu = self.config.fpu
 	self.level = cpuLevelValue(self.config.cpuLevel)
 	self.fixedFlags = if self.level >= CPU_286 then FIXEDFLAGS_286 else FIXEDFLAGS
 	self.flagMask = if self.level >= CPU_386 then FLAGMASK_386 else FLAGMASK
@@ -663,6 +666,9 @@ function Cpu.reset(self: Cpu)
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil
+	if self.fpu then
+		self.fpu:reset()
+	end
 end
 
 function Cpu.tripleFault(self: Cpu)
@@ -1313,11 +1319,10 @@ function Cpu.modrm(self: Cpu): ModRM
 			elseif mod == 2 then
 				displacement = self:fetch32()
 			end
-			local value = (base or 0) + displacement
-			if index then
-				value += index * scale
-			end
-			off = band(value, 0xFFFFFFFF)
+			off = band((base or 0) + displacement, 0xFFFFFFFF)
+		end
+		if index then
+			off = band((off :: number) + index * scale, 0xFFFFFFFF)
 		end
 	else
 		if mod == 0 and rm == 6 then
@@ -2446,8 +2451,16 @@ end
 
 for i = 0, 7 do
 	H[0xD8 + i] = function(cpu: any)
-		cpu:modrm()
-	end -- ESC (x87 stub)
+		const e = cpu:modrm()
+		if not cpu.fpu then
+			return
+		end
+		if band(cpu.cr0, bor(CR0_EM, CR0_TS)) ~= 0 then
+			cpu:fault(7) -- #NM
+			return
+		end
+		cpu.fpu:execute(cpu, 0xD8 + i, e)
+	end
 end
 
 local function loopCommon(cpu: any, mode: number)
@@ -3427,6 +3440,13 @@ H0F[0x00] = function(cpu: any)
 		cpu:writeRM16(e, cpu.tr)
 	elseif e.reg == 2 or e.reg == 3 then
 		const selector = cpu:readRM16(e)
+		if e.reg == 2 and selector == 0 then
+			-- LLDT with a null selector is legal and invalidates LDTR.
+			cpu.ldtr = 0
+			cpu.ldtrBase = 0
+			cpu.ldtrLimit = 0
+			return
+		end
 		const desc = readDescriptor(cpu, selector)
 		if not desc then
 			cpu:fault(13)
@@ -3668,7 +3688,11 @@ H0F[0xA2] = function(cpu: any) -- CPUID
 		cpu:wr32(0, 0x00000400) -- 486-class signature
 		cpu:wr32(3, 0)
 		cpu:wr32(1, 0)
-		cpu:wr32(2, 0)
+		local edx = 0x00000010 -- TSC (RDTSC is implemented)
+		if cpu.fpu then
+			edx = bor(edx, 0x00000001) -- FPU present
+		end
+		cpu:wr32(2, edx)
 	elseif leaf == 0x80000000 then
 		cpu:wr32(0, 0x80000000)
 		cpu:wr32(3, 0)
