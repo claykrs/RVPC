@@ -17,20 +17,21 @@ commit `8f202f5`.
   IRQ5.
 - VBE/DISPI: 640x480, 800x600, 1024x768 at 8/16/32bpp, 4 MiB LFB at
   `0xE0000000`, BAR0 sizing; SeaVGABIOS reports `VBE DISPI: lfb_addr=...`.
-- NE2000 at 0x300/IRQ10 and virtual ISP (ARP, IPv4/ICMP, DHCP, DNS).
+- NE2000 at 0x300/IRQ10 and virtual ISP (ARP, IPv4/ICMP, DHCP, DNS, TCP and an
+  HTTP/1.0 server on port 80).
 - PS/2 keyboard IRQ1 and mouse IRQ12 machine tests; KBC IRQ edges are latched.
+- 82077 floppy controller at 0x3F0..0x3F7, IRQ6, DMA2; SeaBIOS boots
+  `media/freedos-boot.img` from A: to FreeCom. CMOS 0x10 reports 1.44M drives.
 - MBR/partition boot and no-emulation El Torito boot probes pass.
 - HDD write-back persists `media/hdd.img` / `media/win98-hdd.img`.
 
-Gate: `lune run tools/check.lua` → 1143 assertions.
+Gate: `lune run tools/check.lua` → 1251 assertions.
 
 ## Not yet verified
 
 - No Windows 98 SE media is staged, so the actual installer has not been run.
 - No ACPI/APM/SMBIOS tables; Win98 should install as Standard PC but power
   management and device enumeration are untested.
-- No physical floppy controller yet (freedos-boot.img is booted through El
-  Torito, not FDC).
 - VBE 4bpp planar modes, native BAR relocation, UDMA, 16-bit SB audio, FM
   synthesis and full 80-bit x87 precision are incomplete.
 - Task gates and some x87 exception traps remain unimplemented.
