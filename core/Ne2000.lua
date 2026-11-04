@@ -122,7 +122,7 @@ function Ne2000.new(config: Config?): Ne2000
 end
 
 function Ne2000.reset(self: Ne2000)
-	self.cmd = CR_STOP or CR_NODMA
+	self.cmd = bor(CR_STOP, CR_NODMA)
 	self.start = 0x46 * 256
 	self.stop = 0x80 * 256
 	self.boundary = 0x46
@@ -206,6 +206,7 @@ local function transmitPacket(self: Ne2000)
 	buffer.copy(frame, 0, self.mem, index, self.tcnt)
 	self.tsr = TSR_PTX
 	self.isr = bor(self.isr, ISR_TX)
+	self.cmd = band(self.cmd, bit32.bnot(CR_TXP))
 	if self.transmit then
 		self.transmit(frame)
 	end

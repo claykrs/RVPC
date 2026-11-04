@@ -4,6 +4,7 @@
 local Memory = require("../core/Memory")
 local Cpu = require("../core/Cpu")
 local Vga = require("../core/Vga")
+local VgaSink = require("../core/VgaSink")
 local Pic = require("../core/Pic")
 local Pit = require("../core/Pit")
 local Cmos = require("../core/Cmos")
@@ -14,6 +15,7 @@ local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
 local Ne2000 = require("../core/Ne2000")
+local Isp = require("../core/Isp")
 local Machine = require("../core/Machine")
 local smokeTests = require("../tests/SmokeTests")
 local cpuTests = require("../tests/CpuTests")
@@ -26,11 +28,14 @@ local kbcTests = require("../tests/KbcTests")
 local uartTests = require("../tests/UartTests")
 local lptTests = require("../tests/LptTests")
 local ne2000Tests = require("../tests/Ne2000Tests")
+local ispTests = require("../tests/IspTests")
+local vgaSinkTests = require("../tests/VgaSinkTests")
 
 const deps = {
 	Memory = Memory,
 	Cpu = Cpu,
 	Vga = Vga,
+	VgaSink = VgaSink,
 	Pic = Pic,
 	Pit = Pit,
 	Cmos = Cmos,
@@ -38,6 +43,7 @@ const deps = {
 	Ide = Ide,
 	Kbc = Kbc,
 	Ne2000 = Ne2000,
+	Isp = Isp,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -93,6 +99,8 @@ runDirectSuite("kbc", kbcTests)
 runDirectSuite("uart", uartTests)
 runDirectSuite("lpt", lptTests)
 runDirectSuite("ne2000", ne2000Tests)
+runDirectSuite("isp", ispTests)
+runDirectSuite("vga", vgaSinkTests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then
