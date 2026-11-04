@@ -70,24 +70,27 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
   are correct. CPU, 386 frame and XMS suites are in the gate again.
 - **Tests:** `lune run tools/check.lua` passes with 333 assertions.
-- **M1 bring-up (commit `4fbd3bc`, in progress):** `Ide.lua` (ATA/ATAPI PIO),
-  `Kbc.lua` (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD
-  plus a FreeDOS ISO. SeaBIOS reaches its boot menu and starts the CD entry.
+- **M1 bring-up (commit `4fbd3bc`):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
+  (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
+  FreeDOS LiveCD. SeaBIOS detects both drives, shows its boot menu, and starts
+  the CD entry.
+- **Measured M1 fault (commit `docs: add M1 relay report`):** selecting the
+  FreeDOS LiveCD entry gives `bad FF /7` at `F000:85ED`, PC `F000:85EF`, after
+  6M steps (38 IRQs, 0 page faults). The trace shows the real-mode IRQ thunk
+  `F000:D2EC` → generic EOI `F000:FA67` → IRET to `F000:0000`; the interrupt
+  return frame is wrong. Full evidence and next actions are in
+  `docs/M1-REPORT.md`.
 
 ### Next blockers
 
-1. FreeDOS boot: the earlier tiny El Torito floppy-emulation CD faulted at
-   `F000:85ED` (`bad FF /7`, PC `F000:85EF`, after 6M steps). The BIOS code at
-   that address had been correctly shadowed; execution entered the middle of
-   the 32-bit `CALL` at `F000:85E9`. The current harness uses the FreeDOS
-   LiveCD image and passes 7M steps without that fault. Finish the LiveCD boot
-   path and add a regression for the boot-entry thunk.
-2. IDE/ATAPI sector streaming and MBR/partition reads for the Win98 SE CD.
-3. 8042 keyboard/PS2 mouse + IRQ1/IRQ12 (module exists; verify guest input).
-4. VGA modes 12h/13h and the EditableImage sink; text mode 3 works through
-   SeaVGABIOS, but no mode 12h/13h pipeline is wired to the client yet.
-5. Then 386 PM stress (TSS/task gates, exception precision), x87, and the
-   Win98 installer path.
+1. Fix the real-mode IRQ return frame during the VGA/option-ROM boot thunk;
+   add a regression that raises IRQ0 inside an INT10 frame and checks IRET.
+2. Finish ATAPI boot: verify the El Torito no-emulation entry and get a
+   FreeDOS banner or `A:\>` prompt.
+3. Wire the VGA EditableImage sink and UserInputService keyboard/mouse bridge
+   (KBC modules and tests already exist; SeaBIOS IRQ1 currently EOIs without
+   reading 0x60).
+4. Then IDE writes/MBR partitions, SVGA, x87, and the Win98 SE installer path.
 
 
 ## Hard rules

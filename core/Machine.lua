@@ -436,6 +436,7 @@ end
 function Machine.reset(self: Machine)
 	self.cpu:reset()
 	self.mem:setA20(false)
+	self.mem:lockLowRom(false)
 	if self.pic then
 		self.pic:reset()
 	end

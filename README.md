@@ -53,8 +53,15 @@ lune run tools/harness.lua 40   # step budget in millions
 
 M0 is green: the machine boots real SeaBIOS, initializes PIC/PIT/CMOS/A20/PCI/
 fw_cfg, runs SeaVGABIOS in text mode 3, and reaches the no-bootable-device
-screen. See `docs/M0-REPORT.md`, `HANDOFF.md`, `docs/ARCHITECTURE.md` and
-`docs/WIN98.md`.
+screen.
+
+M1 is in bring-up: the primary IDE channel exposes an ATA HDD and ATAPI CD-ROM,
+SeaBIOS detects both, and its boot menu lists a FreeDOS 1.3 LiveCD. Selecting
+the CD currently reaches a measured CPU fault at `F000:85EF` (`bad FF /7`); the
+exact trace and next actions are in `docs/M1-REPORT.md`. Stage the FreeDOS
+LiveCD (`media/FD13LIVE.iso`) and optional `media/hdd.img` as described there
+before running the harness. See also `HANDOFF.md`, `docs/M0-REPORT.md`,
+`docs/ARCHITECTURE.md` and `docs/WIN98.md`.
 
 ## License
 
