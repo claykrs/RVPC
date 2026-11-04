@@ -2017,7 +2017,11 @@ H[0x9A] = function(cpu: any) -- CALL far imm
 	const cs = cpu:fetch16()
 	cpu:farCall(cs, ip, true)
 end
-H[0x9B] = function() end -- WAIT
+H[0x9B] = function(cpu: any) -- WAIT/FWAIT observes a pending x87 #MF
+	if cpu.fpu then
+		cpu.fpu:wait(cpu)
+	end
+end
 H[0x9C] = function(cpu: any) -- PUSHF / PUSHFD
 	if cpu.operand32 then
 		cpu:push32(bor(cpu.flags, ALWAYS))

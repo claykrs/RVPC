@@ -6,6 +6,7 @@ const VM = 0x20000
 
 const Memory = require("../core/Memory")
 const Cpu = require("../core/Cpu")
+const Fpu = require("../core/Fpu")
 const Machine = require("../core/Machine")
 const Pic = require("../core/Pic")
 
@@ -20,6 +21,15 @@ local function freshMachine()
 		memorySize = 16 * 1024 * 1024,
 		cpu = { cpuLevel = "486" },
 	})
+end
+
+local function freshFpuMachine()
+	const fpu = Fpu.new()
+	const machine = Machine.new({ Memory = Memory, Cpu = Cpu }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486", fpu = fpu },
+	})
+	return machine, fpu
 end
 
 local function putCode(m, addr, bytes)
@@ -558,6 +568,71 @@ T("real_mode_mov_r32_sreg_zero_extends", function(expect)
 	})
 	m:run(1)
 	expect(m.cpu:rr32(6) == 0, string.format("ESI=%08X want 00000000", m.cpu:rr32(6)))
+end)
+
+T("x87_mf_idt_vector16_frame", function(expect)
+	const m, fpu = freshFpuMachine()
+	flat32(m)
+	m.mem:write16(0x2000, 0x037B) -- ZE unmasked
+	installGate(m, 16, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, {
+		0x8B,
+		0x04,
+		0x24, -- MOV EAX,[ESP] saved EIP
+		0xA3,
+		0x00,
+		0x70,
+		0x00,
+		0x00, -- MOV [0x7000],EAX
+		0x8B,
+		0x44,
+		0x24,
+		0x04, -- MOV EAX,[ESP+4] saved CS
+		0xA3,
+		0x04,
+		0x70,
+		0x00,
+		0x00, -- MOV [0x7004],EAX
+		0x8B,
+		0x44,
+		0x24,
+		0x08, -- MOV EAX,[ESP+8] saved EFLAGS
+		0xA3,
+		0x08,
+		0x70,
+		0x00,
+		0x00, -- MOV [0x7008],EAX
+		0xDB,
+		0xE2, -- FNCLEX
+		0xCF, -- IRETD
+	})
+	putCode(m, 0x1000, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x20, -- FLDCW [0x2000]
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xE8, -- FLD1
+		0xD8,
+		0xF1, -- FDIV 1/0 -> pending #MF
+		0x9B, -- WAIT observes #MF at 0x100A
+		0xB8,
+		0x34,
+		0x12,
+		0x00,
+		0x00, -- MOV EAX,0x1234
+		0xF4, -- HLT
+	})
+	m:run(40)
+	expect((m.cpu.intCounts[16] or 0) == 1, "vector 16 count=" .. (m.cpu.intCounts[16] or 0))
+	expect(m.mem:read32(0x7000) == 0x100A, string.format("saved EIP=%08X", m.mem:read32(0x7000)))
+	expect(m.mem:read32(0x7004) == 8, string.format("saved CS=%08X", m.mem:read32(0x7004)))
+	expect(band(m.mem:read32(0x7008), 0x200) == 0, "interrupt gate did not clear IF")
+	expect(not fpu.pendingMf, "handler FNCLEX did not clear #MF")
+	expect(m.cpu.r[1] == 0x1234, string.format("EAX=%08X", m.cpu.r[1]))
+	expect(m.cpu.halted, "WAIT did not resume after handler IRETD")
 end)
 
 return TESTS

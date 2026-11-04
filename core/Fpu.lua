@@ -3,13 +3,12 @@
 --
 -- Registers are held as Lua doubles, not true 80-bit extended values. That is
 -- enough for the 32/64-bit code paths used by the 486-era DOS/Windows software
--- this machine targets. Pending exceptions are reported through the x87 status
--- word but are not raised as CPU exceptions. Deliberate gaps: exact unmasked
--- exception traps, underflow/precision tracking, exact 66-bit trigonometric
--- argument reduction, FISTTP, and full 80-bit mantissa precision (extended
--- values round-trip through a host double). Stack, invalid-op and
--- divide-by-zero status still update so software can detect unsupported
--- operations.
+-- this machine targets. Unmasked exceptions set a deferred #MF condition that
+-- is observed by WAIT/FWAIT or the next non-waiting x87 instruction, matching
+-- the 486 native route. Deliberate gaps: exact 80-bit exception mantissas,
+-- exact 66-bit trigonometric argument reduction, FISTTP, and full 80-bit
+-- mantissa precision (extended values round-trip through a host double).
+-- Underflow/denormal/precision tracking is approximate.
 
 const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
 
@@ -37,6 +36,7 @@ const TAG_EMPTY = 3
 
 const NAN = 0 / 0
 const INF = math.huge
+const DBL_MIN = 2.2250738585072014e-308
 const LN2 = math.log(2)
 const TWO32 = 4294967296
 const TWO63 = 9223372036854775808
@@ -54,6 +54,7 @@ export type Fpu = typeof(setmetatable(
 		status: number,
 		invalidCount: number,
 		stackFaultCount: number,
+		pendingMf: boolean,
 		lastOpcode: number,
 		instIP: number,
 		instCS: number,
@@ -63,6 +64,7 @@ export type Fpu = typeof(setmetatable(
 		reset: (self: Fpu) -> (),
 		st: (self: Fpu, index: number) -> number,
 		tagWord: (self: Fpu) -> number,
+		wait: (self: Fpu, cpu: any) -> (),
 		execute: (self: Fpu, cpu: any, opcode: number, e: any) -> (),
 	},
 	Fpu
@@ -80,6 +82,10 @@ local function isFinite(value: number): boolean
 	return not isNan(value) and not isInf(value)
 end
 
+local function isDenormal(value: number): boolean
+	return value ~= 0 and isFinite(value) and math.abs(value) < DBL_MIN
+end
+
 local function tagFor(value: number): number
 	if isNan(value) or isInf(value) then
 		return TAG_SPECIAL
@@ -93,8 +99,21 @@ local function syncTop(self: Fpu)
 	self.status = bor(band(self.status, bit32.bnot(TOP_MASK)), lshift(self.top, 11))
 end
 
+local function exceptionUnmasked(self: Fpu, bits: number): boolean
+	const exceptions = band(bits, 0x3F)
+	return exceptions ~= 0 and band(exceptions, bit32.bnot(self.control)) ~= 0
+end
+
+local function refreshPending(self: Fpu)
+	self.pendingMf = exceptionUnmasked(self, self.status)
+end
+
 local function raiseException(self: Fpu, bits: number)
-	self.status = bor(self.status, bits, ES)
+	self.status = bor(self.status, bits)
+	if exceptionUnmasked(self, bits) then
+		self.status = bor(self.status, ES)
+		self.pendingMf = true
+	end
 end
 
 local function invalid(self: Fpu)
@@ -217,6 +236,10 @@ end
 local function arithmetic(self: Fpu, a: number, b: number, op: number): number
 	local result: number
 	const finiteOperands = isFinite(a) and isFinite(b)
+	local zeroDivide = false
+	if isDenormal(a) or isDenormal(b) then
+		raiseException(self, DE)
+	end
 	if op == 0 then -- add
 		result = a + b
 	elseif op == 1 then -- subtract
@@ -226,13 +249,25 @@ local function arithmetic(self: Fpu, a: number, b: number, op: number): number
 	else -- divide
 		if b == 0 and a ~= 0 and not isNan(a) then
 			raiseException(self, ZE)
+			zeroDivide = true
 		end
 		result = a / b
 	end
 	if isNan(result) then
 		invalid(self)
-	elseif finiteOperands and isInf(result) then
-		raiseException(self, OE)
+	else
+		if isDenormal(result) then
+			raiseException(self, DE)
+		end
+		if isDenormal(result) or ((op == 2 or op == 3) and result == 0 and a ~= 0 and b ~= 0) then
+			raiseException(self, UE)
+		end
+		if not zeroDivide and finiteOperands and isInf(result) then
+			raiseException(self, OE)
+		end
+		if op == 3 and b ~= 0 and isFinite(result) and result * b ~= a then
+			raiseException(self, PE)
+		end
 	end
 	return result
 end
@@ -919,6 +954,7 @@ local function fninit(self: Fpu)
 	self.top = 0
 	self.control = DEFAULT_CONTROL
 	self.status = 0
+	self.pendingMf = false
 	self.instIP = 0
 	self.instCS = 0
 	self.dataIP = 0
@@ -962,6 +998,7 @@ local function writeEnvironment(self: Fpu, cpu: any, e: any): number
 	end
 	-- FSTENV/FNSTENV/FNSAVE mask all exceptions after writing the image.
 	self.control = bor(self.control, 0x3F)
+	refreshPending(self)
 	return size
 end
 
@@ -996,6 +1033,7 @@ local function readEnvironment(self: Fpu, cpu: any, e: any): number
 	for index = 0, 7 do
 		self.tags[index] = band(rshift(tag, index * 2), 3)
 	end
+	refreshPending(self)
 	return size
 end
 
@@ -1080,6 +1118,7 @@ local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
 			fldenv(self, cpu, e)
 		elseif reg == 5 then
 			self.control = cpu:read16(memoryAddress(cpu, e, 2))
+			refreshPending(self)
 		elseif reg == 6 then
 			fstenv(self, cpu, e)
 		elseif reg == 7 then
@@ -1308,7 +1347,11 @@ local function executeRegister(self: Fpu, cpu: any, opcode: number, e: any)
 						invalid(self)
 						setTop(self, NAN)
 					else
-						setTop(self, math.sqrt(value))
+						const root = math.sqrt(value)
+						if root * root ~= value then
+							raiseException(self, PE)
+						end
+						setTop(self, root)
 					end
 				end
 			elseif index == 3 then
@@ -1345,6 +1388,7 @@ local function executeRegister(self: Fpu, cpu: any, opcode: number, e: any)
 	elseif group == 3 then -- DB: FNCLEX/FNINIT/FCOMI/FUCOMI
 		if reg == 4 and index == 2 then
 			self.status = band(self.status, bit32.bnot(EXCEPTION_MASK))
+			self.pendingMf = false
 		elseif reg == 4 and index == 3 then
 			fninit(self)
 		elseif reg == 5 then
@@ -1476,8 +1520,31 @@ function Fpu.tagWord(self: Fpu): number
 	return word
 end
 
+local function ignoresPending(opcode: number, e: any): boolean
+	if opcode == 0xDB and e.reg == 4 then
+		return e.rm == 2 or e.rm == 3 -- FNCLEX / FNINIT
+	elseif opcode == 0xDF and e.reg == 4 and e.rm == 0 then
+		return true -- FNSTSW AX
+	elseif opcode == 0xD9 and (e.reg == 4 or e.reg == 6 or e.reg == 7) then
+		return true -- FLDENV / FNSTENV / FNSTCW
+	elseif opcode == 0xDD and (e.reg == 4 or e.reg == 6 or e.reg == 7) then
+		return true -- FRSTOR / FNSAVE / FNSTSW m16
+	end
+	return false
+end
+
+function Fpu.wait(self: Fpu, cpu: any)
+	if self.pendingMf then
+		cpu:fault(16)
+	end
+end
+
 function Fpu.execute(self: Fpu, cpu: any, opcode: number, e: any)
 	self.lastOpcode = opcode
+	if self.pendingMf and not ignoresPending(opcode, e) then
+		cpu:fault(16)
+		return
+	end
 	const environmentOp = (opcode == 0xD9 and (e.reg == 4 or e.reg == 6))
 		or (opcode == 0xDD and (e.reg == 4 or e.reg == 6))
 	if not environmentOp then
@@ -1505,6 +1572,7 @@ function Fpu.new()
 	self.status = 0
 	self.invalidCount = 0
 	self.stackFaultCount = 0
+	self.pendingMf = false
 	self.lastOpcode = 0
 	self.instIP = 0
 	self.instCS = 0

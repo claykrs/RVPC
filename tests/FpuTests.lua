@@ -604,7 +604,9 @@ T("fpu_unsupported_sets_invalid", function(expect)
 	putCode(m, { 0xD9, 0x0E, 0x00, 0x03 }) -- D9 /1 is reserved
 	m:run(10)
 	expect(fpu.invalidCount == 1, "invalid count=" .. fpu.invalidCount)
-	expect(band(fpu.status, 0x0081) == 0x0081, string.format("invalid status=%04X", fpu.status))
+	expect(band(fpu.status, 0x0001) == 0x0001, string.format("invalid status=%04X", fpu.status))
+	expect(band(fpu.status, 0x0080) == 0, "masked invalid set ES")
+	expect(not fpu.pendingMf, "masked invalid became pending #MF")
 	expect(fpu:tagWord() == 0xFFFF, "unsupported op corrupted the stack")
 end)
 
@@ -959,6 +961,160 @@ T("fpu_ts_lazy_switch", function(expect)
 	expect(band(m.cpu.cr0, 0x00000008) == 0, "second CLTS did not clear TS")
 	expect(fpu.top == 6, "FLD after second CLTS did not execute")
 	expect(fpu:tagWord() == 0x0FFF, string.format("TS lazy tag=%04X", fpu:tagWord()))
+end)
+
+T("fpu_masked_divide_by_zero", function(expect)
+	const m, fpu = newMachine()
+	putCode(m, {
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xE8, -- FLD1
+		0xD8,
+		0xF1, -- FDIV -> 1/0
+	})
+	m:run(3)
+	expect(band(fpu.status, 0x0004) ~= 0, "masked ZE not set")
+	expect(band(fpu.status, 0x0080) == 0, "masked exception set ES")
+	expect(not fpu.pendingMf, "masked exception became pending #MF")
+	expect((m.cpu.intCounts[16] or 0) == 0, "masked exception raised #MF")
+end)
+
+T("fpu_unmasked_divzero_mf_next_op", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x7B, 0x03 }) -- control 0x037B: ZE unmasked
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xE8, -- FLD1
+		0xD8,
+		0xF1, -- FDIV -> pending #MF
+		0xD9,
+		0xE8, -- next x87 observes #MF
+		0xDB,
+		0xE2, -- FNCLEX
+		0xD9,
+		0xE8, -- FLD1 after clear
+	})
+	m.mem:write16(0x40, 0)
+	m.mem:write16(0x42, 0)
+	m.cpu.defaultInts[16] = function() end
+	m:run(4)
+	expect(fpu.pendingMf, "unmasked ZE did not become pending")
+	expect(band(fpu.status, 0x0004) ~= 0 and band(fpu.status, 0x0080) ~= 0, "unmasked ZE status")
+	expect((m.cpu.intCounts[16] or 0) == 0, "#MF raised by the producing instruction")
+	expect(fpu.top == 6, "producer changed stack unexpectedly")
+	m:run(1)
+	expect((m.cpu.intCounts[16] or 0) == 1, "next x87 did not observe #MF")
+	expect(fpu.top == 6, "observing instruction executed before #MF")
+	m:run(1) -- FNCLEX
+	expect(not fpu.pendingMf, "FNCLEX did not clear pending #MF")
+	expect(band(fpu.status, 0x00FF) == 0, string.format("FNCLEX status=%04X", fpu.status))
+	m:run(1) -- FLD1
+	expect(fpu.top == 5, "x87 did not resume after FNCLEX")
+end)
+
+T("fpu_unmasked_invalid_wait", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x7E, 0x03 }) -- control 0x037E: IE unmasked
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xEE, -- FLDZ
+		0xD8,
+		0xF1, -- FDIV -> 0/0, pending #MF
+		0x9B, -- WAIT observes #MF
+		0xDB,
+		0xE2, -- FNCLEX
+		0xD9,
+		0xE8, -- FLD1
+	})
+	m.mem:write16(0x40, 0)
+	m.mem:write16(0x42, 0)
+	m.cpu.defaultInts[16] = function() end
+	m:run(4)
+	expect(fpu.pendingMf, "0/0 did not become pending")
+	expect(band(fpu.status, 0x0001) ~= 0, "unmasked IE not set")
+	expect(band(fpu.status, 0x0004) == 0, "0/0 incorrectly set ZE")
+	expect((m.cpu.intCounts[16] or 0) == 0, "#MF raised before WAIT")
+	m:run(1) -- WAIT
+	expect((m.cpu.intCounts[16] or 0) == 1, "WAIT did not observe #MF")
+	expect(fpu.pendingMf, "WAIT cleared pending by itself")
+	m:run(1) -- FNCLEX
+	expect(not fpu.pendingMf and band(fpu.status, 0x00FF) == 0, "FNCLEX did not clear")
+	m:run(1) -- FLD1
+	expect(fpu.top == 5, "x87 did not resume after WAIT/FNCLEX")
+end)
+
+T("fpu_fnstsw_fnstenv_do_not_trigger_mf", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x7E, 0x03 }) -- IE unmasked
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xEE, -- FLDZ
+		0xD8,
+		0xF1, -- FDIV 0/0 -> pending
+		0xDF,
+		0xE0, -- FNSTSW AX (must not trigger)
+		0xD9,
+		0x36,
+		0x10,
+		0x03, -- FNSTENV [0x310] (must not trigger)
+		0xD9,
+		0xE8, -- FLD1
+	})
+	m.mem:write16(0x40, 0)
+	m.mem:write16(0x42, 0)
+	m.cpu.defaultInts[16] = function() end
+	m:run(4)
+	expect(fpu.pendingMf, "pending not established")
+	m:run(1)
+	expect((m.cpu.intCounts[16] or 0) == 0, "FNSTSW triggered #MF")
+	expect(band(m.cpu.r[1], 0x0081) == 0x0081, string.format("FNSTSW AX=%04X", m.cpu.r[1]))
+	m:run(1)
+	expect((m.cpu.intCounts[16] or 0) == 0, "FNSTENV triggered #MF")
+	expect(m.mem:read16(0x6000 + 0x312) == band(fpu.status, 0xFFFF), "FNSTENV status image")
+	expect(fpu.control == 0x037F, string.format("FNSTENV control=%04X", fpu.control))
+	expect(not fpu.pendingMf, "FNSTENV masking left #MF pending")
+	m:run(1)
+	expect(fpu.top == 5, "x87 did not resume after FNSTENV")
+end)
+
+T("fpu_exception_priority_ze_over_oe", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x73, 0x03 }) -- control 0x0373: ZE and OE unmasked
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW
+		0xD9,
+		0xEE, -- FLDZ
+		0xD9,
+		0xE8, -- FLD1
+		0xD8,
+		0xF1, -- FDIV 1/0
+	})
+	m:run(4)
+	expect(band(fpu.status, 0x0004) ~= 0, "ZE not set")
+	expect(band(fpu.status, 0x0008) == 0, "divide-by-zero also set OE")
+	expect(fpu.pendingMf, "unmasked ZE not pending")
 end)
 
 T("fpu_cpuid_fpu_bit", function(expect)
