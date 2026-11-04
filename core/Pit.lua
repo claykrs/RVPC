@@ -67,9 +67,11 @@ end
 
 function Pit.advance(self: Pit, cycles: number): boolean
 	local irq = false
+	const channels = self.channels
 	for index = 0, CHANNELS - 1 do
-		const channel = self.channels[index + 1]
-		const period = reloadValue(channel)
+		const channel = channels[index + 1]
+		-- Inline reloadValue: advance runs once per guest instruction.
+		const period = if channel.reload == 0 then 0x10000 else channel.reload
 		local remaining = channel.counter - cycles
 		while remaining <= 0 do
 			remaining += period

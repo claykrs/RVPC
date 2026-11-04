@@ -24,7 +24,8 @@
 -- There is no wrap at the top of RAM. Addresses outside RAM/ROM/aperture are
 -- open bus: reads return 0xFF and writes are dropped.
 
-const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
+const band, bor, bnot, lshift, rshift =
+	bit32.band, bit32.bor, bit32.bnot, bit32.lshift, bit32.rshift
 
 const Memory = {}
 Memory.__index = Memory
@@ -225,7 +226,20 @@ function Memory:isRam(addr: number, length: number): boolean
 end
 
 function Memory:read8(addr: number): number
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	-- Hot path: plain conventional/RAM, away from the VGA aperture, option-ROM
+	-- shadow and BIOS windows. isProtected is only ever configured by host
+	-- tooling, never by the guest, so a nil check preserves the slow path.
+	if self.protectStart == nil then
+		if
+			(addr < APERTURE_START and addr < self.size) or (addr >= ONE_MIB and addr < self.size)
+		then
+			return buffer.readu8(self.buf, addr)
+		end
+	end
 	const rom = self.rom
 	if rom then
 		if addr >= self.romHighBase then
@@ -263,7 +277,17 @@ function Memory:read8(addr: number): number
 end
 
 function Memory:read16(addr: number): number
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	const last = addr + 1
+	if
+		self.protectStart == nil
+		and ((last < APERTURE_START and last < self.size) or (addr >= ONE_MIB and last < self.size))
+	then
+		return buffer.readu16(self.buf, addr)
+	end
 	if self:isRam(addr, 2) then
 		return buffer.readu16(self.buf, addr)
 	end
@@ -277,7 +301,17 @@ function Memory:read16(addr: number): number
 end
 
 function Memory:read32(addr: number): number
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	const last = addr + 3
+	if
+		self.protectStart == nil
+		and ((last < APERTURE_START and last < self.size) or (addr >= ONE_MIB and last < self.size))
+	then
+		return buffer.readu32(self.buf, addr)
+	end
 	if self:isRam(addr, 4) then
 		return buffer.readu32(self.buf, addr)
 	end
@@ -285,7 +319,17 @@ function Memory:read32(addr: number): number
 end
 
 function Memory:write8(addr: number, value: number)
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	if
+		self.protectStart == nil
+		and ((addr < APERTURE_START and addr < self.size) or (addr >= ONE_MIB and addr < self.size))
+	then
+		buffer.writeu8(self.buf, addr, band(value, 0xFF))
+		return
+	end
 	if self:isProtected(addr) then
 		return
 	end
@@ -312,7 +356,18 @@ function Memory:write8(addr: number, value: number)
 end
 
 function Memory:write16(addr: number, value: number)
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	const last = addr + 1
+	if
+		self.protectStart == nil
+		and ((last < APERTURE_START and last < self.size) or (addr >= ONE_MIB and last < self.size))
+	then
+		buffer.writeu16(self.buf, addr, band(value, 0xFFFF))
+		return
+	end
 	if self:isProtected(addr) then
 		return
 	end
@@ -338,7 +393,18 @@ function Memory:write16(addr: number, value: number)
 end
 
 function Memory:write32(addr: number, value: number)
-	addr = self:translate(addr)
+	addr = band(addr, 0xFFFFFFFF)
+	if not self.a20 then
+		addr = band(addr, bnot(A20_BIT))
+	end
+	const last = addr + 3
+	if
+		self.protectStart == nil
+		and ((last < APERTURE_START and last < self.size) or (addr >= ONE_MIB and last < self.size))
+	then
+		buffer.writeu32(self.buf, addr, band(value, 0xFFFFFFFF))
+		return
+	end
 	if self:isProtected(addr) then
 		return
 	end

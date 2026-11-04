@@ -956,43 +956,55 @@ function Machine.run(self: Machine, maxSteps: number?): number
 	local steps = 0
 	local idle = 0
 	const budget = maxSteps or math.huge
+	const cpu = self.cpu
+	const pic = self.pic
+	const pit = self.pit
+	const kbc = self.kbc
+	const ide = self.ide
+	const ide2 = self.ide2
+	const ne2000 = self.ne2000
+	const sb16 = self.sb16
+	const fdc = self.fdc
 	while steps < budget and not self.exitCode do
-		if self.pit then
-			const irq = self.pit:advance(1)
-			if irq and self.pic then
-				self.pic:raise(0)
+		if pit then
+			if pit:advance(1) and pic then
+				pic:raise(0)
 			end
 		end
-		if self.pic then
-			if self.kbc then
-				if self.kbc:takeIrq1() then
-					self.pic:raise(1)
+		if pic then
+			-- Each takeIrq is side-effect free unless its own pending/armed
+			-- field is set, so those fields are a cheap equivalent gate.
+			if kbc then
+				if kbc.irq1Armed and kbc:takeIrq1() then
+					pic:raise(1)
 				end
-				if self.kbc:takeIrq12() then
-					self.pic:raise(12)
+				if kbc.irq12Armed and kbc:takeIrq12() then
+					pic:raise(12)
 				end
 			end
-			if self.ide and self.ide:takeIrq() then
-				self.pic:raise(14)
+			if ide and ide.irqPending and ide:takeIrq() then
+				pic:raise(14)
 			end
-			if self.ide2 and self.ide2:takeIrq() then
-				self.pic:raise(15)
+			if ide2 and ide2.irqPending and ide2:takeIrq() then
+				pic:raise(15)
 			end
-			if self.ne2000 and self.ne2000:takeIrq() then
-				self.pic:raise(10)
+			if ne2000 and (ne2000.irqLine or band(ne2000.isr, ne2000.imr) ~= 0) then
+				if ne2000:takeIrq() then
+					pic:raise(10)
+				end
 			end
-			if self.sb16 and self.sb16:takeIrq() then
-				self.pic:raise(5)
+			if sb16 and sb16.irqPending and sb16:takeIrq() then
+				pic:raise(5)
 			end
-			if self.fdc and self.fdc:takeIrq() then
-				self.pic:raise(6)
+			if fdc and fdc.irqPending and fdc:takeIrq() then
+				pic:raise(6)
 			end
 			self.sb16Clock += 1
-			if self.sb16 and self.sb16Clock % 1024 == 0 then
-				self.sb16:tick()
+			if sb16 and self.sb16Clock % 1024 == 0 then
+				sb16:tick()
 			end
 		end
-		if self.cpu.halted then
+		if cpu.halted then
 			if not self:deliverInterrupt() then
 				idle += 1
 				-- A halted CPU waits for the next timer tick; give a full 8254
@@ -1004,8 +1016,16 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				idle = 0
 			end
 		else
-			self:deliverInterrupt()
-			self.cpu:step()
+			if pic and band(cpu.flags, 0x200) ~= 0 and cpu.irqDelay == 0 then
+				self:deliverInterrupt()
+			end
+			-- step() only wraps executeStep in tracing/paging support; skip the
+			-- extra call in the common unpaged, untraced case.
+			if not cpu.traceEnabled and band(cpu.cr0, 0x80000000) == 0 then
+				cpu:executeStep()
+			else
+				cpu:step()
+			end
 			idle = 0
 		end
 		steps += 1

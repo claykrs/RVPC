@@ -148,6 +148,7 @@ export type Cpu = {
 	tr32: boolean,
 	operand32: boolean,
 	address32: boolean,
+	modrmScratch: ModRM,
 	halted: boolean,
 	-- 8086 STI/POPF/IRET interrupt shadow: no hardware IRQ is recognized until
 	-- the instruction after the flag change has executed.
@@ -318,6 +319,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.address32 = false
 	self.baseOperand32 = false
 	self.baseAddress32 = false
+	self.modrmScratch = { mod = 0, reg = 0, rm = 0, off = nil, addr = nil, seg = nil }
 	self.halted = false
 	self.irqDelay = 0
 	self.oseg = nil
@@ -410,7 +412,10 @@ function Cpu.stack32(self: Cpu): boolean
 end
 
 function Cpu.ipMask(self: Cpu): number
-	return if self:code32() then 0xFFFFFFFF else 0xFFFF
+	if band(self.cr0, CR0_PE) ~= 0 and band(self.segFlags.cs or 0, 0x40) ~= 0 then
+		return 0xFFFFFFFF
+	end
+	return 0xFFFF
 end
 
 function Cpu.pagingEnabled(self: Cpu): boolean
@@ -529,7 +534,12 @@ end
 -- Linear (post-segmentation) memory access. All instruction and data traffic
 -- goes through these helpers so paging applies uniformly, including descriptor
 -- and interrupt-table reads.
+-- Paging-off is the common case (real mode, DOS extenders, most of SeaBIOS
+-- POST). Skip the CPL and page-walk calls entirely when CR0.PG is clear.
 function Cpu.read8(self: Cpu, addr: number, supervisor: boolean?): number
+	if band(self.cr0, CR0_PG) == 0 then
+		return self.mem:read8(addr)
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
@@ -539,6 +549,9 @@ function Cpu.read8(self: Cpu, addr: number, supervisor: boolean?): number
 end
 
 function Cpu.read16(self: Cpu, addr: number, supervisor: boolean?): number
+	if band(self.cr0, CR0_PG) == 0 then
+		return self.mem:read16(addr)
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
@@ -548,6 +561,9 @@ function Cpu.read16(self: Cpu, addr: number, supervisor: boolean?): number
 end
 
 function Cpu.read32(self: Cpu, addr: number, supervisor: boolean?): number
+	if band(self.cr0, CR0_PG) == 0 then
+		return self.mem:read32(addr)
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
@@ -557,6 +573,10 @@ function Cpu.read32(self: Cpu, addr: number, supervisor: boolean?): number
 end
 
 function Cpu.write8(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	if band(self.cr0, CR0_PG) == 0 then
+		self.mem:write8(addr, value)
+		return
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
@@ -566,6 +586,10 @@ function Cpu.write8(self: Cpu, addr: number, value: number, supervisor: boolean?
 end
 
 function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	if band(self.cr0, CR0_PG) == 0 then
+		self.mem:write16(addr, value)
+		return
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
@@ -575,6 +599,10 @@ function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean
 end
 
 function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	if band(self.cr0, CR0_PG) == 0 then
+		self.mem:write32(addr, value)
+		return
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
@@ -1118,7 +1146,26 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 end
 
 function Cpu.linear(self: Cpu, reg: string, off: number, size: number): number
-	const base = self:baseOf(reg)
+	local selector
+	if reg == "es" then
+		selector = self.es
+	elseif reg == "cs" then
+		selector = self.cs
+	elseif reg == "ss" then
+		selector = self.ss
+	elseif reg == "ds" then
+		selector = self.ds
+	elseif reg == "fs" then
+		selector = self.fs
+	elseif reg == "gs" then
+		selector = self.gs
+	else
+		error("bad segment register " .. reg)
+	end
+	local base = self.segBase[reg]
+	if self.segSel[reg] ~= selector then
+		base = self:baseOf(reg)
+	end
 	if band(self.cr0, 1) ~= 0 and size > 0 then
 		const limit = self.segLimit[reg]
 		if off + size - 1 > limit then
@@ -1127,7 +1174,7 @@ function Cpu.linear(self: Cpu, reg: string, off: number, size: number): number
 				("%s: %s selector %04X offset %04X size %d exceeds limit %04X"):format(
 					kind,
 					reg,
-					getSeg(self, reg),
+					selector,
 					off,
 					size,
 					limit
@@ -1177,8 +1224,22 @@ function Cpu.wr32(self: Cpu, i: number, v: number)
 end
 
 function Cpu.fetch8(self: Cpu): number
-	local b = self:read8(self:linear("cs", self.ip, 1))
-	self.ip = band(self.ip + 1, self:ipMask())
+	local ip = self.ip
+	-- Unpaged code fetch: avoid the generic segment/page/abort wrappers. The
+	-- selector check preserves ensureSeg's lazy real-mode reload behavior.
+	if self.segSel.cs == self.cs and band(self.cr0, CR0_PG) == 0 then
+		const protectedMode = band(self.cr0, CR0_PE) ~= 0
+		if not protectedMode or ip <= self.segLimit.cs then
+			const b = self.mem:read8(self.segBase.cs + ip)
+			const mask = if protectedMode and band(self.segFlags.cs or 0, 0x40) ~= 0
+				then 0xFFFFFFFF
+				else 0xFFFF
+			self.ip = band(ip + 1, mask)
+			return b
+		end
+	end
+	local b = self:read8(self:linear("cs", ip, 1))
+	self.ip = band(ip + 1, self:ipMask())
 	if self.aborting then
 		return 0
 	end
@@ -1186,11 +1247,35 @@ function Cpu.fetch8(self: Cpu): number
 end
 
 function Cpu.fetch16(self: Cpu): number
-	local lo = self:fetch8()
+	local ip = self.ip
+	if self.segSel.cs == self.cs and band(self.cr0, CR0_PG) == 0 then
+		const protectedMode = band(self.cr0, CR0_PE) ~= 0
+		const mask = if protectedMode and band(self.segFlags.cs or 0, 0x40) ~= 0
+			then 0xFFFFFFFF
+			else 0xFFFF
+		if (not protectedMode or ip + 1 <= self.segLimit.cs) and ip + 1 <= mask then
+			const value = self.mem:read16(self.segBase.cs + ip)
+			self.ip = band(ip + 2, mask)
+			return value
+		end
+	end
+	const lo = self:fetch8()
 	return bor(lo, lshift(self:fetch8(), 8))
 end
 
 function Cpu.fetch32(self: Cpu): number
+	local ip = self.ip
+	if self.segSel.cs == self.cs and band(self.cr0, CR0_PG) == 0 then
+		const protectedMode = band(self.cr0, CR0_PE) ~= 0
+		const mask = if protectedMode and band(self.segFlags.cs or 0, 0x40) ~= 0
+			then 0xFFFFFFFF
+			else 0xFFFF
+		if (not protectedMode or ip + 3 <= self.segLimit.cs) and ip + 3 <= mask then
+			const value = self.mem:read32(self.segBase.cs + ip)
+			self.ip = band(ip + 4, mask)
+			return value
+		end
+	end
 	const lo = self:fetch16()
 	return bor(lo, lshift(self:fetch16(), 16))
 end
@@ -1236,10 +1321,25 @@ function Cpu.popValue(self: Cpu, width: number): number
 end
 
 function Cpu.push16(self: Cpu, v: number)
+	-- Real-mode word stack operations avoid the generic stack-width, segment
+	-- translation and paging wrappers. The selector check keeps ensureSeg's
+	-- lazy real-mode reload semantics for directly assigned SS.
+	if band(self.cr0, CR0_PE) == 0 and self.segSel.ss == self.ss then
+		const sp = band(self.r[5] - 2, 0xFFFF)
+		self.r[5] = sp
+		self.mem:write16(self.segBase.ss + sp, v)
+		return
+	end
 	self:pushValue(v, 2)
 end
 
 function Cpu.pop16(self: Cpu): number
+	if band(self.cr0, CR0_PE) == 0 and self.segSel.ss == self.ss then
+		const sp = self.r[5]
+		const value = self.mem:read16(self.segBase.ss + sp)
+		self.r[5] = band(sp + 2, 0xFFFF)
+		return value
+	end
 	return self:popValue(2)
 end
 
@@ -1279,12 +1379,21 @@ function Cpu.setSZP(self: Cpu, res: number, w: any)
 end
 
 function Cpu.modrm(self: Cpu): ModRM
+	-- Reused because no handler retains a decoded ModRM across another decode.
+	-- This removes a small table allocation from every memory/register operand.
+	local e = self.modrmScratch
 	local m = self:fetch8()
 	const mod = rshift(m, 6)
 	const reg = band(rshift(m, 3), 7)
 	const rm = band(m, 7)
+	e.mod = mod
+	e.reg = reg
+	e.rm = rm
 	if mod == 3 then
-		return { mod = 3, reg = reg, rm = rm, off = nil, addr = nil, seg = nil }
+		e.off = nil
+		e.addr = nil
+		e.seg = nil
+		return e
 	end
 	local off, segReg
 	if self.address32 then
@@ -1362,14 +1471,10 @@ function Cpu.modrm(self: Cpu): ModRM
 		segReg = self.osegReg
 	end
 	const offValue = off :: number
-	return {
-		mod = mod,
-		reg = reg,
-		rm = rm,
-		off = offValue,
-		addr = self:baseOf(segReg) + offValue,
-		seg = segReg,
-	}
+	e.off = offValue
+	e.addr = self:baseOf(segReg) + offValue
+	e.seg = segReg
+	return e
 end
 
 function Cpu.readRM8(self: Cpu, e: ModRM): number
@@ -1420,29 +1525,57 @@ end
 -- Operand-size-directed helpers (16-bit unless the current instruction has a
 -- 0x66 prefix and the CPU is a 386+).
 function Cpu.readRM(self: Cpu, e: ModRM): number
-	if self.operand32 then
-		return self:readRM32(e)
+	if e.mod == 3 then
+		if self.operand32 then
+			return bor(self.r[e.rm + 1], lshift(self.rHi[e.rm + 1], 16))
+		end
+		return self.r[e.rm + 1]
 	end
-	return self:readRM16(e)
+	const addr = self:linear(e.seg :: string, e.off :: number, if self.operand32 then 4 else 2)
+	if self.operand32 then
+		return self:read32(addr)
+	end
+	return self:read16(addr)
 end
 
 function Cpu.writeRM(self: Cpu, e: ModRM, v: number)
+	if e.mod == 3 then
+		if self.operand32 then
+			self.r[e.rm + 1] = band(v, 0xFFFF)
+			self.rHi[e.rm + 1] = band(rshift(v, 16), 0xFFFF)
+		else
+			self.r[e.rm + 1] = band(v, 0xFFFF)
+			if self.level < CPU_386 then
+				self.rHi[e.rm + 1] = 0
+			end
+		end
+		return
+	end
+	const addr = self:linear(e.seg :: string, e.off :: number, if self.operand32 then 4 else 2)
 	if self.operand32 then
-		self:writeRM32(e, v)
+		self:write32(addr, v)
 	else
-		self:writeRM16(e, v)
+		self:write16(addr, v)
 	end
 end
 
 function Cpu.rrw(self: Cpu, i: number): number
-	return if self.operand32 then self:rr32(i) else self:rr(i)
+	if self.operand32 then
+		return bor(self.r[i + 1], lshift(self.rHi[i + 1], 16))
+	end
+	return self.r[i + 1]
 end
 
 function Cpu.wrw(self: Cpu, i: number, v: number)
 	if self.operand32 then
-		self:wr32(i, v)
+		self.r[i + 1] = band(v, 0xFFFF)
+		self.rHi[i + 1] = band(rshift(v, 16), 0xFFFF)
 	else
-		self:wr(i, v)
+		self.r[i + 1] = band(v, 0xFFFF)
+		-- On 386+, a 16-bit register write leaves the upper 16 bits intact.
+		if self.level < CPU_386 then
+			self.rHi[i + 1] = 0
+		end
 	end
 end
 
@@ -1480,10 +1613,25 @@ local function doALU(cpu: any, op: number, a: number, b: number, w: any): number
 		cf, of = false, false
 	end
 	res = band(res, maxv)
-	cpu:setbits(CF, cf)
-	cpu:setbits(OFLG, of)
-	cpu:setbits(AF, band(bxor(bxor(a, b), res), 16) ~= 0)
-	cpu:setSZP(res, width)
+	-- Equivalent to three setbits calls plus setSZP, but keeps the flags word
+	-- in a local for the common ALU path.
+	local f = band(cpu.flags, bnot(bor(CF, OFLG, AF, ZF, SF, PF)))
+	if cf then
+		f = bor(f, CF)
+	end
+	if of then
+		f = bor(f, OFLG)
+	end
+	if band(bxor(bxor(a, b), res), 16) ~= 0 then
+		f = bor(f, AF)
+	end
+	if res == 0 then
+		f = bor(f, ZF)
+	end
+	if res >= signv then
+		f = bor(f, SF)
+	end
+	cpu.flags = bor(f, PARITY[band(res, 0xFF)])
 	return res
 end
 
@@ -3998,7 +4146,9 @@ function Cpu.executeStep(self: Cpu): number
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil
-	self.baseOperand32 = self.level >= CPU_386 and self:code32()
+	self.baseOperand32 = self.level >= CPU_386
+		and band(self.cr0, CR0_PE) ~= 0
+		and band(self.segFlags.cs or 0, 0x40) ~= 0
 	self.baseAddress32 = self.baseOperand32
 	self.operand32 = self.baseOperand32
 	self.address32 = self.baseAddress32
@@ -4044,10 +4194,9 @@ function Cpu.executeStep(self: Cpu): number
 		)
 	end
 	h(self)
-	self.oseg = nil
-	self.osegReg = nil
-	self.rep = nil
-	self.tsc = (self.tsc or 0) + 1
+	-- Prefix state is cleared at the start of the next instruction; clearing
+	-- it here as well only added three stores to every retired instruction.
+	self.tsc += 1
 	return 1
 end
 
@@ -4061,7 +4210,7 @@ function Cpu.step(self: Cpu): number
 			self.badCsTrace = self:traceDump(40)
 		end
 	end
-	if not self:pagingEnabled() then
+	if band(self.cr0, CR0_PG) == 0 then
 		return (self :: any):executeStep()
 	end
 	const ok, result = pcall(function()
