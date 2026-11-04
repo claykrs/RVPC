@@ -4,11 +4,12 @@
 -- Registers are held as Lua doubles, not true 80-bit extended values. That is
 -- enough for the 32/64-bit code paths used by the 486-era DOS/Windows software
 -- this machine targets. Pending exceptions are reported through the x87 status
--- word but are not raised as CPU exceptions. Deliberate gaps: 80-bit memory
--- operands, FLDENV/FSTENV/FNSAVE/FRSTOR, FISTTP/FBLD/FBSTP, exact 66-bit
--- trigonometric argument reduction, and underflow/precision tracking. Stack,
--- invalid-op and divide-by-zero status still update so software can detect
--- unsupported operations.
+-- word but are not raised as CPU exceptions. Deliberate gaps: exact unmasked
+-- exception traps, underflow/precision tracking, exact 66-bit trigonometric
+-- argument reduction, FISTTP, and full 80-bit mantissa precision (extended
+-- values round-trip through a host double). Stack, invalid-op and
+-- divide-by-zero status still update so software can detect unsupported
+-- operations.
 
 const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
 
@@ -38,6 +39,7 @@ const NAN = 0 / 0
 const INF = math.huge
 const LN2 = math.log(2)
 const TWO32 = 4294967296
+const TWO63 = 9223372036854775808
 const TWO64 = 18446744073709551616
 
 const Fpu = {}
@@ -53,6 +55,11 @@ export type Fpu = typeof(setmetatable(
 		invalidCount: number,
 		stackFaultCount: number,
 		lastOpcode: number,
+		instIP: number,
+		instCS: number,
+		dataIP: number,
+		dataDS: number,
+		fop: number,
 		reset: (self: Fpu) -> (),
 		st: (self: Fpu, index: number) -> number,
 		tagWord: (self: Fpu) -> number,
@@ -200,7 +207,7 @@ local function truncate(value: number): number
 end
 
 local function exp2(value: number): number
-	return math.exp(value * LN2)
+	return 2 ^ value
 end
 
 local function log2(value: number): number
@@ -298,6 +305,123 @@ local function writeM64(cpu: any, e: any, value: number)
 	const address = memoryAddress(cpu, e, 8)
 	cpu:write32(address, buffer.readu32(bytes, 0))
 	cpu:write32(address + 4, buffer.readu32(bytes, 4))
+end
+
+-- 80-bit extended values are stored as a 64-bit explicit significand followed
+-- by a sign/exponent word. The host value is a Lua double, so the low bits of
+-- the significand are lost on store; normal values still round-trip through
+-- this representation with double precision.
+local function readM80At(cpu: any, address: number): number
+	const low = cpu:read32(address)
+	const high = cpu:read32(address + 4)
+	const signExponent = cpu:read16(address + 8)
+	const negative = band(signExponent, 0x8000) ~= 0
+	const exponent = band(signExponent, 0x7FFF)
+	const significand = high * TWO32 + low
+	if exponent == 0x7FFF then
+		if significand == 0x8000000000000000 then
+			return if negative then -INF else INF
+		end
+		return NAN
+	elseif exponent == 0 and significand == 0 then
+		return if negative then -0.0 else 0.0
+	end
+	const unbiased = if exponent == 0 then 1 - 16383 - 63 else exponent - 16383 - 63
+	const value = significand * exp2(unbiased)
+	return if negative then -value else value
+end
+
+local function writeM80At(cpu: any, address: number, value: number)
+	local sign = 0
+	local exponent = 0
+	local high = 0
+	local low = 0
+	if isNan(value) then
+		exponent = 0x7FFF
+		high = 0xC0000000
+	elseif isInf(value) then
+		exponent = 0x7FFF
+		high = 0x80000000
+	elseif value == 0 then
+		if 1 / value < 0 then
+			sign = 0x8000
+		end
+	else
+		if value < 0 then
+			sign = 0x8000
+			value = -value
+		end
+		local binaryExponent = math.floor(log2(value))
+		local significand = value / exp2(binaryExponent)
+		if significand >= 2 then
+			binaryExponent += 1
+			significand /= 2
+		elseif significand < 1 then
+			binaryExponent -= 1
+			significand *= 2
+		end
+		exponent = binaryExponent + 16383
+		local scaled = significand * TWO63
+		if scaled >= TWO64 then
+			scaled /= 2
+			exponent += 1
+		end
+		high = math.floor(scaled / TWO32)
+		low = math.floor(scaled % TWO32)
+	end
+	cpu:write32(address, low)
+	cpu:write32(address + 4, high)
+	cpu:write16(address + 8, bor(sign, band(exponent, 0x7FFF)))
+end
+
+local function readM80(cpu: any, e: any): number
+	return readM80At(cpu, memoryAddress(cpu, e, 10))
+end
+
+local function writeM80(cpu: any, e: any, value: number)
+	writeM80At(cpu, memoryAddress(cpu, e, 10), value)
+end
+
+-- Packed BCD: nine bytes, least-significant digit first, then a sign byte.
+local function readBcd(cpu: any, e: any): number
+	const address = memoryAddress(cpu, e, 10)
+	local value = 0
+	for index = 8, 0, -1 do
+		const byte = cpu:read8(address + index)
+		value = value * 100 + rshift(byte, 4) * 10 + band(byte, 0x0F)
+	end
+	if band(cpu:read8(address + 9), 0x80) ~= 0 then
+		value = -value
+	end
+	return value
+end
+
+local function writeBcd(self: Fpu, cpu: any, e: any)
+	if not ensureStack(self, 1) then
+		return
+	end
+	const address = memoryAddress(cpu, e, 10)
+	local value = roundInteger(self, getSt(self, 0))
+	const negative = value < 0
+	value = math.abs(value)
+	if not isFinite(value) or value >= 1e18 then
+		invalid(self)
+		for index = 0, 8 do
+			cpu:write8(address + index, 0xFF)
+		end
+		cpu:write8(address + 9, 0xFF)
+	else
+		local remaining = math.floor(value)
+		for index = 0, 8 do
+			const digit0 = remaining % 10
+			remaining = math.floor(remaining / 10)
+			const digit1 = remaining % 10
+			remaining = math.floor(remaining / 10)
+			cpu:write8(address + index, bor(digit0, lshift(digit1, 4)))
+		end
+		cpu:write8(address + 9, if negative then 0x80 else 0x00)
+	end
+	pop(self)
 end
 
 local function readSigned16(cpu: any, e: any): number
@@ -795,11 +919,129 @@ local function fninit(self: Fpu)
 	self.top = 0
 	self.control = DEFAULT_CONTROL
 	self.status = 0
+	self.instIP = 0
+	self.instCS = 0
+	self.dataIP = 0
+	self.dataDS = 0
+	self.fop = 0
 	for index = 0, 7 do
 		self.regs[index] = 0
 		self.tags[index] = TAG_EMPTY
 	end
 	syncTop(self)
+end
+
+local function environmentSize(cpu: any): number
+	if cpu.operand32 and not cpu:isV86() then
+		return 28
+	end
+	return 14
+end
+
+local function writeEnvironment(self: Fpu, cpu: any, e: any): number
+	const size = environmentSize(cpu)
+	const address = memoryAddress(cpu, e, size)
+	const status = bor(band(self.status, bit32.bnot(TOP_MASK)), lshift(self.top, 11))
+	const tag = self:tagWord()
+	if size == 28 then
+		cpu:write32(address, band(self.control, 0xFFFF))
+		cpu:write32(address + 4, band(status, 0xFFFF))
+		cpu:write32(address + 8, band(tag, 0xFFFF))
+		cpu:write32(address + 12, band(self.instIP, 0xFFFFFFFF))
+		cpu:write32(address + 16, bor(band(self.instCS, 0xFFFF), lshift(band(self.fop, 0x7FF), 16)))
+		cpu:write32(address + 20, band(self.dataIP, 0xFFFFFFFF))
+		cpu:write32(address + 24, band(self.dataDS, 0xFFFF))
+	else
+		cpu:write16(address, band(self.control, 0xFFFF))
+		cpu:write16(address + 2, band(status, 0xFFFF))
+		cpu:write16(address + 4, band(tag, 0xFFFF))
+		cpu:write16(address + 6, band(self.instIP, 0xFFFF))
+		cpu:write16(address + 8, band(self.instCS, 0xFFFF))
+		cpu:write16(address + 10, band(self.dataIP, 0xFFFF))
+		cpu:write16(address + 12, band(self.dataDS, 0xFFFF))
+	end
+	-- FSTENV/FNSTENV/FNSAVE mask all exceptions after writing the image.
+	self.control = bor(self.control, 0x3F)
+	return size
+end
+
+local function readEnvironment(self: Fpu, cpu: any, e: any): number
+	const size = environmentSize(cpu)
+	const address = memoryAddress(cpu, e, size)
+	local control, status, tag
+	if size == 28 then
+		control = cpu:read16(address)
+		status = cpu:read16(address + 4)
+		tag = cpu:read16(address + 8)
+		self.instIP = cpu:read32(address + 12)
+		const selectorOpcode = cpu:read32(address + 16)
+		self.instCS = band(selectorOpcode, 0xFFFF)
+		self.fop = band(rshift(selectorOpcode, 16), 0x7FF)
+		self.dataIP = cpu:read32(address + 20)
+		self.dataDS = band(cpu:read32(address + 24), 0xFFFF)
+	else
+		control = cpu:read16(address)
+		status = cpu:read16(address + 2)
+		tag = cpu:read16(address + 4)
+		self.instIP = cpu:read16(address + 6)
+		self.instCS = cpu:read16(address + 8)
+		self.dataIP = cpu:read16(address + 10)
+		self.dataDS = cpu:read16(address + 12)
+		self.fop = 0
+	end
+	self.control = band(control, 0xFFFF)
+	self.top = band(rshift(status, 11), 7)
+	self.status = band(status, bit32.bnot(TOP_MASK))
+	syncTop(self)
+	for index = 0, 7 do
+		self.tags[index] = band(rshift(tag, index * 2), 3)
+	end
+	return size
+end
+
+local function fstenv(self: Fpu, cpu: any, e: any)
+	writeEnvironment(self, cpu, e)
+end
+
+local function fldenv(self: Fpu, cpu: any, e: any)
+	readEnvironment(self, cpu, e)
+end
+
+local function fnsave(self: Fpu, cpu: any, e: any)
+	const size = writeEnvironment(self, cpu, e)
+	const address = memoryAddress(cpu, e, size) + size
+	for index = 0, 7 do
+		writeM80At(cpu, address + index * 10, getSt(self, index))
+	end
+	fninit(self)
+end
+
+local function frstor(self: Fpu, cpu: any, e: any)
+	const size = readEnvironment(self, cpu, e)
+	const address = memoryAddress(cpu, e, size) + size
+	for index = 0, 7 do
+		self.regs[(self.top + index) % 8] = readM80At(cpu, address + index * 10)
+	end
+end
+
+local function fld80(self: Fpu, cpu: any, e: any)
+	push(self, readM80(cpu, e))
+end
+
+local function fstp80(self: Fpu, cpu: any, e: any)
+	if not ensureStack(self, 1) then
+		return
+	end
+	writeM80(cpu, e, getSt(self, 0))
+	pop(self)
+end
+
+local function fbld(self: Fpu, cpu: any, e: any)
+	push(self, readBcd(cpu, e))
+end
+
+local function fbstp(self: Fpu, cpu: any, e: any)
+	writeBcd(self, cpu, e)
 end
 
 local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
@@ -827,15 +1069,19 @@ local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
 				setTop(self, arithmetic(self, readM32(cpu, e), getSt(self, 0), 3))
 			end
 		end
-	elseif group == 1 then -- D9: m32 load/store, control word
+	elseif group == 1 then -- D9: m32 load/store, environment, control word
 		if reg == 0 then
 			doFld(self, readM32(cpu, e))
 		elseif reg == 2 then
 			doFst(self, cpu, e, 32, false)
 		elseif reg == 3 then
 			doFst(self, cpu, e, 32, true)
+		elseif reg == 4 then
+			fldenv(self, cpu, e)
 		elseif reg == 5 then
 			self.control = cpu:read16(memoryAddress(cpu, e, 2))
+		elseif reg == 6 then
+			fstenv(self, cpu, e)
 		elseif reg == 7 then
 			cpu:write16(memoryAddress(cpu, e, 2), self.control)
 		else
@@ -864,13 +1110,17 @@ local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
 				setTop(self, arithmetic(self, value, getSt(self, 0), 3))
 			end
 		end
-	elseif group == 3 then -- DB: m32 integer load/store
+	elseif group == 3 then -- DB: m32 integer, m80 load/store
 		if reg == 0 then
 			push(self, readSigned32(cpu, e))
 		elseif reg == 2 then
 			storeInteger(self, cpu, e, 32, false)
 		elseif reg == 3 then
 			storeInteger(self, cpu, e, 32, true)
+		elseif reg == 5 then
+			fld80(self, cpu, e)
+		elseif reg == 7 then
+			fstp80(self, cpu, e)
 		else
 			invalid(self)
 		end
@@ -897,13 +1147,17 @@ local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
 				setTop(self, arithmetic(self, value, getSt(self, 0), 3))
 			end
 		end
-	elseif group == 5 then -- DD: m64 load/store, status word
+	elseif group == 5 then -- DD: m64 load/store, state, status word
 		if reg == 0 then
 			doFld(self, readM64(cpu, e))
 		elseif reg == 2 then
 			doFst(self, cpu, e, 64, false)
 		elseif reg == 3 then
 			doFst(self, cpu, e, 64, true)
+		elseif reg == 4 then
+			frstor(self, cpu, e)
+		elseif reg == 6 then
+			fnsave(self, cpu, e)
 		elseif reg == 7 then
 			cpu:write16(memoryAddress(cpu, e, 2), band(self.status, 0xFFFF))
 		else
@@ -932,15 +1186,19 @@ local function executeMemory(self: Fpu, cpu: any, opcode: number, e: any)
 				setTop(self, arithmetic(self, value, getSt(self, 0), 3))
 			end
 		end
-	else -- DF: m16/m64 integer load/store
+	else -- DF: m16/m64 integer, BCD load/store
 		if reg == 0 then
 			push(self, readSigned16(cpu, e))
 		elseif reg == 2 then
 			storeInteger(self, cpu, e, 16, false)
 		elseif reg == 3 then
 			storeInteger(self, cpu, e, 16, true)
+		elseif reg == 4 then
+			fbld(self, cpu, e)
 		elseif reg == 5 then
 			push(self, readSigned64(cpu, e))
+		elseif reg == 6 then
+			fbstp(self, cpu, e)
 		elseif reg == 7 then
 			storeInteger(self, cpu, e, 64, true)
 		else
@@ -1220,6 +1478,17 @@ end
 
 function Fpu.execute(self: Fpu, cpu: any, opcode: number, e: any)
 	self.lastOpcode = opcode
+	const environmentOp = (opcode == 0xD9 and (e.reg == 4 or e.reg == 6))
+		or (opcode == 0xDD and (e.reg == 4 or e.reg == 6))
+	if not environmentOp then
+		self.instIP = cpu.opIP or cpu.ip
+		self.instCS = cpu.cs
+		self.fop = band(opcode, 0x7FF)
+		if e.mod ~= 3 then
+			self.dataIP = e.off or 0
+			self.dataDS = cpu[e.seg or "ds"] or 0
+		end
+	end
 	if e.mod == 3 then
 		executeRegister(self, cpu, opcode, e)
 	else
@@ -1237,6 +1506,11 @@ function Fpu.new()
 	self.invalidCount = 0
 	self.stackFaultCount = 0
 	self.lastOpcode = 0
+	self.instIP = 0
+	self.instCS = 0
+	self.dataIP = 0
+	self.dataDS = 0
+	self.fop = 0
 	for index = 0, 7 do
 		self.regs[index] = 0
 		self.tags[index] = TAG_EMPTY

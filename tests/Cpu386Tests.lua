@@ -318,6 +318,66 @@ T("v86_interrupt_frame_and_iret", function(expect)
 	expect(cpu.pageFaults == 0, "unexpected page fault")
 end)
 
+T("v86_io_bitmap_trap", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	cpu.tr = 0x18
+	cpu.trBase = 0x20000
+	cpu.trLimit = 0x1FF
+	cpu.tr32 = true
+	m.mem:write32(0x20004, 0x9000)
+	m.mem:write16(0x20008, 0x10)
+	m.mem:write16(0x20066, 0x0100) -- I/O bitmap at TSS+0x100
+	for index = 0, 0x2F do
+		m.mem:write8(0x20100 + index, 0xFF)
+	end
+	m.mem:write8(0x20110, 0xFE) -- allow port 0x80, deny port 0x81
+	installGate(m, 13, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, {
+		0x83,
+		0x04,
+		0x24,
+		0x02, -- ADD dword [ESP],2 (skip the IN)
+		0xCF, -- IRETD
+	})
+	putCode(m, 0x10000, {
+		0xE4,
+		0x80, -- IN AL,80h (allowed)
+		0xA2,
+		0x00,
+		0x04, -- MOV [0400],AL
+		0xE4,
+		0x81, -- IN AL,81h (denied -> #GP)
+		0xB8,
+		0x34,
+		0x12, -- MOV AX,1234
+		0xA2,
+		0x10,
+		0x04, -- MOV [0410],AL
+		0xEB,
+		0xFE, -- JMP $
+	})
+	putCode(m, 0x1000, { 0xCF }) -- IRETD into V86
+	cpu:push32(0) -- GS
+	cpu:push32(0) -- FS
+	cpu:push32(0x1000) -- DS
+	cpu:push32(0x1000) -- ES
+	cpu:push32(0x2000) -- SS
+	cpu:push32(0x800) -- ESP
+	cpu:push32(bor(0x202, VM)) -- EFLAGS
+	cpu:push32(0x1000) -- CS
+	cpu:push32(0) -- EIP
+	m:run(80)
+	expect(cpu:isV86(), "did not return to V86")
+	expect((cpu.intCounts[13] or 0) == 1, "I/O bitmap did not raise #GP")
+	expect(m.mem:read8(0x10400) == 0xFF, string.format("allowed IN AL=%02X", m.mem:read8(0x10400)))
+	expect(
+		m.mem:read8(0x10410) == 0x34,
+		string.format("handler did not resume V86 code, AL=%02X", m.mem:read8(0x10410))
+	)
+end)
+
 T("pic_priority_and_slave_eoi", function(expect)
 	const pic = Pic.new()
 	pic.master.imr = 0xFC -- unmask IRQ0/IRQ1

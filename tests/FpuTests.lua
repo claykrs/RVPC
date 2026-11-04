@@ -1,7 +1,7 @@
 --!nonstrict
 -- FpuTests.lua -- x87 subset through Machine.new with a real 486 CPU config.
 
-const band = bit32.band
+const band, bor = bit32.band, bit32.bor
 const Memory = require("../core/Memory")
 const Cpu = require("../core/Cpu")
 const Fpu = require("../core/Fpu")
@@ -606,6 +606,359 @@ T("fpu_unsupported_sets_invalid", function(expect)
 	expect(fpu.invalidCount == 1, "invalid count=" .. fpu.invalidCount)
 	expect(band(fpu.status, 0x0081) == 0x0081, string.format("invalid status=%04X", fpu.status))
 	expect(fpu:tagWord() == 0xFFFF, "unsupported op corrupted the stack")
+end)
+
+T("fpu_env16_layout", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x00, 0x07 }) -- control 0x0700
+	putData(m, 0x308, { 0x7F, 0x03 }) -- default control
+	putF32(m, 0x304, 1.5)
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW [0x300]
+		0xD9,
+		0x06,
+		0x04,
+		0x03, -- FLD dword [0x304]
+		0xD9,
+		0x36,
+		0x10,
+		0x03, -- FNSTENV m14 [0x310]
+		0xD9,
+		0x2E,
+		0x08,
+		0x03, -- FLDCW default
+		0xD9,
+		0x26,
+		0x10,
+		0x03, -- FLDENV m14 [0x310]
+		0xD9,
+		0x3E,
+		0x20,
+		0x03, -- FNSTCW [0x320]
+	})
+	m:run(100)
+	expect(m.mem:read16(0x6000 + 0x310) == 0x0700, "16-bit control")
+	const status = m.mem:read16(0x6000 + 0x312)
+	expect(band(status, 0x3800) == 0x3800, string.format("16-bit TOP=%04X", status))
+	expect(
+		m.mem:read16(0x6000 + 0x314) == 0x3FFF,
+		string.format("16-bit tag=%04X", m.mem:read16(0x6000 + 0x314))
+	)
+	expect(m.mem:read16(0x6000 + 0x316) == 0x0104, "16-bit FIP=" .. m.mem:read16(0x6000 + 0x316))
+	expect(m.mem:read16(0x6000 + 0x318) == 0x0600, "16-bit FCS=" .. m.mem:read16(0x6000 + 0x318))
+	expect(m.mem:read16(0x6000 + 0x31A) == 0x0304, "16-bit FDP=" .. m.mem:read16(0x6000 + 0x31A))
+	expect(m.mem:read16(0x6000 + 0x31C) == 0x0600, "16-bit FDS=" .. m.mem:read16(0x6000 + 0x31C))
+	expect(fpu.control == 0x0700, string.format("restored control=%04X", fpu.control))
+	expect(fpu.top == 7, "restored TOP=" .. fpu.top)
+	expect(m.mem:read16(0x6000 + 0x320) == 0x0700, "FNSTCW after FLDENV")
+	closeTo(expect, fpu:st(0), 1.5, "FLDENV left registers intact")
+end)
+
+T("fpu_env32_layout", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x00, 0x07 })
+	putData(m, 0x308, { 0x7F, 0x03 })
+	putF32(m, 0x304, 1.5)
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW [0x300]
+		0xD9,
+		0x06,
+		0x04,
+		0x03, -- FLD dword [0x304]
+		0x9B,
+		0x66,
+		0xD9,
+		0x36,
+		0x10,
+		0x03, -- FSTENV m28 [0x310]
+		0xD9,
+		0x2E,
+		0x08,
+		0x03, -- FLDCW default
+		0x66,
+		0xD9,
+		0x26,
+		0x10,
+		0x03, -- FLDENV m28 [0x310]
+		0xD9,
+		0x3E,
+		0x40,
+		0x03, -- FNSTCW [0x340]
+	})
+	m:run(100)
+	expect(m.mem:read16(0x6000 + 0x310) == 0x0700, "32-bit control")
+	const status = m.mem:read16(0x6000 + 0x314)
+	expect(band(status, 0x3800) == 0x3800, string.format("32-bit TOP=%04X", status))
+	expect(
+		m.mem:read16(0x6000 + 0x318) == 0x3FFF,
+		string.format("32-bit tag=%04X", m.mem:read16(0x6000 + 0x318))
+	)
+	expect(m.mem:read32(0x6000 + 0x31C) == 0x0104, "32-bit FIP=" .. m.mem:read32(0x6000 + 0x31C))
+	expect(band(m.mem:read32(0x6000 + 0x320), 0xFFFF) == 0x0600, "32-bit FCS")
+	expect(band(bit32.rshift(m.mem:read32(0x6000 + 0x320), 16), 0x7FF) == 0xD9, "32-bit FOP")
+	expect(m.mem:read32(0x6000 + 0x324) == 0x0304, "32-bit FDP=" .. m.mem:read32(0x6000 + 0x324))
+	expect(band(m.mem:read32(0x6000 + 0x328), 0xFFFF) == 0x0600, "32-bit FDS")
+	expect(fpu.control == 0x0700, string.format("restored control=%04X", fpu.control))
+	expect(fpu.top == 7, "restored TOP=" .. fpu.top)
+	expect(m.mem:read16(0x6000 + 0x340) == 0x0700, "FNSTCW after FLDENV")
+end)
+
+T("fpu_fsave_frstor_roundtrip", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x00, 0x07 })
+	putF32(m, 0x304, 1.5)
+	putF32(m, 0x308, 2.5)
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW [0x300]
+		0xD9,
+		0x06,
+		0x04,
+		0x03, -- FLD 1.5
+		0xD9,
+		0x06,
+		0x08,
+		0x03, -- FLD 2.5
+		0xD8,
+		0xC1, -- FADD -> 4.0
+		0x66,
+		0xDD,
+		0x36,
+		0x00,
+		0x04, -- FNSAVE m108 [0x400]
+		0x66,
+		0xDD,
+		0x26,
+		0x00,
+		0x04, -- FRSTOR m108 [0x400]
+		0xDD,
+		0x1E,
+		0x20,
+		0x03, -- FSTP qword [0x320]
+		0xDD,
+		0x1E,
+		0x28,
+		0x03, -- FSTP qword [0x328]
+		0xD9,
+		0x3E,
+		0x30,
+		0x03, -- FNSTCW [0x330]
+	})
+	m:run(100)
+	expect(m.mem:read16(0x6000 + 0x400) == 0x0700, "saved control")
+	expect(band(m.mem:read16(0x6000 + 0x404), 0x3800) == 0x3000, "saved TOP")
+	expect(
+		m.mem:read16(0x6000 + 0x408) == 0x0FFF,
+		string.format("saved tag=%04X", m.mem:read16(0x6000 + 0x408))
+	)
+	expect(m.mem:read32(0x6000 + 0x41C) == 0, "R0 low significand")
+	expect(m.mem:read32(0x6000 + 0x420) == 0x80000000, "R0 high significand")
+	expect(m.mem:read16(0x6000 + 0x424) == 0x4001, "R0 exponent")
+	expect(m.mem:read32(0x6000 + 0x426) == 0, "R1 low significand")
+	expect(m.mem:read32(0x6000 + 0x42A) == 0xC0000000, "R1 high significand")
+	expect(m.mem:read16(0x6000 + 0x42E) == 0x3FFF, "R1 exponent")
+	closeTo(expect, readF64(m, 0x320), 4.0, "FRSTOR ST0")
+	closeTo(expect, readF64(m, 0x328), 1.5, "FRSTOR ST1")
+	expect(m.mem:read16(0x6000 + 0x330) == 0x0700, "FRSTOR control")
+	expect(fpu:tagWord() == 0xFFFF, string.format("post-restore tag=%04X", fpu:tagWord()))
+end)
+
+T("fpu_fstenv_masks_exceptions", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x00, 0x07 }) -- control 0x0700, all exceptions unmasked
+	putCode(m, {
+		0xD9,
+		0x2E,
+		0x00,
+		0x03, -- FLDCW [0x300]
+		0xD9,
+		0x36,
+		0x10,
+		0x03, -- FNSTENV [0x310]
+	})
+	m:run(100)
+	expect(m.mem:read16(0x6000 + 0x310) == 0x0700, "saved control was masked")
+	expect(fpu.control == 0x073F, string.format("live control=%04X", fpu.control))
+end)
+
+T("fpu_fsave16_roundtrip", function(expect)
+	const m, fpu = newMachine()
+	putF32(m, 0x300, 3.5)
+	putCode(m, {
+		0xD9,
+		0x06,
+		0x00,
+		0x03, -- FLD dword [0x300]
+		0xDD,
+		0x36,
+		0x00,
+		0x04, -- FNSAVE m94 [0x400]
+		0xDD,
+		0x26,
+		0x00,
+		0x04, -- FRSTOR m94 [0x400]
+		0xDD,
+		0x1E,
+		0x20,
+		0x03, -- FSTP qword [0x320]
+	})
+	m:run(100)
+	expect(m.mem:read16(0x6000 + 0x400) == 0x037F, "16-bit saved control")
+	expect(band(m.mem:read16(0x6000 + 0x402), 0x3800) == 0x3800, "16-bit saved TOP")
+	expect(
+		m.mem:read16(0x6000 + 0x404) == 0x3FFF,
+		string.format("16-bit saved tag=%04X", m.mem:read16(0x6000 + 0x404))
+	)
+	expect(m.mem:read32(0x6000 + 0x40E) == 0, "16-bit R0 low significand")
+	expect(m.mem:read32(0x6000 + 0x412) == 0xE0000000, "16-bit R0 high significand")
+	expect(m.mem:read16(0x6000 + 0x416) == 0x4000, "16-bit R0 exponent")
+	closeTo(expect, readF64(m, 0x320), 3.5, "16-bit FNSAVE/FRSTOR")
+	expect(fpu:tagWord() == 0xFFFF, "16-bit state stack not empty")
+end)
+
+T("fpu_m80_roundtrip", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xFF, 0x3F }) -- 1.5
+	putF64(m, 0x328, 2.5)
+	putCode(m, {
+		0xDB,
+		0x2E,
+		0x00,
+		0x03, -- FLD m80 [0x300]
+		0xDB,
+		0x3E,
+		0x10,
+		0x03, -- FSTP m80 [0x310]
+		0xDB,
+		0x2E,
+		0x10,
+		0x03, -- FLD m80 [0x310]
+		0xDD,
+		0x1E,
+		0x20,
+		0x03, -- FSTP qword [0x320]
+		0xDD,
+		0x06,
+		0x28,
+		0x03, -- FLD qword [0x328]
+		0xDB,
+		0x3E,
+		0x30,
+		0x03, -- FSTP m80 [0x330]
+		0xDB,
+		0x2E,
+		0x30,
+		0x03, -- FLD m80 [0x330]
+		0xDD,
+		0x1E,
+		0x40,
+		0x03, -- FSTP qword [0x340]
+	})
+	m:run(100)
+	for index = 0, 9 do
+		expect(
+			m.mem:read8(0x6000 + 0x310 + index) == m.mem:read8(0x6000 + 0x300 + index),
+			"m80 byte " .. index
+		)
+	end
+	closeTo(expect, readF64(m, 0x320), 1.5, "m80 -> f64")
+	closeTo(expect, readF64(m, 0x340), 2.5, "f64 -> m80 -> f64")
+	expect(m.mem:read16(0x6000 + 0x338) == 0x4000, "2.5 exponent")
+	expect(m.mem:read32(0x6000 + 0x334) == 0xA0000000, "2.5 high significand")
+	expect(fpu:tagWord() == 0xFFFF, "m80 stack not empty")
+end)
+
+T("fpu_bcd_roundtrip", function(expect)
+	const m, fpu = newMachine()
+	putData(m, 0x300, { 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 }) -- 123456789
+	putCode(m, {
+		0xDF,
+		0x26,
+		0x00,
+		0x03, -- FBLD [0x300]
+		0xDF,
+		0x36,
+		0x10,
+		0x03, -- FBSTP [0x310]
+		0xDF,
+		0x26,
+		0x10,
+		0x03, -- FBLD [0x310]
+		0xDF,
+		0x36,
+		0x20,
+		0x03, -- FBSTP [0x320]
+	})
+	m:run(100)
+	for index = 0, 9 do
+		expect(
+			m.mem:read8(0x6000 + 0x310 + index) == m.mem:read8(0x6000 + 0x300 + index),
+			"BCD byte " .. index
+		)
+		expect(
+			m.mem:read8(0x6000 + 0x320 + index) == m.mem:read8(0x6000 + 0x300 + index),
+			"BCD second byte " .. index
+		)
+	end
+	expect(fpu:tagWord() == 0xFFFF, "BCD stack not empty")
+end)
+
+T("fpu_ts_lazy_switch", function(expect)
+	const m, fpu = newMachine()
+	putCode(m, {
+		0xD9,
+		0xE8, -- FLD1 (TS -> #NM)
+		0x0F,
+		0x06, -- CLTS
+		0xD9,
+		0xE8, -- FLD1
+		0xDB,
+		0xE3, -- FNINIT (TS -> #NM)
+		0xDB,
+		0xE2, -- FNCLEX (TS -> #NM)
+		0x0F,
+		0x06, -- CLTS
+		0xD9,
+		0xE8, -- FLD1
+	})
+	m.mem:write16(0x1C, 0)
+	m.mem:write16(0x1E, 0)
+	m.cpu.defaultInts[7] = function() end
+
+	m.cpu.cr0 = 0x00000008
+	m:run(1)
+	expect((m.cpu.intCounts[7] or 0) == 1, "TS FLD did not raise #NM")
+	expect(fpu.top == 0, "TS FLD modified the FPU")
+
+	m:run(1) -- CLTS
+	expect(band(m.cpu.cr0, 0x00000008) == 0, "CLTS did not clear TS")
+	m:run(1) -- FLD1
+	expect(fpu.top == 7, "FLD after CLTS did not execute")
+
+	m.cpu.cr0 = bor(m.cpu.cr0, 0x00000008)
+	m:run(1) -- FNINIT
+	expect((m.cpu.intCounts[7] or 0) == 2, "FNINIT did not raise #NM under TS")
+	expect(band(m.cpu.cr0, 0x00000008) ~= 0, "FNINIT cleared TS")
+	expect(fpu.top == 7 and fpu:tagWord() == 0x3FFF, "FNINIT executed under TS")
+
+	m:run(1) -- FNCLEX
+	expect((m.cpu.intCounts[7] or 0) == 3, "FNCLEX did not raise #NM under TS")
+	expect(band(m.cpu.cr0, 0x00000008) ~= 0, "FNCLEX cleared TS")
+	expect(fpu.top == 7, "FNCLEX executed under TS")
+
+	m:run(1) -- CLTS
+	m:run(1) -- FLD1
+	expect(band(m.cpu.cr0, 0x00000008) == 0, "second CLTS did not clear TS")
+	expect(fpu.top == 6, "FLD after second CLTS did not execute")
+	expect(fpu:tagWord() == 0x0FFF, string.format("TS lazy tag=%04X", fpu:tagWord()))
 end)
 
 T("fpu_cpuid_fpu_bit", function(expect)

@@ -2508,7 +2508,47 @@ H[0xE3] = function(cpu: any)
 	end
 end
 
+-- I/O privilege for protected mode and V86. Real mode is unrestricted. In
+-- protected mode, CPL <= IOPL is sufficient; otherwise the 32-bit TSS I/O
+-- permission bitmap decides, with a missing/oversized bitmap denying access.
+local function ioAllowed(cpu: any, port: number, width: number): boolean
+	if not cpu:isProtected() then
+		return true
+	end
+	const iopl = band(rshift(cpu.flags, 12), 3)
+	if cpu:isV86() then
+		if iopl == 3 then
+			return true
+		end
+	elseif cpu:cpl() <= iopl then
+		return true
+	end
+	if not cpu.tr32 or cpu.trLimit < 0x67 then
+		return false
+	end
+	const mapBase = cpu:read16(cpu.trBase + 0x66, true)
+	if mapBase >= cpu.trLimit then
+		return false
+	end
+	for index = 0, width - 1 do
+		const currentPort = band(port + index, 0xFFFF)
+		const byteOffset = mapBase + rshift(currentPort, 3)
+		if byteOffset > cpu.trLimit then
+			return false
+		end
+		const mapByte = cpu:read8(cpu.trBase + byteOffset, true)
+		if band(mapByte, lshift(1, band(currentPort, 7))) ~= 0 then
+			return false
+		end
+	end
+	return true
+end
+
 local function ioIn(cpu: any, port: number, width: number): number
+	if not ioAllowed(cpu, port, width) then
+		cpu:fault(13)
+		return 0
+	end
 	if width == 4 then
 		const read32 = cpu.io.in32 :: ((p: number) -> number)?
 		if read32 then
@@ -2531,6 +2571,10 @@ local function ioIn(cpu: any, port: number, width: number): number
 end
 
 local function ioOut(cpu: any, port: number, width: number, value: number)
+	if not ioAllowed(cpu, port, width) then
+		cpu:fault(13)
+		return
+	end
 	if width == 4 then
 		const write32 = cpu.io.out32 :: ((p: number, v: number) -> ())?
 		if write32 then
