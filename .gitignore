@@ -11,10 +11,10 @@ win98se-media.zip
 tools/bin/
 
 # generated import models / places
-Rvdm98.rbxmx
-Rvdm98.rbxm
-Rvdm98-demo.rbxlx
-Rvdm98-demo.rbxl
+Rvpc.rbxmx
+Rvpc.rbxm
+Rvpc-demo.rbxlx
+Rvpc-demo.rbxl
 
 # generated Studio deploy payload
 tools/deploy_args.json

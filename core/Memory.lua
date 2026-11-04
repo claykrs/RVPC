@@ -12,7 +12,7 @@
 --   E0000-FFFFF  BIOS ROM (256 KiB SeaBIOS image; reset vector at FFFF0)
 --
 -- With no ROM installed the E0000-FFFFF window stays backed by RAM so the old
--- RVDM hypervisor stubs (IVT trampolines at F000:0100, XMS entry at F100:00C0)
+-- legacy hypervisor stubs (IVT trampolines at F000:0100, XMS entry at F100:00C0)
 -- keep working. Once loadRom() is called, ROM reads are served from the image
 -- and writes to ROM are ignored.
 --
@@ -62,7 +62,7 @@ export type Memory = typeof(setmetatable(
 		romLowOffset: number,
 		romHighBase: number,
 		romShadowed: boolean,
-		lowRomLocked: boolean,
+		lowRomLockMask: number,
 	},
 	Memory
 ))
@@ -86,7 +86,7 @@ function Memory.new(size: number?): Memory
 		romLowOffset = 0,
 		romHighBase = 0,
 		romShadowed = false,
-		lowRomLocked = false,
+		lowRomLockMask = 0,
 	}, Memory)
 end
 
@@ -128,10 +128,37 @@ function Memory:hasRom(): boolean
 end
 
 -- SeaBIOS locks the legacy BIOS shadow through the i440FX PAM registers just
--- before boot. Keeping C0000-FFFFF writable after that lets a boot loader's
--- El Torito image overwrite the running firmware.
+-- before boot. The F-segment holds the running firmware and must become
+-- read-only. E0000-EFFFF is BIOS extension RAM, and SeaBIOS keeps its
+-- real-mode IRQ stack there (SS=DA80, SP=F9xx lands at EA1EC), so it must stay
+-- writable after the lock.
+-- The i440FX PAM registers protect individual 32 KiB chunks of
+-- C0000-FFFFF. The VGA option ROM uses E8000-EFFFF as a writable stack even
+-- after the BIOS locks its own F-segment, so this must be a bitmask, not one
+-- global boolean.
+function Memory:setLowRomLockMask(mask: number)
+	self.lowRomLockMask = band(mask, 0xFF)
+end
+
 function Memory:lockLowRom(locked: boolean)
-	self.lowRomLocked = locked
+	self.lowRomLockMask = if locked then 0xC0 else 0
+end
+
+function Memory:isLowRomLocked(addr: number): boolean
+	if self.lowRomLockMask == 0 or addr < 0xC0000 or addr > 0xFFFFF then
+		return false
+	end
+	const chunk = band(rshift(addr - 0xC0000, 15), 7)
+	return band(self.lowRomLockMask, lshift(1, chunk)) ~= 0
+end
+
+function Memory:hasLockedLowRom(addr: number, length: number): boolean
+	for index = 0, length - 1 do
+		if self:isLowRomLocked(addr + index) then
+			return true
+		end
+	end
+	return false
 end
 
 -- Option ROMs are shadowed into the C0000-DFFFF expansion window. The window
@@ -223,7 +250,7 @@ function Memory:read8(addr: number): number
 	if addr >= APERTURE_START and addr <= APERTURE_END and self.aperture then
 		return self.aperture:read8(addr)
 	end
-	-- No ROM installed: preserve the RVDM hypervisor's writable high segment.
+	-- No ROM installed: preserve the legacy hypervisor's writable high segment.
 	if not rom and addr >= Memory.ROM_BASE and addr <= 0xFFFFF and addr < self.size then
 		return buffer.readu8(self.buf, addr)
 	end
@@ -254,7 +281,7 @@ function Memory:write8(addr: number, value: number)
 	if self:isProtected(addr) then
 		return
 	end
-	if self.lowRomLocked and addr >= 0xC0000 and addr <= 0xFFFFF then
+	if self:isLowRomLocked(addr) then
 		return
 	end
 	if self:isRam(addr, 1) then
@@ -277,7 +304,7 @@ function Memory:write16(addr: number, value: number)
 	if self:isProtected(addr) then
 		return
 	end
-	if self.lowRomLocked and addr <= 0xFFFFF and addr + 1 >= 0xC0000 then
+	if self:hasLockedLowRom(addr, 2) then
 		self:write8(addr, band(value, 0xFF))
 		self:write8(addr + 1, band(rshift(value, 8), 0xFF))
 		return
@@ -299,7 +326,7 @@ function Memory:write32(addr: number, value: number)
 	if self:isProtected(addr) then
 		return
 	end
-	if self.lowRomLocked and addr <= 0xFFFFF and addr + 3 >= 0xC0000 then
+	if self:hasLockedLowRom(addr, 4) then
 		for index = 0, 3 do
 			self:write8(addr + index, band(rshift(value, index * 8), 0xFF))
 		end

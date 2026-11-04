@@ -1,5 +1,5 @@
 --!strict
--- Vga.lua -- environment-pure VGA device model for RVDM.
+-- Vga.lua -- environment-pure VGA device model for RVPC.
 --
 -- The device owns the A0000..AFFFF aperture rather than Memory: a real VGA has
 -- four 64 KiB planes behind one 64 KiB window, so the linear 1 MiB buffer
@@ -1415,7 +1415,7 @@ function Vga.fillTextPattern(self: Vga)
 			self.mem:write8(cell + 1, 0x07)
 		end
 	end
-	self:writeText(2, 24, "RVDM VGA DIAGNOSTIC", 0x1F)
+	self:writeText(2, 24, "RVPC VGA DIAGNOSTIC", 0x1F)
 	self:writeText(4, 16, "MODE 03H TEXT FALLBACK 80X25", 0x0F)
 	self:writeText(6, 16, "MODE 12H 640X480X16 PLANAR", 0x0A)
 	self:writeText(7, 16, "MODE 13H 320X200X256 LINEAR", 0x0B)

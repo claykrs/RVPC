@@ -1,5 +1,5 @@
 --!nonstrict
--- harness.lua -- headless RVDM98 boot: load a real 256 KiB SeaBIOS (and the
+-- harness.lua -- headless RVPC boot: load a real 256 KiB SeaBIOS (and the
 -- SeaVGABIOS option ROM) and run until firmware text appears or it faults.
 --
 -- Usage: lune run tools/harness.lua [max-millions]
@@ -114,6 +114,7 @@ local executed = 0
 local lastScreen = ""
 local lastPrint = 0
 local menuSelected = false
+local menuDebug = 0
 
 while executed < budget do
 	const want = math.min(chunk, budget - executed)
@@ -124,17 +125,124 @@ while executed < budget do
 		print(
 			("FAULT at %s after %d steps: %s"):format(machine:bootPc(), executed, tostring(result))
 		)
+		local irq = machine.cpu.lastIrq
+		if irq then
+			print(
+				("last IRQ0 before: cs=%04X ip=%04X flags=%04X ss=%04X sp=%04X"):format(
+					irq.cs,
+					irq.ip,
+					irq.flags,
+					irq.ss,
+					irq.sp
+				)
+			)
+			print(("  stack: %04X %04X %04X %04X"):format(irq.s0, irq.s1, irq.s2, irq.s3))
+			if machine.cpu.lastIrqTrace then
+				print("  IRQ0 entry trace:")
+				for index, pc in machine.cpu.lastIrqTrace do
+					print("    " .. pc)
+					if index >= 40 then
+						break
+					end
+				end
+			end
+		end
+		if machine.cpu.badCsTrace then
+			print("first 0202:0 entry trace:")
+			for _, pc in machine.cpu.badCsTrace do
+				print("  " .. pc)
+			end
+		end
+		local sw = machine.cpu.lastSwInt
+		if sw then
+			print(
+				("last INT10: from %04X:%04X flags=%04X ss=%04X sp=%04X"):format(
+					sw.cs,
+					sw.ip,
+					sw.flags,
+					sw.ss,
+					sw.sp
+				)
+			)
+			print(
+				("  int10 stack: %04X %04X %04X %04X %04X %04X %04X %04X"):format(
+					sw.s0,
+					sw.s1,
+					sw.s2,
+					sw.s3,
+					sw.s4,
+					sw.s5,
+					sw.s6,
+					sw.s7
+				)
+			)
+		end
+		local extra = {}
+		for index = 0, 127 do
+			extra[#extra + 1] = string.format("%04X", machine.mem:read16(0xE9600 + index * 2))
+		end
+		print("VGA extra stack:" .. table.concat(extra, " "))
+		local far = machine.cpu.lastFarCall
+		if far then
+			print(
+				("last far CALL: %04X:%04X -> %04X:%04X ss=%04X sp=%04X"):format(
+					far.fromCs,
+					far.fromIp,
+					far.toCs,
+					far.toIp,
+					far.ss,
+					far.sp
+				)
+			)
+		end
+		local retf = machine.cpu.lastRetf
+		if retf then
+			print(
+				("last RETF: %04X:%04X -> %04X:%04X ss=%04X sp=%04X after=%04X"):format(
+					retf.fromCs,
+					retf.fromIp,
+					retf.cs,
+					retf.ip,
+					retf.ss,
+					retf.sp,
+					retf.afterSp
+				)
+			)
+			print(
+				("  retf stack: %04X %04X %04X %04X %04X %04X"):format(
+					retf.s0,
+					retf.s1,
+					retf.s2,
+					retf.s3,
+					retf.s4,
+					retf.s5
+				)
+			)
+		end
+		local iret = machine.cpu.lastIret
+		if iret then
+			print(
+				("last IRET: ip=%04X cs=%04X flags=%04X ss=%04X sp=%04X"):format(
+					iret.ip,
+					iret.cs,
+					iret.flags,
+					iret.ss,
+					iret.sp
+				)
+			)
+			print(("  stack: %04X %04X %04X %04X"):format(iret.s0, iret.s1, iret.s2, iret.s3))
+		end
 		print("trace:")
 		const trace = machine.cpu:traceDump(4096)
 		local first = nil
 		for index, pc in trace do
-			if pc == "F000:00000000" then
+			if string.find(pc, "0202:", 1, true) then
 				first = index
 				break
 			end
 		end
 		if first then
-			for index = math.max(1, first - 24), math.min(#trace, first + 16) do
+			for index = math.max(1, first - 80), math.min(#trace, first + 16) do
 				print("  " .. trace[index])
 			end
 		else
@@ -158,9 +266,34 @@ while executed < budget do
 		print(("... %dM steps at %s"):format(math.floor(executed / 1_000_000), machine:bootPc()))
 	end
 	if not menuSelected and string.find(screen, "Select boot device", 1, true) then
-		print("selecting boot entry 1 (CD)")
+		print(
+			("selecting boot entry 1 (CD); bda head=%04X tail=%04X start=%04X end=%04X"):format(
+				machine.mem:read16(0x41A),
+				machine.mem:read16(0x41C),
+				machine.mem:read16(0x480),
+				machine.mem:read16(0x482)
+			)
+		)
 		if machine:injectBdaKey(0x02, string.byte("1")) then
 			menuSelected = true
+			print(
+				("injected; bda head=%04X tail=%04X"):format(
+					machine.mem:read16(0x41A),
+					machine.mem:read16(0x41C)
+				)
+			)
+		end
+	end
+	if menuSelected then
+		menuDebug += 1
+		if menuDebug % 8 == 0 then
+			print(
+				("menu wait: bda head=%04X tail=%04X pc=%s"):format(
+					machine.mem:read16(0x41A),
+					machine.mem:read16(0x41C),
+					machine:bootPc()
+				)
+			)
 		end
 	end
 	if

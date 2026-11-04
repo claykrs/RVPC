@@ -1,5 +1,5 @@
 --!nonstrict
--- run.lua -- RVDM98 test runner.
+-- run.lua -- RVPC test runner.
 
 local Memory = require("../core/Memory")
 local Cpu = require("../core/Cpu")

@@ -1,7 +1,10 @@
-# RVDM98 — a real PC in Roblox, targeting Windows 98 SE
+# RVPC - a real PC in Roblox, targeting Windows 98 SE
 
-RVDM98 is a from-scratch successor to RVDM. It is a **full-system x86 PC
+RVPC is a from-scratch successor to the original Windows 3.0 emulator. It is a **full-system x86 PC
 emulator** written in Luau, intended to run inside Roblox on the client.
+
+**RVPC/98** is the Windows 98 SE machine profile. The product is a virtual PC,
+not a DOS compatibility layer.
 
 The target is a **486/Pentium-class PC** with:
 

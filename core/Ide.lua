@@ -108,7 +108,7 @@ local function newDrive(kind: string, image: buffer?, present: boolean): Drive
 		image = image,
 		status = if present then bor(ST_DRDY, ST_DSC) else 0,
 		error = 0,
-		model = if kind == "hdd" then "RVDM98 VIRTUAL HDD" else "RVDM98 VIRTUAL CD",
+		model = if kind == "hdd" then "RVPC VIRTUAL HDD" else "RVPC VIRTUAL CD",
 	}
 end
 
@@ -175,7 +175,7 @@ local function identify(drive: Drive): buffer
 		putWord(out, 49, 0x0200) -- LBA supported
 		putWord(out, 80, 0x0000)
 		putWord(out, 82, 0x0000)
-		putAtaString(out, 54, "RVDM98 VIRTUAL CD", 40)
+		putAtaString(out, 54, "RVPC VIRTUAL CD", 40)
 		return out
 	end
 	putWord(out, 0, 0x0040)
@@ -188,7 +188,7 @@ local function identify(drive: Drive): buffer
 	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
 	putWord(out, 80, 0x0004) -- ATA-2
 	putWord(out, 82, 0x4000) -- LBA
-	putAtaString(out, 54, "RVDM98 VIRTUAL HDD", 40)
+	putAtaString(out, 54, "RVPC VIRTUAL HDD", 40)
 	return out
 end
 
@@ -292,7 +292,7 @@ local function atapiPacket(self: Ide)
 		buffer.writeu8(data, 0, 0x05) -- CD-ROM
 		buffer.writeu8(data, 1, 0x80) -- removable
 		buffer.writeu8(data, 4, 31)
-		putAtaString(data, 8, "RVDM98", 8)
+		putAtaString(data, 8, "RVPC", 8)
 		putAtaString(data, 16, "VIRTUAL CD", 16)
 		putAtaString(data, 32, "1.0", 4)
 		beginRead(self, data)

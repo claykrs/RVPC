@@ -1,20 +1,20 @@
 --!strict
--- init.lua -- RVDM98 core index.
+-- init.lua -- RVPC core index.
 
-const Vdm = {}
+const Rvpc = {}
 
-Vdm.Memory = require(script.Memory)
-Vdm.Cpu = require(script.Cpu)
-Vdm.Vga = require(script.Vga)
-Vdm.Pic = require(script.Pic)
-Vdm.Pit = require(script.Pit)
-Vdm.Cmos = require(script.Cmos)
-Vdm.FwCfg = require(script.FwCfg)
-Vdm.Ide = require(script.Ide)
-Vdm.Kbc = require(script.Kbc)
-Vdm.Xms = require(script.Xms)
-Vdm.Uart = require(script.Uart)
-Vdm.Lpt = require(script.Lpt)
-Vdm.Machine = require(script.Machine)
+Rvpc.Memory = require(script.Memory)
+Rvpc.Cpu = require(script.Cpu)
+Rvpc.Vga = require(script.Vga)
+Rvpc.Pic = require(script.Pic)
+Rvpc.Pit = require(script.Pit)
+Rvpc.Cmos = require(script.Cmos)
+Rvpc.FwCfg = require(script.FwCfg)
+Rvpc.Ide = require(script.Ide)
+Rvpc.Kbc = require(script.Kbc)
+Rvpc.Xms = require(script.Xms)
+Rvpc.Uart = require(script.Uart)
+Rvpc.Lpt = require(script.Lpt)
+Rvpc.Machine = require(script.Machine)
 
-return Vdm
+return Rvpc

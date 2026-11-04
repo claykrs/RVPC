@@ -1,5 +1,5 @@
 --!nonstrict
--- Theme.lua -- single source of visual truth for Vdm UI surfaces.
+-- Theme.lua -- single source of visual truth for Rvpc UI surfaces.
 
 const Colors = table.freeze({
 	-- Host desktop (behind the emulator window).

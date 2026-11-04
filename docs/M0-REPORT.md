@@ -11,7 +11,7 @@ exact hash.
 
 ### Memory (`core/Memory.lua`)
 
-- Replaced the inherited 1 MiB/RVDM wrap-around model with configurable 32-bit
+- Replaced the inherited 1 MiB wrap-around model with configurable 32-bit
   physical RAM (16/32/64 MiB; tests use all three).
 - A20M now clears address bit 20 only, so `0x100000-0x1FFFFF` folds onto
   `0-0xFFFFF` while higher bits are untouched. This is 486 chipset behavior,

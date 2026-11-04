@@ -1,9 +1,9 @@
 --!nonstrict
--- build_rbxmx.lua -- generate Vdm.rbxmx (Roblox model XML) for manual import:
---   Vdm            (ModuleScript tree from core/)          -> ReplicatedStorage
---   VdmUi          (ModuleScript tree from roblox/ui/)     -> ReplicatedStorage
---   VdmFixtures    (Folder tree from fixtures/)            -> ReplicatedStorage
---   VdmClient      (Folder tree from roblox/client/)       -> StarterPlayerScripts
+-- build_rbxmx.lua -- generate Rvpc.rbxmx (Roblox model XML) for manual import:
+--   Rvpc            (ModuleScript tree from core/)          -> ReplicatedStorage
+--   RvpcUi          (ModuleScript tree from roblox/ui/)     -> ReplicatedStorage
+--   RvpcFixtures    (Folder tree from fixtures/)            -> ReplicatedStorage
+--   RvpcClient      (Folder tree from roblox/client/)       -> StarterPlayerScripts
 -- Run from the repo root: lune run tools/build_rbxmx.lua
 
 const fs = require("@lune/fs")
@@ -87,10 +87,10 @@ end
 
 local doc = '<?xml version="1.0" encoding="utf-8"?>\n'
 	.. '<roblox xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="4">\n'
-doc = doc .. tree("core", "Vdm", "  ", "init.lua", "ModuleScript")
-doc = doc .. tree("roblox/ui", "VdmUi", "  ", "init.lua", "ModuleScript")
-doc = doc .. tree("fixtures", "VdmFixtures", "  ", nil, "Folder")
-doc = doc .. tree("roblox/client", "VdmClient", "  ", nil, "Folder")
+doc = doc .. tree("core", "Rvpc", "  ", "init.lua", "ModuleScript")
+doc = doc .. tree("roblox/ui", "RvpcUi", "  ", "init.lua", "ModuleScript")
+doc = doc .. tree("fixtures", "RvpcFixtures", "  ", nil, "Folder")
+doc = doc .. tree("roblox/client", "RvpcClient", "  ", nil, "Folder")
 doc = doc .. "</roblox>\n"
-fs.writeFile("Vdm.rbxmx", doc)
-print(("wrote Vdm.rbxmx (%d bytes, %d items)"):format(#doc, referent))
+fs.writeFile("Rvpc.rbxmx", doc)
+print(("wrote Rvpc.rbxmx (%d bytes, %d items)"):format(#doc, referent))

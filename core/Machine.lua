@@ -1,5 +1,5 @@
 --!strict
--- Machine.lua -- 486/Pentium-class PC skeleton for RVDM98.
+-- Machine.lua -- 486/Pentium-class PC skeleton for RVPC.
 --
 -- Owns 32-bit physical memory, the CPU, VGA, the 8259/8254/CMOS chipset and
 -- optional serial/parallel ports. Host services are injected through deps; this

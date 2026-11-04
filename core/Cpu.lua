@@ -128,6 +128,13 @@ export type Cpu = {
 	traceEnabled: boolean,
 	trace: { string },
 	traceIndex: number,
+	lastIrq: { [string]: number }?,
+	lastIrqTrace: { string }?,
+	lastIret: { [string]: number }?,
+	lastFarCall: { [string]: number }?,
+	lastRetf: { [string]: number }?,
+	lastSwInt: { [string]: number }?,
+	badCsTrace: { string }?,
 	gdtr: { base: number, limit: number },
 	idtr: { base: number, limit: number },
 	ldtr: number,
@@ -330,6 +337,13 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.traceEnabled = false
 	self.trace = {}
 	self.traceIndex = 0
+	self.lastIrq = nil
+	self.lastIrqTrace = nil
+	self.lastIret = nil
+	self.lastFarCall = nil
+	self.lastRetf = nil
+	self.lastSwInt = nil
+	self.badCsTrace = nil
 	self.defaultInts = {}
 	self.stubSeg = nil
 	self.intStubs = {}
@@ -783,6 +797,16 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	offset = band(offset, 0xFFFFFFFF)
 	const nearWidth = if self.operand32 then 4 else 2
 	if not self:isProtected() or self:isV86() then
+		if self.traceEnabled and isCall then
+			self.lastFarCall = {
+				fromCs = self.cs,
+				fromIp = self.ip,
+				toCs = selector,
+				toIp = offset,
+				ss = self.ss,
+				sp = self:getSP(),
+			}
+		end
 		if isCall then
 			self:pushValue(self.cs, nearWidth)
 			self:pushValue(self.ip, nearWidth)
@@ -2225,8 +2249,29 @@ end
 
 local function retf(cpu: any, extra: number)
 	const width = if cpu.operand32 then 4 else 2
+	if cpu.traceEnabled then
+		const ssBase = cpu:baseOf("ss")
+		const sp = cpu:getSP()
+		cpu.lastRetf = {
+			fromCs = cpu.cs,
+			fromIp = band(cpu.ip - 1, cpu:ipMask()),
+			ss = cpu.ss,
+			sp = sp,
+			s0 = cpu.mem:read16(ssBase + band(sp, 0xFFFF)),
+			s1 = cpu.mem:read16(ssBase + band(sp + 2, 0xFFFF)),
+			s2 = cpu.mem:read16(ssBase + band(sp + 4, 0xFFFF)),
+			s3 = cpu.mem:read16(ssBase + band(sp + 6, 0xFFFF)),
+			s4 = cpu.mem:read16(ssBase + band(sp + 8, 0xFFFF)),
+			s5 = cpu.mem:read16(ssBase + band(sp + 10, 0xFFFF)),
+		}
+	end
 	const ip = cpu:popValue(width)
 	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
+	if cpu.lastRetf then
+		cpu.lastRetf.ip = ip
+		cpu.lastRetf.cs = csSel
+		cpu.lastRetf.afterSp = cpu:getSP()
+	end
 	local outerSp, outerSs
 	if cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
 		outerSp = cpu:popValue(width)
@@ -2267,6 +2312,21 @@ H[0xCF] = function(cpu: any) -- IRET / IRETD
 	const ip = if width == 4 then cpu:pop32() else cpu:pop16()
 	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	const newFlags = if width == 4 then cpu:pop32() else cpu:pop16()
+	if cpu.traceEnabled then
+		const ssBase = cpu:baseOf("ss")
+		const sp = cpu:getSP()
+		cpu.lastIret = {
+			ip = ip,
+			cs = csSel,
+			flags = newFlags,
+			ss = cpu.ss,
+			sp = sp,
+			s0 = cpu.mem:read16(ssBase + band(sp, 0xFFFF)),
+			s1 = cpu.mem:read16(ssBase + band(sp + 2, 0xFFFF)),
+			s2 = cpu.mem:read16(ssBase + band(sp + 4, 0xFFFF)),
+			s3 = cpu.mem:read16(ssBase + band(sp + 6, 0xFFFF)),
+		}
+	end
 	const wasEnabled = cpu:getF(IFF)
 	const targetV86 = band(newFlags, VM) ~= 0
 	local outerSp, outerSs
@@ -3767,6 +3827,25 @@ function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boole
 	local base = lshift(n, 2)
 	local lo = mem:read16(base)
 	local hi = mem:read16(base + 2)
+	if self.traceEnabled and software and n == 0x10 then
+		const ssBase = self:baseOf("ss")
+		const sp = self:getSP()
+		self.lastSwInt = {
+			cs = self.cs,
+			ip = self.ip,
+			flags = self.flags,
+			ss = self.ss,
+			sp = sp,
+			s0 = mem:read16(ssBase + band(sp, 0xFFFF)),
+			s1 = mem:read16(ssBase + band(sp + 2, 0xFFFF)),
+			s2 = mem:read16(ssBase + band(sp + 4, 0xFFFF)),
+			s3 = mem:read16(ssBase + band(sp + 6, 0xFFFF)),
+			s4 = mem:read16(ssBase + band(sp + 8, 0xFFFF)),
+			s5 = mem:read16(ssBase + band(sp + 10, 0xFFFF)),
+			s6 = mem:read16(ssBase + band(sp + 12, 0xFFFF)),
+			s7 = mem:read16(ssBase + band(sp + 14, 0xFFFF)),
+		}
+	end
 	const handler = self.defaultInts[n]
 	const stub = self.intStubs[n]
 	if handler and stub and lo == stub.off and hi == stub.seg then
@@ -3775,6 +3854,22 @@ function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boole
 	end
 	if lo ~= 0 or hi ~= 0 then
 		const returnIP = if software then self.ip else (self.faultIP or self.ip)
+		if self.traceEnabled and n == 8 then
+			const ssBase = self:baseOf("ss")
+			const sp = self:getSP()
+			self.lastIrqTrace = self:traceDump(512)
+			self.lastIrq = {
+				cs = self.cs,
+				ip = returnIP,
+				flags = self.flags,
+				ss = self.ss,
+				sp = sp,
+				s0 = self.mem:read16(ssBase + band(sp, 0xFFFF)),
+				s1 = self.mem:read16(ssBase + band(sp + 2, 0xFFFF)),
+				s2 = self.mem:read16(ssBase + band(sp + 4, 0xFFFF)),
+				s3 = self.mem:read16(ssBase + band(sp + 6, 0xFFFF)),
+			}
+		end
 		self:push16(self.flags)
 		self:push16(self.cs)
 		self:push16(returnIP)
@@ -3879,6 +3974,9 @@ function Cpu.step(self: Cpu): number
 	if self.traceEnabled then
 		self.traceIndex = (self.traceIndex % 4096) + 1
 		self.trace[self.traceIndex] = ("%04X:%08X"):format(self.cs, self.ip)
+		if self.badCsTrace == nil and self.cs == 0x0202 and self.ip == 0 then
+			self.badCsTrace = self:traceDump(40)
+		end
 	end
 	if not self:pagingEnabled() then
 		return (self :: any):executeStep()

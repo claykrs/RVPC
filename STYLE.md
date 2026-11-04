@@ -1,4 +1,4 @@
-# RVDM style guide
+# RVPC style guide
 
 This repository targets **Roblox Studio** first and **Lune** second. Every
 decision below is chosen so the same source runs in both without a build step
@@ -59,7 +59,7 @@ them); there is no `.luau`/`.lua` split.
   `machine.diagnostics` and forwards to an optional `deps.logger`.
 - Roblox code lives under `roblox/`. It defines UI and platform glue only.
 - Roblox loads modules through **service roots and index modules**:
-  `require(ReplicatedStorage:WaitForChild("Vdm"))`, `VdmUi`, `VdmFixtures`.
+  `require(ReplicatedStorage:WaitForChild("Rvpc"))`, `RvpcUi`, `RvpcFixtures`.
   String-path requires (`./`, `../`, `@self`) are not available in this Studio
   build, so deep `script.Parent.Parent.X` chains are not used either. Sibling
   requires inside one UI folder (`script.Parent.Theme`) are allowed.

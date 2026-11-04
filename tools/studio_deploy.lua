@@ -15,7 +15,7 @@
 const fs = require("@lune/fs")
 const process = require("@lune/process")
 
-const STUDIO_ID = process.env.VDM_STUDIO_ID or "45da683b-c6f3-410f-b964-e7c6e4444f26"
+const STUDIO_ID = process.env.RVPC_STUDIO_ID or "45da683b-c6f3-410f-b964-e7c6e4444f26"
 
 local chunk = process.args[1] or "reinit"
 local single = process.args[2]
@@ -120,17 +120,17 @@ type Tree = {
 }
 
 const TREES: { [string]: Tree } = {
-	core = { dir = "core", container = "Vdm", className = "ModuleScript", init = "init.lua" },
-	ui = { dir = "roblox/ui", container = "VdmUi", className = "ModuleScript", init = "init.lua" },
-	fixtures = { dir = "fixtures", container = "VdmFixtures", className = "Folder", init = nil },
-	client = { dir = "roblox/client", container = "VdmClient", className = "Folder", init = nil },
-	server = { dir = "roblox/server", container = "VdmServer", className = "Folder", init = nil },
+	core = { dir = "core", container = "Rvpc", className = "ModuleScript", init = "init.lua" },
+	ui = { dir = "roblox/ui", container = "RvpcUi", className = "ModuleScript", init = "init.lua" },
+	fixtures = { dir = "fixtures", container = "RvpcFixtures", className = "Folder", init = nil },
+	client = { dir = "roblox/client", container = "RvpcClient", className = "Folder", init = nil },
+	server = { dir = "roblox/server", container = "RvpcServer", className = "Folder", init = nil },
 }
 
 local function rootExpr(spec: Tree): string
-	if spec.container == "VdmClient" then
+	if spec.container == "RvpcClient" then
 		return "SPS"
-	elseif spec.container == "VdmServer" then
+	elseif spec.container == "RvpcServer" then
 		return "SSS"
 	end
 	return "RS"

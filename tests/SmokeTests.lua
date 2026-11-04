@@ -1,5 +1,5 @@
 --!nonstrict
--- SmokeTests.lua -- baseline RVDM98 CPU checks.
+-- SmokeTests.lua -- baseline RVPC CPU checks.
 
 local function code(m, bytes)
 	for index = 1, #bytes do

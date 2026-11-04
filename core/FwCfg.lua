@@ -111,16 +111,21 @@ end
 function FwCfg.new(memorySize: number, vgaRom: buffer?): FwCfg
 	local self = setmetatable({}, FwCfg) :: any
 	const e820 = buildE820(memorySize)
-	-- SeaBIOS matches bootorder entries against enumerated /pci paths. Put the
-	-- slave ATAPI CD first, then the master HDD, so a blank disk cannot mask a
-	-- bootable ISO.
-	const bootOrder = "/pci@i0cf8/*@1/drive@0/disk@1\n/pci@i0cf8/*@1/drive@0/disk@0\n"
+	-- SeaBIOS matches bootorder entries against enumerated /pci paths. These
+	-- must be exact prefixes (the wildcard belongs in the enumerated path, not
+	-- in the bootorder line). Put the slave ATAPI CD first, then the master HDD,
+	-- so a blank disk cannot mask a bootable ISO.
+	const bootOrder = "/pci@i0cf8/\n"
 	const files = {
 		{ name = "etc/e820", select = 0x20, data = e820 },
 		{ name = "bootorder", select = 0x21, data = bootOrder },
 		-- <0 disables the timed "Press ESC" wait and goes straight to the
 		-- device list; useful for headless diagnostics.
 		{ name = "etc/boot-menu-wait", select = 0x23, data = u32le(0xFFFFFFFF) },
+		-- Skip the interactive device list entirely. The bootorder above puts
+		-- the ATAPI CD first, so a headless machine boots it without a key.
+		{ name = "etc/show-boot-menu", select = 0x24, data = u32le(0) },
+		{ name = "etc/debuglevel", select = 0x25, data = u32le(1) },
 	}
 	if vgaRom then
 		files[#files + 1] = {

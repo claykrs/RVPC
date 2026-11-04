@@ -1,4 +1,4 @@
-# HANDOFF — RVDM98
+# HANDOFF - RVPC
 
 Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
@@ -6,7 +6,7 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
 - **Host:** Roblox/Luau client; core stays environment-pure.
-- **Codebase:** forked from RVDM as a reference, but the machine layer is being
+- **Codebase:** forked from the original Windows 3.0 emulator as a reference, but the machine layer is being
   rebuilt. Windows 3.x-specific DOS/VFS/NE hacks are not part of the target.
 - **Firmware:** real SeaBIOS (prebuilt ROM, staged locally; not committed).
 - **Install:** boot the 98 SE ISO, partition/format a virtual HDD, install,

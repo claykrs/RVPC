@@ -1,8 +1,8 @@
 --!nonstrict
--- init.lua -- the VdmUi tree as one ModuleScript.
--- Consumers: `const VdmUi = require(ReplicatedStorage:WaitForChild("VdmUi"))`.
+-- init.lua -- the RvpcUi tree as one ModuleScript.
+-- Consumers: `const RvpcUi = require(ReplicatedStorage:WaitForChild("RvpcUi"))`.
 
-const VdmUi = {
+const RvpcUi = {
 	Theme = require(script.Theme),
 	Cleaner = require(script.Cleaner),
 	State = require(script.State),
@@ -10,4 +10,4 @@ const VdmUi = {
 	Window = require(script.Window),
 }
 
-return VdmUi
+return RvpcUi

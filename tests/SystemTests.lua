@@ -243,7 +243,7 @@ T("vga_modes_12_13_and_text", function(expect)
 
 	expect(vga:setMode(0x03), "mode 3 rejected")
 	expect(vga:isTextMode(), "mode 3 not text")
-	vga:writeText(0, 0, "RVDM98", 0x0F)
+	vga:writeText(0, 0, "RVPC", 0x0F)
 	expect(m.mem:read8(0xB8000) == string.byte("R"), "text cell")
 end)
 

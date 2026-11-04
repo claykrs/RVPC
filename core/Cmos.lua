@@ -49,6 +49,12 @@ function Cmos.new(config: Config?): Cmos
 	self.lastReadValue = 0
 	self.readCount = 0
 	self.trace = {}
+	-- SeaBIOS reads the QEMU boot-order words from CMOS 0x38/0x3D before it
+	-- looks at fw_cfg bootorder. Nibbles low-to-high are boot priority 101..:
+	-- 3 = CD, 2 = HD, 1 = floppy. This puts the ATAPI CD first and stops the
+	-- always-present floppy fallback from winning the first attempt.
+	self.ram[0x38] = 0x10
+	self.ram[0x3D] = 0x23
 	return self
 end
 

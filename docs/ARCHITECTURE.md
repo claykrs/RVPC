@@ -1,4 +1,4 @@
-# RVDM98 architecture
+# RVPC architecture
 
 ## Machine
 
@@ -30,8 +30,8 @@ are open bus (reads `0xFF`, writes dropped).
 - No FPU in the first pass; add x87 after Win98 boot (98 works without it for
   most setup/desktop paths, but some apps need it).
 
-The RVDM `Cpu.lua` already has 286 protected mode, descriptor caches, call
-gates, IDT and 386 instruction subsets. RVDM98 keeps that as a reference but
+The inherited `Cpu.lua` already has 286 protected mode, descriptor caches, call
+gates, IDT and 386 instruction subsets. RVPC keeps that as a reference but
 rewrites address translation and adds paging/V86.
 
 ## Firmware
