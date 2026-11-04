@@ -30,6 +30,8 @@ export type Kbc = typeof(setmetatable(
 		mouseEnabled: boolean,
 		irq1: boolean,
 		irq12: boolean,
+		irq1Armed: boolean,
+		irq12Armed: boolean,
 		lastStatus: number,
 		trace: { string },
 		in8: (self: Kbc, port: number) -> number,
@@ -54,6 +56,8 @@ function Kbc.new(): Kbc
 	self.mouseEnabled = true
 	self.irq1 = false
 	self.irq12 = false
+	self.irq1Armed = false
+	self.irq12Armed = false
 	self.lastStatus = 0
 	self.trace = {}
 	return self
@@ -68,6 +72,8 @@ function Kbc.reset(self: Kbc)
 	self.mouseEnabled = true
 	self.irq1 = false
 	self.irq12 = false
+	self.irq1Armed = false
+	self.irq12Armed = false
 	self.lastStatus = 0
 end
 
@@ -91,10 +97,12 @@ local function queueByte(self: Kbc, value: number, aux: boolean)
 	if aux then
 		if band(self.config, 0x02) ~= 0 then
 			self.irq12 = true
+			self.irq12Armed = true
 		end
 	else
 		if band(self.config, 0x01) ~= 0 then
 			self.irq1 = true
+			self.irq1Armed = true
 		end
 	end
 end
@@ -138,26 +146,30 @@ function Kbc.mouseMove(self: Kbc, dx: number, dy: number, buttons: number?)
 end
 
 function Kbc.takeIrq1(self: Kbc): boolean
-	if band(self.config, 0x01) == 0 then
+	if band(self.config, 0x01) == 0 or not self.irq1Armed then
 		return false
 	end
 	for _, entry in self.queue do
 		if not entry.aux then
+			self.irq1Armed = false
 			return true
 		end
 	end
+	self.irq1Armed = false
 	return false
 end
 
 function Kbc.takeIrq12(self: Kbc): boolean
-	if band(self.config, 0x02) == 0 then
+	if band(self.config, 0x02) == 0 or not self.irq12Armed then
 		return false
 	end
 	for _, entry in self.queue do
 		if entry.aux then
+			self.irq12Armed = false
 			return true
 		end
 	end
+	self.irq12Armed = false
 	return false
 end
 
@@ -170,6 +182,16 @@ function Kbc.in8(self: Kbc, port: number): number
 	if port == 0x60 then
 		const entry = table.remove(self.queue, 1)
 		if entry then
+			if not entry.aux then
+				-- One keyboard byte per IRQ1. If more make/break bytes are
+				-- queued, arm the next edge now so it is delivered after EOI.
+				for _, queued in self.queue do
+					if not queued.aux then
+						self.irq1Armed = true
+						break
+					end
+				end
+			end
 			return entry.value
 		end
 		return 0xFF
