@@ -9,6 +9,7 @@ const RvpcUi = {
 	Components = require(script.Components),
 	Window = require(script.Window),
 	VgaView = require(script.VgaView),
+	Input = require(script.Input),
 }
 
 return RvpcUi

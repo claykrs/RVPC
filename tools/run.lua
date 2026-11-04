@@ -30,6 +30,7 @@ local lptTests = require("../tests/LptTests")
 local ne2000Tests = require("../tests/Ne2000Tests")
 local ispTests = require("../tests/IspTests")
 local vgaSinkTests = require("../tests/VgaSinkTests")
+local inputMapTests = require("../tests/InputMapTests")
 
 const deps = {
 	Memory = Memory,
@@ -101,6 +102,7 @@ runDirectSuite("lpt", lptTests)
 runDirectSuite("ne2000", ne2000Tests)
 runDirectSuite("isp", ispTests)
 runDirectSuite("vga", vgaSinkTests)
+runDirectSuite("inputmap", inputMapTests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then

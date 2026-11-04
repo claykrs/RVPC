@@ -10,6 +10,15 @@
 			"RvpcUi": {
 				"$path": "roblox/ui"
 			}
+		},
+		"StarterPlayer": {
+			"$className": "StarterPlayer",
+			"StarterPlayerScripts": {
+				"$className": "StarterPlayerScripts",
+				"RvpcClient": {
+					"$path": "roblox/client"
+				}
+			}
 		}
 	}
 }
