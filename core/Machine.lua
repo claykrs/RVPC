@@ -100,9 +100,19 @@ export type Machine = typeof(setmetatable(
 		config: Config,
 		pciAddress: number,
 		vgaBar: number,
+		vgaCommand: number,
+		vgaLatency: number,
+		vgaRomBar: number,
+		vgaRomBarProbe: boolean,
+		vgaInterruptLine: number,
 		ideBars: { number },
 		ideBarProbe: { boolean },
 		ideCommand: number,
+		ideLatency: number,
+		isaConfig: { [number]: number },
+		isaCommand: number,
+		elcrMaster: number,
+		elcrSlave: number,
 		sb16Clock: number,
 		lastInPort: number,
 		lastOutPort: number,
@@ -146,11 +156,19 @@ end
 -- Bochs/QEMU stdvga-compatible PCI VGA device at 00:02.0. The VGA BIOS option
 -- ROM at C0000 is what installs INT 10h; the legacy VGA register model lives in
 -- core/Vga.lua. BAR0 is intentionally absent (no linear framebuffer yet).
+local function configDword(config: { [number]: number }, offset: number): number
+	local value = 0
+	for index = 0, 3 do
+		value = bor(value, lshift(band(config[offset + index] or 0, 0xFF), index * 8))
+	end
+	return value
+end
+
 local function vgaDword(machine: any, offset: number): number
 	if offset == 0x00 then
 		return 0x11111234 -- Bochs VGA, vendor 1234 device 1111
 	elseif offset == 0x04 then
-		return 0x00000007 -- I/O + memory + bus master enabled
+		return bor(band(machine.vgaCommand or 7, 0xFFFF), 0x02000000)
 	elseif offset == 0x08 then
 		return 0x03000001 -- VGA controller, revision 1
 	elseif offset == 0x0C then
@@ -160,9 +178,16 @@ local function vgaDword(machine: any, offset: number): number
 	elseif offset == 0x2C then
 		return 0x11001AF4
 	elseif offset == 0x30 then
-		return 0x00000000 -- ROM is scanned from the C0000 shadow window
+		if machine.vgaRomBarProbe then
+			return 0xFFFFF800
+		end
+		return machine.vgaRomBar or 0
 	elseif offset == 0x3C then
-		return 0x00000B00 -- IRQ 11
+		-- Route VGA through the slot's INTC link (PIRQD on this PIIX3 table)
+		-- so the $PIR link and the VGA interrupt line both resolve to IRQ 11.
+		return bor(band(machine.vgaInterruptLine or 11, 0xFF), 0x0300)
+	elseif offset == 0x40 then
+		return band(machine.vgaLatency or 0, 0xFF)
 	end
 	return 0
 end
@@ -174,11 +199,11 @@ end
 const IDE_BAR_DEFAULTS = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
 const IDE_BAR_SIZES = { 8, 2, 8, 2, 16 }
 
-local function isaBridgeDword(offset: number): number
+local function isaBridgeDword(machine: any, offset: number): number
 	if offset == 0x00 then
 		return 0x70008086 -- Intel PIIX3 ISA bridge
 	elseif offset == 0x04 then
-		return 0x00000007 -- I/O + memory + bus master decode
+		return bor(band(machine.isaCommand or 0x0007, 0xFFFF), 0x02000000)
 	elseif offset == 0x08 then
 		return 0x06010000 -- ISA bridge, revision 0
 	elseif offset == 0x0C then
@@ -186,7 +211,7 @@ local function isaBridgeDword(offset: number): number
 	elseif offset == 0x2C then
 		return 0x11001AF4 -- Red Hat/QEMU subsystem
 	end
-	return 0
+	return configDword(machine.isaConfig or {}, offset)
 end
 
 local function ideBarMask(index: number): number
@@ -218,6 +243,8 @@ local function ideDword(machine: any, offset: number): number
 		return 0x11001AF4
 	elseif offset == 0x3C then
 		return 0x0000010E -- interrupt line 14, INTA#
+	elseif offset == 0x40 then
+		return band(machine.ideLatency or 0, 0xFF)
 	end
 	return 0
 end
@@ -234,7 +261,7 @@ local function pciRead(machine: any, address: number): number
 		if device == 0 and functionNumber == 0 then
 			return hostBridgeDword(machine, offset)
 		elseif device == 1 and functionNumber == 0 then
-			return isaBridgeDword(offset)
+			return isaBridgeDword(machine, offset)
 		elseif device == 1 and functionNumber == 1 then
 			return ideDword(machine, offset)
 		elseif device == 2 and functionNumber == 0 then
@@ -252,12 +279,39 @@ local function pciWrite(machine: any, address: number, value: number)
 	const device = band(rshift(address, 11), 0x1F)
 	const functionNumber = band(rshift(address, 8), 0x07)
 	const offset = band(address, 0xFC)
-	if bus == 0 and device == 2 and functionNumber == 0 and offset == 0x10 then
-		-- VGA LFB BAR0: 4 MiB memory BAR at 0xE0000000.
-		if value == 0xFFFFFFFF then
-			machine.vgaBar = 0xFFC00000
-		else
-			machine.vgaBar = band(value, 0xFFC00000)
+	if bus == 0 and device == 2 and functionNumber == 0 then
+		if offset == 0x04 then
+			machine.vgaCommand = band(value, 0xFFFF)
+		elseif offset == 0x10 then
+			-- VGA LFB BAR0: 4 MiB memory BAR at 0xE0000000.
+			if value == 0xFFFFFFFF then
+				machine.vgaBar = 0xFFC00000
+			else
+				machine.vgaBar = band(value, 0xFFC00000)
+			end
+		elseif offset == 0x30 then
+			if value == 0xFFFFFFFF then
+				machine.vgaRomBarProbe = true
+			else
+				machine.vgaRomBarProbe = false
+				machine.vgaRomBar = bor(band(value, 0xFFFFF800), band(value, 1))
+			end
+		elseif offset == 0x3C then
+			machine.vgaInterruptLine = band(value, 0xFF)
+		elseif offset == 0x40 then
+			machine.vgaLatency = band(value, 0xFF)
+		end
+		return
+	end
+	if bus == 0 and device == 1 and functionNumber == 0 then
+		if offset == 0x04 then
+			machine.isaCommand = band(value, 0xFFFF)
+		elseif offset == 0x3C then
+			machine.isaConfig[0x3C] = band(value, 0xFF)
+		elseif offset >= 0x40 then
+			for index = 0, 3 do
+				machine.isaConfig[offset + index] = band(rshift(value, index * 8), 0xFF)
+			end
 		end
 		return
 	end
@@ -285,6 +339,9 @@ local function pciWrite(machine: any, address: number, value: number)
 				end
 			end
 			return
+		end
+		if offset == 0x40 then
+			machine.ideLatency = band(value, 0xFF)
 		end
 		return
 	end
@@ -418,6 +475,27 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.ideBars = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
 	self.ideBarProbe = { false, false, false, false, false }
 	self.ideCommand = 0x00000007
+	self.ideLatency = 0
+	self.vgaCommand = 0x00000007
+	self.vgaLatency = 0
+	self.vgaRomBar = 0x000C0001 -- 32 KiB option ROM in the C0000 shadow window
+	self.vgaRomBarProbe = false
+	self.vgaInterruptLine = 11
+	self.isaCommand = 0x00000007
+	self.isaConfig = {}
+	for index = 0, 0xFF do
+		self.isaConfig[index] = 0
+	end
+	-- PIIX3 reset defaults: PIRQ[A-D] disabled until the firmware routes them.
+	for index = 0x60, 0x63 do
+		self.isaConfig[index] = 0x80
+	end
+	self.isaConfig[0x4E] = 0x03
+	self.isaConfig[0x4F] = 0x00
+	self.isaConfig[0x69] = 0x02
+	self.isaConfig[0x70] = 0x80
+	self.elcrMaster = 0
+	self.elcrSlave = 0
 	self.sb16Clock = 0
 	self.hostConfig = {}
 	self.lastInPort = 0
@@ -490,6 +568,11 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.vga and port >= 0x3C0 and port <= 0x3DF then
 				return self.vga:in8(port)
 			end
+			if port == 0x4D0 then
+				return self.elcrMaster
+			elseif port == 0x4D1 then
+				return self.elcrSlave
+			end
 			if
 				self.pic
 				and (
@@ -549,8 +632,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if port == PCI_ADDRESS then
 				return band(self.pciAddress, 0xFFFF)
-			elseif port == PCI_DATA then
-				return band(pciRead(self, self.pciAddress), 0xFFFF)
+			elseif port >= PCI_DATA and port <= PCI_DATA + 2 then
+				const lane = port - PCI_DATA
+				return band(
+					rshift(pciRead(self, band(self.pciAddress, 0xFFFFFFFC)), lane * 8),
+					0xFFFF
+				)
 			end
 			return bor(io.in8(port), lshift(io.in8(band(port + 1, 0xFFFF)), 8))
 		end,
@@ -653,6 +740,13 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.vga:out8(port, value)
 				return
 			end
+			if port == 0x4D0 then
+				self.elcrMaster = band(value, 0xFF)
+				return
+			elseif port == 0x4D1 then
+				self.elcrSlave = band(value, 0xFF)
+				return
+			end
 			if
 				self.pic
 				and (
@@ -684,8 +778,13 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return
 			end
 			if port >= PCI_DATA and port <= PCI_DATA + 3 then
-				-- Byte writes to config space are not used by SeaBIOS; DWORD
-				-- writes are handled by out32.
+				const lane = port - PCI_DATA
+				const address = band(self.pciAddress, 0xFFFFFFFC)
+				const old = pciRead(self, address)
+				const shift = lane * 8
+				const mask = lshift(0xFF, shift)
+				const updated = bor(band(old, bit32.bnot(mask)), lshift(band(value, 0xFF), shift))
+				pciWrite(self, address, updated)
 				return
 			end
 			if self.uart and port >= 0x3F8 and port <= 0x3FF then
@@ -729,7 +828,17 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if port == PCI_ADDRESS then
 				self.pciAddress = bor(band(self.pciAddress, 0xFFFF0000), band(value, 0xFFFF))
 				return
-			elseif port == PCI_DATA then
+			elseif port >= PCI_DATA and port <= PCI_DATA + 2 then
+				const lane = port - PCI_DATA
+				const address = band(self.pciAddress, 0xFFFFFFFC)
+				const old = pciRead(self, address)
+				const shift = lane * 8
+				const mask = lshift(0xFFFF, shift)
+				pciWrite(
+					self,
+					address,
+					bor(band(old, bit32.bnot(mask)), lshift(band(value, 0xFFFF), shift))
+				)
 				return
 			end
 			io.out8(port, band(value, 0xFF))
