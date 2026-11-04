@@ -25,10 +25,11 @@ const Machine = require("../core/Machine")
 
 const BIOS_PATH = "roms/bios-256k.bin"
 const VGA_ROM_PATH = "roms/vgabios-stdvga.bin"
-const CDROM_PATH = if fs.isFile("media/freedos-boot.iso")
-	then "media/freedos-boot.iso"
+const CDROM_PATH = if fs.isFile("media/win98se.iso")
+	then "media/win98se.iso"
+	elseif fs.isFile("media/freedos-boot.iso") then "media/freedos-boot.iso"
 	else "media/FD13LIVE.iso"
-const HDD_PATH = "media/hdd.img"
+const HDD_PATH = if fs.isFile("media/win98-hdd.img") then "media/win98-hdd.img" else "media/hdd.img"
 
 if not fs.isFile(BIOS_PATH) then
 	print("missing " .. BIOS_PATH)
