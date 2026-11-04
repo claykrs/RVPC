@@ -70,9 +70,9 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
   are correct. CPU, 386 frame and XMS suites are in the gate again.
 - **Tests:** `lune run tools/check.lua` passes with 333 assertions.
-- **M1 working tree (in progress):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
-  (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
-  FreeDOS ISO. SeaBIOS reaches its boot menu and starts the CD entry.
+- **M1 bring-up (commit `4fbd3bc`, in progress):** `Ide.lua` (ATA/ATAPI PIO),
+  `Kbc.lua` (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD
+  plus a FreeDOS ISO. SeaBIOS reaches its boot menu and starts the CD entry.
 
 ### Next blockers
 

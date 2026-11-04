@@ -177,6 +177,6 @@ M0:
 - The legacy 8086 CPU suite, XMS suite and a new `tests/Cpu386Tests.lua` are
   back in `tools/check.lua`: 333 assertions.
 
-M1 work (IDE/ATAPI, 8042/PS2, PAM locking) is in the working tree at the time
-of writing; see `HANDOFF.md` for its exact boot state and blockers.
+M1 bring-up (IDE/ATAPI, 8042/PS2, PAM locking) is commit `4fbd3bc` and is
+still in progress; see `HANDOFF.md` for its exact boot state and blockers.
 

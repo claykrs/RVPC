@@ -1,7 +1,7 @@
 --!nonstrict
 -- IdeTests.lua -- ATA PIO, MBR parsing and ATAPI PACKET/READ(10).
 
-const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
+const band, bor, lshift = bit32.band, bit32.bor, bit32.lshift
 const Ide = require("../core/Ide")
 
 const TESTS = {}
