@@ -27,14 +27,33 @@ Windows 98 SE media is **not** committed. The release page will provide a
 ready-to-run demo image and the emulator model; the source repo stays free of
 Microsoft binaries.
 
+Firmware is staged locally under `roms/` (gitignored):
+
+```powershell
+New-Item -ItemType Directory -Force roms
+Invoke-WebRequest `
+  https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/bios-256k.bin `
+  -OutFile roms/bios-256k.bin
+Invoke-WebRequest `
+  https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/vgabios-stdvga.bin `
+  -OutFile roms/vgabios-stdvga.bin
+```
+
+The SeaBIOS image is the 256 KiB QEMU build (`rel-1.17.0` in the current
+bring-up); `vgabios-stdvga.bin` supplies the INT 10h text console. Both are
+firmware blobs, not Microsoft media.
+
 ```powershell
 lune run tools/check.lua
 lune run tools/harness.lua
+lune run tools/harness.lua 40   # step budget in millions
 ```
 
 ## Status
 
-Early bring-up. See `HANDOFF.md`, `docs/ARCHITECTURE.md` and
+M0 is green: the machine boots real SeaBIOS, initializes PIC/PIT/CMOS/A20/PCI/
+fw_cfg, runs SeaVGABIOS in text mode 3, and reaches the no-bootable-device
+screen. See `docs/M0-REPORT.md`, `HANDOFF.md`, `docs/ARCHITECTURE.md` and
 `docs/WIN98.md`.
 
 ## License

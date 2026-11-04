@@ -14,8 +14,13 @@ Devices: VGA, IDE, ATAPI CD, PS/2, UART, LPT, SB16, NE2000
 ```
 
 Physical memory is a flat byte buffer up to the configured size. The first
-1 MiB follows the PC map; A0000–BFFFF is the VGA aperture; F0000–FFFFF is the
-BIOS ROM alias.
+1 MiB follows the PC map; A0000–AFFFF routes to the VGA aperture; B8000–BFFFF
+is colour text RAM; C0000–DFFFF is option-ROM shadow RAM; E0000–EFFFF is BIOS
+extension RAM; F0000–FFFFF is a writable shadow of the BIOS image's last 64 KiB.
+The full 256 KiB SeaBIOS image is also mapped read-only at `0xFFFC0000`
+(`0x100000000 - 256 KiB`), which is where 32-bit firmware and the reset vector
+can fetch it. A20M only forces bit 20 low; addresses above the configured RAM
+are open bus (reads `0xFF`, writes dropped).
 
 ## CPU
 
@@ -31,9 +36,12 @@ rewrites address translation and adds paging/V86.
 
 ## Firmware
 
-SeaBIOS. Prefer a real 256 KiB ROM image, mapped at 0xE0000 (alias F0000) and
-high memory as required. Do not write an HLE BIOS for the Win98 target; the
-installer depends on real INT 13h/INT 15h/PCI/ACPI behavior.
+SeaBIOS. A real 256 KiB QEMU/SeaBIOS image is mapped read-only at `0xFFFC0000`
+and shadowed at `F0000-FFFFF`; the low reset vector is at `F000:FFF0`. The
+`SeaVGABIOS` stdvga ROM is supplied through fw_cfg as
+`vgaroms/vgabios-stdvga.bin` and installs the real INT 10h console. Do not write
+an HLE BIOS for the Win98 target; the installer depends on real INT 13h/INT 15h/
+PCI/ACPI behavior.
 
 ## Storage
 
@@ -71,9 +79,10 @@ installer depends on real INT 13h/INT 15h/PCI/ACPI behavior.
 
 `Machine.new(deps, config)` receives:
 
-- `Memory`, `Cpu`, `Vga`, `Pic`, `Pit`, `Cmos`, `Ide`, `Ne2000`, `Uart`, `Lpt`
+- `Memory`, `Cpu`, `Vga`, `Pic`, `Pit`, `Cmos`, `FwCfg`, `Ide`, `Ne2000`,
+  `Uart`, `Lpt`
 - `config.serial`, `config.printer`, `config.disk`, `config.network`,
-  `config.audio`, `config.logger`
+  `config.audio`, `config.logger`, `config.rom`, `config.vgaRom`
 
 Core never requires Roblox or Lune. The same machine runs under the Lune
 harness and the Roblox client.

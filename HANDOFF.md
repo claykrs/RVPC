@@ -50,13 +50,36 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current state
 
-- RVDM HEAD was forked into this repo as reference.
-- Core kept: `Cpu`, `Memory`, `Vga`, `Uart`, `Lpt`, `Xms`, `init`.
-- Removed: Windows 3.x BIOS/DOS/VFS/NE loader, fixtures, SETUP.INF tools.
-- `Cpu.lua` already has 286 PM/descriptor caches from R7; it still needs
-  32-bit addressing/paging/V86 for 98.
-- `Memory.lua` is still the RVDM 1 MiB model; replace with 32-bit physical
-  memory before boot tests.
+M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
+
+- **Memory:** 32-bit physical RAM (16/32/64 MiB configurable), A20M masks bit
+  20 only, VGA/option-ROM windows, open-bus reads, and a 256 KiB SeaBIOS high
+  mapping at `0xFFFC0000` with a writable `F0000-FFFFF` shadow.
+- **CPU:** 386/486 real/PM core: 32-bit operands and addressing (SIB), full
+  EIP, CR0/CR3, two-level paging with #PF error codes, V86 entry via IRETD,
+  32-bit interrupt/trap frames, 32-bit CALL/RET/PUSH/POP/string/MUL/DIV,
+  CPUID, BSWAP, SHLD/SHRD, BT/BTS/BTR/BTC, XADD, INVD/WBINVD.
+- **Chipset:** `Pic` (8259 master/slave), `Pit` (8254), `Cmos` (RTC/shutdown/
+  memory words), port `0x92` A20/reset, PCI config `0xCF8/0xCFC` with an
+  i440FX host bridge and Bochs-compatible VGA function, and QEMU fw_cfg
+  (`0x510/0x511`) providing e820/bootorder/vgarom files.
+- **Firmware:** real SeaBIOS `rel-1.17.0` + SeaVGABIOS `rel-1.17.0` staged in
+  `roms/` (gitignored). `tools/harness.lua` loads both.
+- **Measured boot:** `F000:B757`, 6M steps, 8 IRQs, 0 page faults. VGA text:
+  SeaBIOS banner, two failed hard-disk attempts, then
+  `No bootable device.  Retrying in 60 seconds.` — expected with no IDE yet.
+- **Tests:** `lune run tools/check.lua` passes; 64 assertions cover memory/A20,
+  paging translation/fault, V86, PIC/PIT/CMOS and existing smoke tests.
+
+### Next blockers
+
+1. IDE/ATAPI PIO: identify/read, MBR/partition parsing; let SeaBIOS boot an
+   empty HDD or the Win98 SE CD. This is the immediate M0→M1 step.
+2. 8042 keyboard/PS2 mouse + IRQ1/IRQ12: boot menu and install-time input.
+3. VGA modes 12h/13h and the EditableImage sink; text mode 3 currently works
+   through SeaVGABIOS, but no mode 12h/13h pipeline exists yet.
+4. Then 386 PM stress (TSS/task gates, exception precision), x87, and the
+   Win98 installer path.
 
 ## Hard rules
 

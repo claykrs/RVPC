@@ -4,16 +4,26 @@
 local Memory = require("../core/Memory")
 local Cpu = require("../core/Cpu")
 local Vga = require("../core/Vga")
+local Pic = require("../core/Pic")
+local Pit = require("../core/Pit")
+local Cmos = require("../core/Cmos")
+local FwCfg = require("../core/FwCfg")
 local Xms = require("../core/Xms")
 local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
 local Machine = require("../core/Machine")
 local smokeTests = require("../tests/SmokeTests")
+local memoryTests = require("../tests/MemoryTests")
+local systemTests = require("../tests/SystemTests")
 
 const deps = {
 	Memory = Memory,
 	Cpu = Cpu,
 	Vga = Vga,
+	Pic = Pic,
+	Pit = Pit,
+	Cmos = Cmos,
+	FwCfg = FwCfg,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -45,7 +55,22 @@ local function runSuite(prefix, tests, config)
 	end
 end
 
+local function runDirectSuite(prefix, tests)
+	for _, test in ipairs(tests) do
+		const name = prefix .. " -- " .. test.name
+		const e = expect(name)
+		local ok, err = pcall(function()
+			test.run(e)
+		end)
+		if not ok then
+			failures[#failures + 1] = name .. " THREW: " .. tostring(err)
+		end
+	end
+end
+
 runSuite("smoke", smokeTests)
+runDirectSuite("memory", memoryTests)
+runDirectSuite("system", systemTests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then

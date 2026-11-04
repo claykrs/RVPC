@@ -1,16 +1,31 @@
 --!strict
--- Cpu.lua -- complete 8086 real-mode core (bit32 only, no native bitwise ops).
+-- Cpu.lua -- 8086/286/386/486 integer core (bit32 only, no native bitwise ops).
 -- r[1..8] = AX CX DX BX SP BP SI DI; SP is r[5]; 8-bit reg i<4 low / i>=4 high.
+-- rHi[1..8] holds bits 16-31 on the 386/486 path. EIP is kept in `ip` as a full
+-- 32-bit value; 16-bit code masks it to 64 KiB on every fetch.
 
 const band, bor, bxor, bnot, lshift, rshift =
 	bit32.band, bit32.bor, bit32.bxor, bit32.bnot, bit32.lshift, bit32.rshift
 
 const CF, PF, AF, ZF, SF, TF, IFF, DFF, OFLG = 1, 4, 16, 64, 128, 256, 512, 1024, 2048
+const RF = 0x10000
+const VM = 0x20000
+const AC = 0x40000
 const ALWAYS = 2
 const FLAGMASK = 4053 -- CF|PF|AF|ZF|SF|TF|IF|DF|OF (0xFD5)
-const FLAGMASK_386 = bor(FLAGMASK, 0x7000) -- 386: IOPL/NT writable in real mode
+const FLAGMASK_386 = bor(FLAGMASK, 0x7000, RF, VM, AC) -- 386: IOPL/NT/RF/VM/AC
 const FIXEDFLAGS = bor(0xF000, ALWAYS) -- bits 15-12 plus bit 1 read as 1 on 8086
 const FIXEDFLAGS_286 = ALWAYS -- 286 real mode: bits 12-15 read as 0
+
+const CR0_PE = 0x00000001
+const CR0_TS = 0x00000008
+const CR0_WP = 0x00010000
+const CR0_PG = 0x80000000
+
+-- Unique sentinel used to unwind a faulting instruction after #PF delivery.
+-- Cpu.step only catches it when paging is enabled; every other error still
+-- propagates to the host as an unimplemented-hardware diagnostic.
+const ABORT_INSTRUCTION = { kind = "cpu-abort" }
 
 const CPU_8086 = 0
 const CPU_286 = 1
@@ -25,7 +40,7 @@ local function cpuLevelValue(value: any): number
 		end
 		return CPU_8086
 	end
-	if value == "386" then
+	if value == "386" or value == "486" or value == "586" or value == "pentium" then
 		return CPU_386
 	elseif value == "286" then
 		return CPU_286
@@ -56,6 +71,10 @@ export type Descriptor = {
 export type Io = {
 	in8: (port: number) -> number,
 	out8: (port: number, value: number) -> (),
+	in16: ((port: number) -> number)?,
+	out16: ((port: number, value: number) -> ())?,
+	in32: ((port: number) -> number)?,
+	out32: ((port: number, value: number) -> ())?,
 }
 
 export type InterruptHandler = (n: number) -> ()
@@ -85,8 +104,20 @@ export type Cpu = {
 	ip: number,
 	flags: number,
 	cr0: number,
+	cr3: number,
 	cr: { number },
 	dr: { number },
+	baseOperand32: boolean,
+	baseAddress32: boolean,
+	pageFaults: number,
+	lastPageFault: { addr: number, errorCode: number, write: boolean, user: boolean }?,
+	inPageFault: boolean,
+	aborting: boolean,
+	tsc: number,
+	lastIoStringDest: number,
+	lastIoStringCount: number,
+	lastIoStringPort: number,
+	intCounts: { [number]: number },
 	gdtr: { base: number, limit: number },
 	idtr: { base: number, limit: number },
 	ldtr: number,
@@ -95,6 +126,7 @@ export type Cpu = {
 	tr: number,
 	trBase: number,
 	trLimit: number,
+	tr32: boolean,
 	operand32: boolean,
 	address32: boolean,
 	halted: boolean,
@@ -118,6 +150,35 @@ export type Cpu = {
 	wr32: (self: Cpu, i: number, v: number) -> (),
 	ensureSeg: (self: Cpu, reg: string) -> (),
 	setPE: (self: Cpu, on: boolean) -> (),
+	isProtected: (self: Cpu) -> boolean,
+	isV86: (self: Cpu) -> boolean,
+	cpl: (self: Cpu) -> number,
+	code32: (self: Cpu) -> boolean,
+	stack32: (self: Cpu) -> boolean,
+	ipMask: (self: Cpu) -> number,
+	pagingEnabled: (self: Cpu) -> boolean,
+	translatePage: (
+		self: Cpu,
+		addr: number,
+		write: boolean,
+		user: boolean,
+		fetch: boolean?
+	) -> number,
+	pageFault: (
+		self: Cpu,
+		addr: number,
+		write: boolean,
+		user: boolean,
+		reserved: boolean,
+		fetch: boolean,
+		present: boolean?
+	) -> (),
+	read8: (self: Cpu, addr: number, supervisor: boolean?) -> number,
+	read16: (self: Cpu, addr: number, supervisor: boolean?) -> number,
+	read32: (self: Cpu, addr: number, supervisor: boolean?) -> number,
+	write8: (self: Cpu, addr: number, value: number, supervisor: boolean?) -> (),
+	write16: (self: Cpu, addr: number, value: number, supervisor: boolean?) -> (),
+	write32: (self: Cpu, addr: number, value: number, supervisor: boolean?) -> (),
 	reset: (self: Cpu) -> (),
 	tripleFault: (self: Cpu) -> (),
 	loadSeg: (self: Cpu, reg: string, selector: number) -> (),
@@ -126,20 +187,32 @@ export type Cpu = {
 	linear: (self: Cpu, reg: string, off: number, size: number) -> number,
 	fetch8: (self: Cpu) -> number,
 	fetch16: (self: Cpu) -> number,
+	fetch32: (self: Cpu) -> number,
+	getSP: (self: Cpu) -> number,
+	setSP: (self: Cpu, value: number) -> (),
+	pushValue: (self: Cpu, v: number, width: number) -> (),
+	popValue: (self: Cpu, width: number) -> number,
 	push16: (self: Cpu, v: number) -> (),
 	pop16: (self: Cpu) -> number,
 	push32: (self: Cpu, v: number) -> (),
 	pop32: (self: Cpu) -> number,
 	setbits: (self: Cpu, mask: number, on: boolean) -> (),
 	getF: (self: Cpu, mask: number) -> boolean,
-	setSZP: (self: Cpu, res: number, w: boolean) -> (),
+	setSZP: (self: Cpu, res: number, w: any) -> (),
 	modrm: (self: Cpu) -> ModRM,
 	readRM8: (self: Cpu, e: ModRM) -> number,
 	writeRM8: (self: Cpu, e: ModRM, v: number) -> (),
 	readRM16: (self: Cpu, e: ModRM) -> number,
 	writeRM16: (self: Cpu, e: ModRM, v: number) -> (),
+	readRM32: (self: Cpu, e: ModRM) -> number,
+	writeRM32: (self: Cpu, e: ModRM, v: number) -> (),
+	readRM: (self: Cpu, e: ModRM) -> number,
+	writeRM: (self: Cpu, e: ModRM, v: number) -> (),
+	rrw: (self: Cpu, i: number) -> number,
+	wrw: (self: Cpu, i: number, v: number) -> (),
 	interrupt: (self: Cpu, n: number, errorCode: number?, software: boolean?) -> (),
 	pmInterrupt: (self: Cpu, n: number, errorCode: number?, software: boolean?) -> (),
+	executeStep: (self: Cpu) -> number,
 	step: (self: Cpu) -> number,
 	dump: (self: Cpu) -> { [string]: number },
 }
@@ -218,13 +291,26 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.tr = 0
 	self.trBase = 0
 	self.trLimit = 0
+	self.tr32 = false
 	self.operand32 = false
 	self.address32 = false
+	self.baseOperand32 = false
+	self.baseAddress32 = false
 	self.halted = false
 	self.irqDelay = 0
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil
+	self.cr3 = 0
+	self.pageFaults = 0
+	self.lastPageFault = nil
+	self.inPageFault = false
+	self.aborting = false
+	self.tsc = 0
+	self.lastIoStringDest = 0
+	self.lastIoStringCount = 0
+	self.lastIoStringPort = 0
+	self.intCounts = {}
 	self.defaultInts = {}
 	self.stubSeg = nil
 	self.intStubs = {}
@@ -247,10 +333,210 @@ end
 -- loadSeg uses selector<<4 and the next far transfer reloads CS.
 function Cpu.setPE(self: Cpu, on: boolean)
 	if on then
-		self.cr0 = bor(self.cr0, 1)
+		self.cr0 = bor(self.cr0, CR0_PE)
 	else
-		self.cr0 = band(self.cr0, bnot(1))
+		self.cr0 = band(self.cr0, bnot(CR0_PE))
 	end
+	self.cr[0] = self.cr0
+end
+
+function Cpu.isProtected(self: Cpu): boolean
+	return band(self.cr0, CR0_PE) ~= 0
+end
+
+function Cpu.isV86(self: Cpu): boolean
+	return self:isProtected() and band(self.flags, VM) ~= 0
+end
+
+-- Current privilege level. V86 always executes at ring 3 even though no
+-- protected-mode selector is loaded.
+function Cpu.cpl(self: Cpu): number
+	if self:isV86() then
+		return 3
+	end
+	if self:isProtected() then
+		return band(self.cs, 3)
+	end
+	return 0
+end
+
+-- CS.D controls the default operand/address size and EIP width. Real mode and
+-- V86 are 16-bit unless the V86 CS descriptor set D=1.
+function Cpu.code32(self: Cpu): boolean
+	if not self:isProtected() then
+		return false
+	end
+	return band(self.segFlags.cs or 0, 0x40) ~= 0
+end
+
+function Cpu.stack32(self: Cpu): boolean
+	return self:isProtected() and band(self.segFlags.ss or 0, 0x40) ~= 0
+end
+
+function Cpu.ipMask(self: Cpu): number
+	return if self:code32() then 0xFFFFFFFF else 0xFFFF
+end
+
+function Cpu.pagingEnabled(self: Cpu): boolean
+	return band(self.cr0, CR0_PG) ~= 0
+end
+
+-- Deliver a page fault. The exception frame is built by the normal IDT path;
+-- the sentinel unwinds the faulting instruction so no partial architectural
+-- result escapes. Nested faults during frame construction are fatal.
+function Cpu.pageFault(
+	self: Cpu,
+	addr: number,
+	write: boolean,
+	user: boolean,
+	reserved: boolean,
+	fetch: boolean,
+	present: boolean?
+)
+	self.pageFaults += 1
+	local errorCode = if present then 1 else 0
+	if write then
+		errorCode = bor(errorCode, 2)
+	end
+	if user then
+		errorCode = bor(errorCode, 4)
+	end
+	if reserved then
+		errorCode = bor(errorCode, 8)
+	end
+	if fetch then
+		errorCode = bor(errorCode, 16) -- 486 I/D bit
+	end
+	self.lastPageFault = { addr = addr, errorCode = errorCode, write = write, user = user }
+	if self.inPageFault then
+		self:tripleFault()
+		self.aborting = true
+		error(ABORT_INSTRUCTION, 0)
+	end
+	self.inPageFault = true
+	const ok, _err = pcall(function()
+		self:interrupt(14, errorCode, false)
+	end)
+	self.inPageFault = false
+	if not ok then
+		self.aborting = true
+		error(ABORT_INSTRUCTION, 0)
+	end
+	self.aborting = true
+	error(ABORT_INSTRUCTION, 0)
+end
+
+-- 386 two-level paging. CR3 is a physical address; page-table entries are read
+-- with the physical bus directly. 4 MiB pages require CR4.PSE, which this
+-- 486-class core leaves disabled, but accepting a present 4 MiB PDE is useful
+-- for guests that set it by hand.
+function Cpu.translatePage(
+	self: Cpu,
+	addr: number,
+	write: boolean,
+	user: boolean,
+	fetch: boolean?
+): number
+	if not self:pagingEnabled() then
+		return addr
+	end
+	const dirBase = band(self.cr3, 0xFFFFF000)
+	const dirIndex = rshift(addr, 22)
+	const pdeAddr = dirBase + dirIndex * 4
+	const pde = self.mem:read32(pdeAddr)
+	if band(pde, 1) == 0 then
+		self:pageFault(addr, write, user, false, fetch or false)
+	end
+	const userPage = band(pde, 4) ~= 0
+	const writable = band(pde, 2) ~= 0
+	if user and not userPage then
+		self:pageFault(addr, write, user, false, fetch or false, true)
+	end
+	if write and not writable and (user or band(self.cr0, CR0_WP) ~= 0) then
+		self:pageFault(addr, write, user, false, fetch or false, true)
+	end
+	if band(pde, 0x80) ~= 0 then -- 4 MiB page (PSE)
+		if band(addr, 0x3FF000) ~= 0 and band(pde, 0x40000000) ~= 0 then
+			self:pageFault(addr, write, user, true, fetch or false, true)
+		end
+		return band(pde, 0xFFC00000) + band(addr, 0x3FFFFF)
+	end
+	const tableBase = band(pde, 0xFFFFF000)
+	const pteAddr = tableBase + band(rshift(addr, 12), 0x3FF) * 4
+	const pte = self.mem:read32(pteAddr)
+	if band(pte, 1) == 0 then
+		self:pageFault(addr, write, user, false, fetch or false)
+	end
+	if user and band(pte, 4) == 0 then
+		self:pageFault(addr, write, user, false, fetch or false, true)
+	end
+	if write and band(pte, 2) == 0 and (user or band(self.cr0, CR0_WP) ~= 0) then
+		self:pageFault(addr, write, user, false, fetch or false, true)
+	end
+	-- Accessed/dirty bookkeeping, as a real 486 does.
+	const touched = bor(pte, 0x20)
+	const withDirty = if write then bor(touched, 0x40) else touched
+	if withDirty ~= pte then
+		self.mem:write32(pteAddr, withDirty)
+	end
+	return band(pte, 0xFFFFF000) + band(addr, 0xFFF)
+end
+
+-- Linear (post-segmentation) memory access. All instruction and data traffic
+-- goes through these helpers so paging applies uniformly, including descriptor
+-- and interrupt-table reads.
+function Cpu.read8(self: Cpu, addr: number, supervisor: boolean?): number
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, false, user, false)
+	if self.aborting then
+		return 0
+	end
+	return self.mem:read8(phys)
+end
+
+function Cpu.read16(self: Cpu, addr: number, supervisor: boolean?): number
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, false, user, false)
+	if self.aborting then
+		return 0
+	end
+	return self.mem:read16(phys)
+end
+
+function Cpu.read32(self: Cpu, addr: number, supervisor: boolean?): number
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, false, user, false)
+	if self.aborting then
+		return 0
+	end
+	return self.mem:read32(phys)
+end
+
+function Cpu.write8(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, true, user, false)
+	if self.aborting then
+		return
+	end
+	self.mem:write8(phys, value)
+end
+
+function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, true, user, false)
+	if self.aborting then
+		return
+	end
+	self.mem:write16(phys, value)
+end
+
+function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
+	const user = not supervisor and self:cpl() == 3
+	const phys = self:translatePage(addr, true, user, false)
+	if self.aborting then
+		return
+	end
+	self.mem:write32(phys, value)
 end
 
 local function getSeg(cpu: any, reg: string): number
@@ -299,8 +585,11 @@ end
 
 function Cpu.reset(self: Cpu)
 	self.cr0 = 0
+	self.cr3 = 0
 	self.cr = { 0, 0, 0, 0 }
 	self.dr = { 0, 0, 0, 0 }
+	self.inPageFault = false
+	self.aborting = false
 	self.gdtr = { base = 0, limit = 0 }
 	self.idtr = { base = 0, limit = 0 }
 	self.ldtr = 0
@@ -309,6 +598,7 @@ function Cpu.reset(self: Cpu)
 	self.tr = 0
 	self.trBase = 0
 	self.trLimit = 0
+	self.tr32 = false
 	self.es, self.cs, self.ss, self.ds = 0, 0xF000, 0, 0
 	self.fs, self.gs = 0, 0
 	cacheReal(self, "es", 0)
@@ -350,12 +640,12 @@ local function readDescriptor(cpu: any, selector: number): Descriptor?
 		return nil
 	end
 	const addr = base + index * 8
-	const limitLow = cpu.mem:read16(addr)
-	const baseLow = cpu.mem:read16(addr + 2)
-	const baseMid = cpu.mem:read8(addr + 4)
-	const access = cpu.mem:read8(addr + 5)
-	const flags = cpu.mem:read8(addr + 6)
-	const baseHigh = cpu.mem:read8(addr + 7)
+	const limitLow = cpu:read16(addr, true)
+	const baseLow = cpu:read16(addr + 2, true)
+	const baseMid = cpu:read8(addr + 4, true)
+	const access = cpu:read8(addr + 5, true)
+	const flags = cpu:read8(addr + 6, true)
+	const baseHigh = cpu:read8(addr + 7, true)
 	local descLimit = bor(limitLow, lshift(band(flags, 0x0F), 16))
 	if band(flags, 0x80) ~= 0 then
 		descLimit = bor(lshift(descLimit, 12), 0xFFF)
@@ -367,8 +657,8 @@ local function readDescriptor(cpu: any, selector: number): Descriptor?
 		flags = flags,
 		raw0 = limitLow,
 		raw2 = baseLow,
-		raw4 = cpu.mem:read8(addr + 4),
-		raw6 = cpu.mem:read8(addr + 6),
+		raw4 = baseMid,
+		raw6 = cpu:read16(addr + 6, true), -- gate offset high word
 	}
 end
 
@@ -379,7 +669,7 @@ function Cpu.ensureSeg(self: Cpu, reg: string)
 	if self.segSel[reg] == selector then
 		return
 	end
-	if band(self.cr0, 1) == 0 then
+	if not self:isProtected() or self:isV86() then
 		cacheReal(self, reg, selector)
 		return
 	end
@@ -388,7 +678,7 @@ end
 
 function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 	selector = band(selector, 0xFFFF)
-	if band(self.cr0, 1) == 0 then
+	if not self:isProtected() or self:isV86() then
 		setSeg(self, reg, selector)
 		cacheReal(self, reg, selector)
 		return
@@ -457,11 +747,12 @@ end
 -- outer IRET path unwinds.
 function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolean)
 	selector = band(selector, 0xFFFF)
-	offset = band(offset, 0xFFFF)
-	if band(self.cr0, 1) == 0 then
+	offset = band(offset, 0xFFFFFFFF)
+	const nearWidth = if self.operand32 then 4 else 2
+	if not self:isProtected() or self:isV86() then
 		if isCall then
-			self:push16(self.cs)
-			self:push16(self.ip)
+			self:pushValue(self.cs, nearWidth)
+			self:pushValue(self.ip, nearWidth)
 		end
 		self:loadSeg("cs", selector)
 		self.ip = offset
@@ -485,22 +776,26 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			)
 		end
 		if isCall then
-			self:push16(self.cs)
-			self:push16(self.ip)
+			self:pushValue(self.cs, nearWidth)
+			self:pushValue(self.ip, nearWidth)
 		end
 		self:loadSeg("cs", selector)
 		self.ip = offset
 		return
 	end
 	-- Call gate: offset/selector/parameter count are packed in the descriptor.
+	const gate32 = gateType == 0x0C
+	const gateWidth = if gate32 then 4 else 2
 	const gateDpl = band(rshift(desc.access, 5), 3)
-	const cpl = band(self.cs, 3)
+	const cpl = self:cpl()
 	const rpl = band(selector, 3)
 	if gateDpl < math.max(cpl, rpl) then
 		error(("#GP: call gate %04X DPL%d below CPL%d/RPL%d"):format(selector, gateDpl, cpl, rpl))
 	end
 	const targetSelector = band(desc.raw2, 0xFFFF)
-	const targetOffset = band(bor(desc.raw0, lshift(desc.raw6, 16)), 0xFFFF)
+	const targetOffset = if gate32
+		then band(bor(desc.raw0, lshift(desc.raw6, 16)), 0xFFFFFFFF)
+		else band(desc.raw0, 0xFFFF)
 	const paramCount = band(desc.raw4, 0x1F)
 	const targetDesc = readDescriptor(self, targetSelector)
 	if not targetDesc or band(targetDesc.access, 0x80) == 0 then
@@ -519,8 +814,8 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	if not isCall or targetRing >= cpl then
 		-- Same/outer ring or JMP through a gate: no stack switch.
 		if isCall then
-			self:push16(self.cs)
-			self:push16(self.ip)
+			self:pushValue(self.cs, gateWidth)
+			self:pushValue(self.ip, gateWidth)
 		end
 		self:loadSeg("cs", targetSelector)
 		self.ip = targetOffset
@@ -533,9 +828,15 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	if targetRing > 2 then
 		error(("#GP: call gate %04X unsupported target ring %d"):format(selector, targetRing))
 	end
-	const spOff = 2 + targetRing * 4
-	const ssOff = spOff + 2
-	if self.trLimit < ssOff + 1 then
+	local spOff, ssOff
+	if self.tr32 then
+		spOff = 4 + targetRing * 8
+		ssOff = spOff + 4
+	else
+		spOff = 2 + targetRing * 4
+		ssOff = spOff + 2
+	end
+	if self.trLimit < ssOff + (if self.tr32 then 3 else 1) then
 		error(
 			("#TS: TSS selector %04X limit %04X too small for ring %d"):format(
 				self.tr,
@@ -544,34 +845,57 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			)
 		)
 	end
-	const newSp0 = self.mem:read16(self.trBase + spOff)
-	const newSs = self.mem:read16(self.trBase + ssOff)
+	const newSp0 = if self.tr32
+		then self:read32(self.trBase + spOff, true)
+		else self:read16(self.trBase + spOff, true)
+	const newSs = self:read16(self.trBase + ssOff, true)
 	const ssDesc = readDescriptor(self, newSs)
 	if not ssDesc or not descriptorIsWritableData(ssDesc) then
 		error(("#TS: TSS stack selector %04X invalid for ring %d"):format(newSs, targetRing))
 	end
 	const oldSs = self.ss
-	const oldSp = self.r[5]
+	const oldSp = self:getSP()
 	const oldBase = self:baseOf("ss")
+	const oldMask = if self:stack32() then 0xFFFFFFFF else 0xFFFF
 	const newBase = ssDesc.base
-	local newSp = band(newSp0 - paramCount * 2, 0xFFFF)
+	const newStack32 = band(ssDesc.flags, 0x40) ~= 0
+	const newMask = if newStack32 then 0xFFFFFFFF else 0xFFFF
+	local newSp = band(newSp0 - paramCount * gateWidth, newMask)
 	for index = 0, paramCount - 1 do
-		const value = self.mem:read16(oldBase + band(oldSp + index * 2, 0xFFFF))
-		self.mem:write16(newBase + band(newSp + index * 2, 0xFFFF), value)
+		const offsetInFrame = band(oldSp + index * gateWidth, oldMask)
+		const value = if gateWidth == 4
+			then self:read32(oldBase + offsetInFrame)
+			else self:read16(oldBase + offsetInFrame)
+		if gateWidth == 4 then
+			self:write32(newBase + band(newSp + index * 4, newMask), value, true)
+		else
+			self:write16(newBase + band(newSp + index * 2, newMask), value, true)
+		end
 	end
 	-- Nested frame (top to bottom): IP, CS, old SP, old SS, params.
 	-- A 286/386 CALL through a call gate pushes the old SS:SP and the return
 	-- CS:IP only; unlike an interrupt gate it does not push FLAGS.
-	newSp = band(newSp - 2, 0xFFFF)
-	self.mem:write16(newBase + newSp, oldSs)
-	newSp = band(newSp - 2, 0xFFFF)
-	self.mem:write16(newBase + newSp, oldSp)
-	newSp = band(newSp - 2, 0xFFFF)
-	self.mem:write16(newBase + newSp, self.cs)
-	newSp = band(newSp - 2, 0xFFFF)
-	self.mem:write16(newBase + newSp, self.ip)
+	if gateWidth == 4 then
+		newSp = band(newSp - 4, newMask)
+		self:write32(newBase + newSp, oldSs, true)
+		newSp = band(newSp - 4, newMask)
+		self:write32(newBase + newSp, oldSp, true)
+		newSp = band(newSp - 4, newMask)
+		self:write32(newBase + newSp, self.cs, true)
+		newSp = band(newSp - 4, newMask)
+		self:write32(newBase + newSp, self.ip, true)
+	else
+		newSp = band(newSp - 2, newMask)
+		self:write16(newBase + newSp, oldSs, true)
+		newSp = band(newSp - 2, newMask)
+		self:write16(newBase + newSp, oldSp, true)
+		newSp = band(newSp - 2, newMask)
+		self:write16(newBase + newSp, self.cs, true)
+		newSp = band(newSp - 2, newMask)
+		self:write16(newBase + newSp, self.ip, true)
+	end
 	self:loadSeg("ss", newSs)
-	self.r[5] = newSp
+	self:setSP(newSp)
 	self:loadSeg("cs", targetSelector)
 	self.ip = targetOffset
 end
@@ -593,10 +917,10 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		)
 	end
 	const addr = idt.base + gateOffset
-	const offsetLow = self.mem:read16(addr)
-	const targetSelector = self.mem:read16(addr + 2)
-	const access = self.mem:read8(addr + 5)
-	const offsetHigh = self.mem:read16(addr + 6)
+	const offsetLow = self:read16(addr, true)
+	const targetSelector = self:read16(addr + 2, true)
+	const access = self:read8(addr + 5, true)
+	const offsetHigh = self:read16(addr + 6, true)
 	const gateType = band(access, 0x1F)
 	if band(access, 0x80) == 0 then
 		error(("#NP: INT %02X gate %d not present"):format(n, n))
@@ -607,7 +931,9 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 	if gateType ~= 0x06 and gateType ~= 0x07 and gateType ~= 0x0E and gateType ~= 0x0F then
 		error(("#GP: INT %02X gate type %02X is not an interrupt/trap gate"):format(n, gateType))
 	end
-	const cpl = band(self.cs, 3)
+	const gate32 = gateType == 0x0E or gateType == 0x0F
+	const frameWidth = if gate32 then 4 else 2
+	const cpl = self:cpl()
 	const gateDpl = band(rshift(access, 5), 3)
 	if software and gateDpl < cpl then
 		error(("#GP: INT %02X gate DPL%d below CPL%d"):format(n, gateDpl, cpl))
@@ -626,7 +952,11 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		)
 	end
 	const targetRing = band(rshift(targetDesc.access, 5), 3)
-	const targetOffset = band(bor(offsetLow, lshift(offsetHigh, 16)), 0xFFFF)
+	const targetOffset = if gate32
+		then band(bor(offsetLow, lshift(offsetHigh, 16)), 0xFFFFFFFF)
+		else band(offsetLow, 0xFFFF)
+	const v86 = self:isV86()
+	const savedFlags = self.flags
 	if targetRing < cpl then
 		if self.tr == 0 or self.trBase == 0 then
 			error(("#GP: INT %02X needs a loaded TSS for ring %d"):format(n, targetRing))
@@ -634,9 +964,15 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		if targetRing > 2 then
 			error(("#GP: INT %02X unsupported target ring %d"):format(n, targetRing))
 		end
-		const spOff = 2 + targetRing * 4
-		const ssOff = spOff + 2
-		if self.trLimit < ssOff + 1 then
+		local spOff, ssOff
+		if self.tr32 then
+			spOff = 4 + targetRing * 8
+			ssOff = spOff + 4
+		else
+			spOff = 2 + targetRing * 4
+			ssOff = spOff + 2
+		end
+		if self.trLimit < ssOff + (if self.tr32 then 3 else 1) then
 			error(
 				("#TS: TSS selector %04X limit %04X too small for INT %02X"):format(
 					self.tr,
@@ -645,44 +981,59 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 				)
 			)
 		end
-		const newSp0 = self.mem:read16(self.trBase + spOff)
-		const newSs = self.mem:read16(self.trBase + ssOff)
+		const newSp0 = if self.tr32
+			then self:read32(self.trBase + spOff, true)
+			else self:read16(self.trBase + spOff, true)
+		const newSs = self:read16(self.trBase + ssOff, true)
 		const ssDesc = readDescriptor(self, newSs)
 		if not ssDesc or not descriptorIsWritableData(ssDesc) then
 			error(("#TS: INT %02X stack selector %04X invalid"):format(n, newSs))
 		end
 		const oldSs = self.ss
-		const oldSp = self.r[5]
+		const oldSp = self:getSP()
 		const newBase = ssDesc.base
-		local newSp = newSp0
-		newSp = band(newSp - 2, 0xFFFF)
-		self.mem:write16(newBase + newSp, oldSs)
-		newSp = band(newSp - 2, 0xFFFF)
-		self.mem:write16(newBase + newSp, oldSp)
-		newSp = band(newSp - 2, 0xFFFF)
-		self.mem:write16(newBase + newSp, self.flags)
-		newSp = band(newSp - 2, 0xFFFF)
-		self.mem:write16(newBase + newSp, self.cs)
-		newSp = band(newSp - 2, 0xFFFF)
-		self.mem:write16(newBase + newSp, self.ip)
+		const newStack32 = band(ssDesc.flags, 0x40) ~= 0
+		const newMask = if newStack32 then 0xFFFFFFFF else 0xFFFF
+		local newSp = band(newSp0, newMask)
+		const pushWidth = if v86 or gate32 then 4 else 2
+		const writeStack = function(value: number)
+			newSp = band(newSp - pushWidth, newMask)
+			if pushWidth == 4 then
+				self:write32(newBase + newSp, value, true)
+			else
+				self:write16(newBase + newSp, value, true)
+			end
+		end
+		-- Virtual-8086 frames additionally preserve the four data segments.
+		if v86 then
+			writeStack(self.gs)
+			writeStack(self.fs)
+			writeStack(self.ds)
+			writeStack(self.es)
+		end
+		writeStack(oldSs)
+		writeStack(oldSp)
+		writeStack(savedFlags)
+		writeStack(self.cs)
+		writeStack(self.ip)
 		if errorCode ~= nil then
-			newSp = band(newSp - 2, 0xFFFF)
-			self.mem:write16(newBase + newSp, errorCode)
+			writeStack(errorCode)
 		end
 		self:loadSeg("ss", newSs)
-		self.r[5] = newSp
+		self:setSP(newSp)
 		self:loadSeg("cs", targetSelector)
 		self.ip = targetOffset
 	else
-		self:push16(self.flags)
-		self:push16(self.cs)
-		self:push16(self.ip)
+		self:pushValue(savedFlags, frameWidth)
+		self:pushValue(self.cs, frameWidth)
+		self:pushValue(self.ip, frameWidth)
 		if errorCode ~= nil then
-			self:push16(errorCode)
+			self:pushValue(errorCode, frameWidth)
 		end
 		self:loadSeg("cs", targetSelector)
 		self.ip = targetOffset
 	end
+	self.flags = band(self.flags, bnot(VM))
 	self:setbits(TF, false)
 	if gateType == 0x06 or gateType == 0x0E then
 		self:setbits(IFF, false)
@@ -745,8 +1096,11 @@ function Cpu.wr32(self: Cpu, i: number, v: number)
 end
 
 function Cpu.fetch8(self: Cpu): number
-	local b = self.mem:read8(self:linear("cs", self.ip, 1))
-	self.ip = band(self.ip + 1, 0xFFFF)
+	local b = self:read8(self:linear("cs", self.ip, 1))
+	self.ip = band(self.ip + 1, self:ipMask())
+	if self.aborting then
+		return 0
+	end
 	return b
 end
 
@@ -755,28 +1109,65 @@ function Cpu.fetch16(self: Cpu): number
 	return bor(lo, lshift(self:fetch8(), 8))
 end
 
+function Cpu.fetch32(self: Cpu): number
+	const lo = self:fetch16()
+	return bor(lo, lshift(self:fetch16(), 16))
+end
+
+function Cpu.getSP(self: Cpu): number
+	return if self:stack32() then self:rr32(4) else self.r[5]
+end
+
+function Cpu.setSP(self: Cpu, value: number)
+	if self:stack32() then
+		self:wr32(4, value)
+	else
+		self.r[5] = band(value, 0xFFFF)
+	end
+end
+
+function Cpu.pushValue(self: Cpu, v: number, width: number)
+	const mask = if self:stack32() then 0xFFFFFFFF else 0xFFFF
+	const sp = band(self:getSP() - width, mask)
+	self:setSP(sp)
+	if width == 4 then
+		self:write32(self:linear("ss", sp, 4), v)
+	elseif width == 2 then
+		self:write16(self:linear("ss", sp, 2), v)
+	else
+		self:write8(self:linear("ss", sp, 1), v)
+	end
+end
+
+function Cpu.popValue(self: Cpu, width: number): number
+	const mask = if self:stack32() then 0xFFFFFFFF else 0xFFFF
+	const sp = self:getSP()
+	local value
+	if width == 4 then
+		value = self:read32(self:linear("ss", sp, 4))
+	elseif width == 2 then
+		value = self:read16(self:linear("ss", sp, 2))
+	else
+		value = self:read8(self:linear("ss", sp, 1))
+	end
+	self:setSP(band(sp + width, mask))
+	return value
+end
+
 function Cpu.push16(self: Cpu, v: number)
-	self.r[5] = band(self.r[5] - 2, 0xFFFF) -- r[5] is SP
-	self.mem:write16(self:linear("ss", self.r[5], 2), v)
+	self:pushValue(v, 2)
 end
 
 function Cpu.pop16(self: Cpu): number
-	local v = self.mem:read16(self:linear("ss", self.r[5], 2))
-	self.r[5] = band(self.r[5] + 2, 0xFFFF)
-	return v
+	return self:popValue(2)
 end
 
 function Cpu.push32(self: Cpu, v: number)
-	self.r[5] = band(self.r[5] - 4, 0xFFFF)
-	self.mem:write16(self:linear("ss", self.r[5], 4), band(v, 0xFFFF))
-	self.mem:write16(self:linear("ss", self.r[5] + 2, 2), band(rshift(v, 16), 0xFFFF))
+	self:pushValue(v, 4)
 end
 
 function Cpu.pop32(self: Cpu): number
-	local lo = self.mem:read16(self:linear("ss", self.r[5], 4))
-	local hi = self.mem:read16(self:linear("ss", self.r[5] + 2, 2))
-	self.r[5] = band(self.r[5] + 4, 0xFFFF)
-	return bor(lo, lshift(hi, 16))
+	return self:popValue(4)
 end
 
 function Cpu.setbits(self: Cpu, mask: number, on: boolean)
@@ -791,63 +1182,101 @@ function Cpu.getF(self: Cpu, mask: number): boolean
 	return band(self.flags, mask) ~= 0
 end
 
-function Cpu.setSZP(self: Cpu, res: number, w: boolean)
+-- w accepts the historical boolean (false=8-bit, true=16-bit) plus 32 for the
+-- 386 operand-size prefix. Keeping the boolean form avoids churning every
+-- 8086/286 handler while still giving 32-bit ALU/shift results correct SZP.
+function Cpu.setSZP(self: Cpu, res: number, w: any)
 	local f = band(self.flags, bnot(ZF + SF + PF))
 	if res == 0 then
 		f = bor(f, ZF)
 	end
-	if w then
-		if res >= 0x8000 then
-			f = bor(f, SF)
-		end
-	else
-		if res >= 0x80 then
-			f = bor(f, SF)
-		end
+	const signBit = if w == 32 then 0x80000000 elseif w == 16 or w == true then 0x8000 else 0x80
+	if res >= signBit then
+		f = bor(f, SF)
 	end
 	self.flags = bor(f, PARITY[band(res, 0xFF)])
 end
 
 function Cpu.modrm(self: Cpu): ModRM
 	local m = self:fetch8()
-	local mod = rshift(m, 6)
-	local reg = band(rshift(m, 3), 7)
-	local rm = band(m, 7)
+	const mod = rshift(m, 6)
+	const reg = band(rshift(m, 3), 7)
+	const rm = band(m, 7)
 	if mod == 3 then
 		return { mod = 3, reg = reg, rm = rm, off = nil, addr = nil, seg = nil }
 	end
 	local off, segReg
-	if mod == 0 and rm == 6 then
-		off, segReg = self:fetch16(), "ds"
-	else
-		local r = self.r
-		if rm == 0 then
-			off, segReg = r[4] + r[7], "ds"
-		elseif rm == 1 then
-			off, segReg = r[4] + r[8], "ds"
-		elseif rm == 2 then
-			off, segReg = r[6] + r[7], "ss"
-		elseif rm == 3 then
-			off, segReg = r[6] + r[8], "ss"
-		elseif rm == 4 then
-			off, segReg = r[7], "ds"
-		elseif rm == 5 then
-			off, segReg = r[8], "ds"
-		elseif rm == 6 then
-			off, segReg = r[6], "ss"
-		else
-			off, segReg = r[4], "ds"
-		end
-		if mod == 1 then
-			local d = self:fetch8()
-			if d >= 0x80 then
-				d -= 0x100
+	if self.address32 then
+		local base: number? = nil
+		local index: number? = nil
+		local scale = 1
+		segReg = "ds"
+		if rm == 4 then
+			const sib = self:fetch8()
+			scale = lshift(1, rshift(sib, 6))
+			const indexField = band(rshift(sib, 3), 7)
+			const baseField = band(sib, 7)
+			if indexField ~= 4 then
+				index = self:rr32(indexField)
 			end
-			off += d
-		elseif mod == 2 then
-			off += self:fetch16()
+			if mod == 0 and baseField == 5 then
+				off = self:fetch32()
+			else
+				base = self:rr32(baseField)
+				if baseField == 4 or baseField == 5 then
+					segReg = "ss"
+				end
+			end
+		elseif mod == 0 and rm == 5 then
+			off = self:fetch32()
+		else
+			base = self:rr32(rm)
+			if rm == 5 then
+				segReg = "ss"
+			end
 		end
-		off = band(off, 0xFFFF)
+		if off == nil then
+			local displacement = 0
+			if mod == 1 then
+				displacement = sign8(self:fetch8())
+			elseif mod == 2 then
+				displacement = self:fetch32()
+			end
+			local value = (base or 0) + displacement
+			if index then
+				value += index * scale
+			end
+			off = band(value, 0xFFFFFFFF)
+		end
+	else
+		if mod == 0 and rm == 6 then
+			off, segReg = self:fetch16(), "ds"
+		else
+			const r = self.r
+			if rm == 0 then
+				off, segReg = r[4] + r[7], "ds"
+			elseif rm == 1 then
+				off, segReg = r[4] + r[8], "ds"
+			elseif rm == 2 then
+				off, segReg = r[6] + r[7], "ss"
+			elseif rm == 3 then
+				off, segReg = r[6] + r[8], "ss"
+			elseif rm == 4 then
+				off, segReg = r[7], "ds"
+			elseif rm == 5 then
+				off, segReg = r[8], "ds"
+			elseif rm == 6 then
+				off, segReg = r[6], "ss"
+			else
+				off, segReg = r[4], "ds"
+			end
+			if mod == 1 then
+				off += sign8(self:fetch8())
+			elseif mod == 2 then
+				off += self:fetch16()
+			end
+			off = band(off, 0xFFFF)
+		end
 	end
 	if self.osegReg then
 		segReg = self.osegReg
@@ -867,14 +1296,14 @@ function Cpu.readRM8(self: Cpu, e: ModRM): number
 	if e.mod == 3 then
 		return self:rb(e.rm)
 	end
-	return self.mem:read8(self:linear(e.seg :: string, e.off :: number, 1))
+	return self:read8(self:linear(e.seg :: string, e.off :: number, 1))
 end
 
 function Cpu.writeRM8(self: Cpu, e: ModRM, v: number)
 	if e.mod == 3 then
 		self:wb(e.rm, v)
 	else
-		self.mem:write8(self:linear(e.seg :: string, e.off :: number, 1), v)
+		self:write8(self:linear(e.seg :: string, e.off :: number, 1), v)
 	end
 end
 
@@ -882,21 +1311,67 @@ function Cpu.readRM16(self: Cpu, e: ModRM): number
 	if e.mod == 3 then
 		return self:rr(e.rm)
 	end
-	return self.mem:read16(self:linear(e.seg :: string, e.off :: number, 2))
+	return self:read16(self:linear(e.seg :: string, e.off :: number, 2))
 end
 
 function Cpu.writeRM16(self: Cpu, e: ModRM, v: number)
 	if e.mod == 3 then
 		self:wr(e.rm, v)
 	else
-		self.mem:write16(self:linear(e.seg :: string, e.off :: number, 2), v)
+		self:write16(self:linear(e.seg :: string, e.off :: number, 2), v)
+	end
+end
+
+function Cpu.readRM32(self: Cpu, e: ModRM): number
+	if e.mod == 3 then
+		return self:rr32(e.rm)
+	end
+	return self:read32(self:linear(e.seg :: string, e.off :: number, 4))
+end
+
+function Cpu.writeRM32(self: Cpu, e: ModRM, v: number)
+	if e.mod == 3 then
+		self:wr32(e.rm, v)
+	else
+		self:write32(self:linear(e.seg :: string, e.off :: number, 4), v)
+	end
+end
+
+-- Operand-size-directed helpers (16-bit unless the current instruction has a
+-- 0x66 prefix and the CPU is a 386+).
+function Cpu.readRM(self: Cpu, e: ModRM): number
+	if self.operand32 then
+		return self:readRM32(e)
+	end
+	return self:readRM16(e)
+end
+
+function Cpu.writeRM(self: Cpu, e: ModRM, v: number)
+	if self.operand32 then
+		self:writeRM32(e, v)
+	else
+		self:writeRM16(e, v)
+	end
+end
+
+function Cpu.rrw(self: Cpu, i: number): number
+	return if self.operand32 then self:rr32(i) else self:rr(i)
+end
+
+function Cpu.wrw(self: Cpu, i: number, v: number)
+	if self.operand32 then
+		self:wr32(i, v)
+	else
+		self:wr(i, v)
 	end
 end
 
 -- op: 0 ADD, 1 OR, 2 ADC, 3 SBB, 4 AND, 5 SUB, 6 XOR, 7 CMP
-local function doALU(cpu: any, op: number, a: number, b: number, w: boolean): number
-	local maxv = w and 0xFFFF or 0xFF
-	local signv = w and 0x8000 or 0x80
+-- w: false/8 = byte, true/16 = word, 32 = dword.
+local function doALU(cpu: any, op: number, a: number, b: number, w: any): number
+	const width = if w == 32 then 32 elseif w == 16 or w == true then 16 else 8
+	const maxv = if width == 32 then 0xFFFFFFFF elseif width == 16 then 0xFFFF else 0xFF
+	const signv = if width == 32 then 0x80000000 elseif width == 16 then 0x8000 else 0x80
 	local res, cf, of
 	if op == 0 or op == 2 then
 		local c = 0
@@ -928,7 +1403,7 @@ local function doALU(cpu: any, op: number, a: number, b: number, w: boolean): nu
 	cpu:setbits(CF, cf)
 	cpu:setbits(OFLG, of)
 	cpu:setbits(AF, band(bxor(bxor(a, b), res), 16) ~= 0)
-	cpu:setSZP(res, w)
+	cpu:setSZP(res, width)
 	return res
 end
 
@@ -937,44 +1412,55 @@ end
 -- 80186+ the shift group also updates SZP for SHL/SHR/SAR (rotates leave SZP
 -- alone); Windows 3.0 real-mode code branches on those flags right after a
 -- shift, so they cannot be left stale.
-local function doShift(cpu: any, op: number, v: number, cnt: number, w: boolean): number
-	local bits = w and 16 or 8
-	local maxv = w and 0xFFFF or 0xFF
-	local msb = w and 0x8000 or 0x80
+local function doShift(cpu: any, op: number, v: number, cnt: number, w: any): number
+	const width = if w == 32 then 32 elseif w == 16 or w == true then 16 else 8
+	const bits = width
+	const maxv = if width == 32 then 0xFFFFFFFF elseif width == 16 then 0xFFFF else 0xFF
+	const msb = if width == 32 then 0x80000000 elseif width == 16 then 0x8000 else 0x80
 	if cnt == 0 then
-		return v
+		return band(v, maxv)
+	end
+	-- 386+ masks the count to five bits; an 8086/286 uses the raw CL value.
+	if cpu.level >= CPU_386 then
+		cnt = band(cnt, 0x1F)
+		if cnt == 0 then
+			return band(v, maxv)
+		end
 	end
 	local cf = cpu:getF(CF)
-	local res, of = v, false
+	local res, of = band(v, maxv), false
 
 	if op == 4 or op == 6 then
-		res = v
+		res = band(v, maxv)
 		for _ = 1, cnt do
 			cf = band(res, msb) ~= 0
 			res = band(lshift(res, 1), maxv)
 		end
 		of = cnt == 1 and (cf ~= (band(res, msb) ~= 0)) or false
 	elseif op == 5 then
-		res = v
+		res = band(v, maxv)
 		of = cnt == 1 and (band(v, msb) ~= 0) or false
 		for _ = 1, cnt do
 			cf = band(res, 1) ~= 0
 			res = rshift(res, 1)
 		end
 	elseif op == 7 then
-		local sv = w and sign16(v) or sign8(v)
+		local sv = if width == 32
+			then sign32(band(v, 0xFFFFFFFF))
+			elseif width == 16 then sign16(v)
+			else sign8(v)
 		if cnt >= bits then
 			res = sv < 0 and maxv or 0
 			cf = sv < 0
 		else
-			res = band(math.floor(sv / lshift(1, cnt)), maxv)
-			cf = band(rshift(sv, cnt - 1), 1) == 1
+			res = band(math.floor(sv / (2 ^ cnt)), maxv)
+			cf = band(rshift(band(sv, maxv), cnt - 1), 1) == 1
 		end
 		of = false
 	elseif op == 0 then
 		local c = cnt % bits
 		if c == 0 then
-			res = v
+			res = band(v, maxv)
 			cf = band(v, 1) == 1
 		else
 			res = band(bor(lshift(v, c), rshift(v, bits - c)), maxv)
@@ -984,7 +1470,7 @@ local function doShift(cpu: any, op: number, v: number, cnt: number, w: boolean)
 	elseif op == 1 then
 		local c = cnt % bits
 		if c == 0 then
-			res = v
+			res = band(v, maxv)
 			cf = band(v, msb) ~= 0
 		else
 			res = band(bor(rshift(v, c), lshift(v, bits - c)), maxv)
@@ -992,29 +1478,54 @@ local function doShift(cpu: any, op: number, v: number, cnt: number, w: boolean)
 		end
 		of = cnt == 1 and ((band(res, msb) ~= 0) ~= (band(res, rshift(msb, 1)) ~= 0)) or false
 	elseif op == 2 then
-		local width = bits + 1
-		local c = cnt % width
-		if c == 0 then
-			res = v
+		if width == 32 then
+			res = band(v, 0xFFFFFFFF)
+			for _ = 1, cnt do
+				const nextCf = band(res, msb) ~= 0
+				res = band(bor(lshift(res, 1), if cf then 1 else 0), 0xFFFFFFFF)
+				cf = nextCf
+			end
+			-- A 33-bit rotate leaves the original CF after a full turn.
+			if cnt % 33 == 0 then
+				cf = cpu:getF(CF)
+			end
 		else
-			local combined = bor(lshift(v, 1), cf and 1 or 0)
-			local mask = lshift(1, width) - 1
-			local rot = band(bor(lshift(combined, c), rshift(combined, width - c)), mask)
-			res = band(rshift(rot, 1), maxv)
-			cf = band(rot, 1) == 1
+			const rotWidth = bits + 1
+			const c = cnt % rotWidth
+			if c == 0 then
+				res = band(v, maxv)
+			else
+				const combined = bor(lshift(v, 1), if cf then 1 else 0)
+				const mask = lshift(1, rotWidth) - 1
+				const rot = band(bor(lshift(combined, c), rshift(combined, rotWidth - c)), mask)
+				res = band(rshift(rot, 1), maxv)
+				cf = band(rot, 1) == 1
+			end
 		end
 		of = cnt == 1 and (cf ~= (band(res, msb) ~= 0)) or false
 	else
-		local width = bits + 1
-		local c = cnt % width
-		local combined = bor(v, cf and lshift(1, bits) or 0)
-		if c == 0 then
-			res = v
+		if width == 32 then
+			res = band(v, 0xFFFFFFFF)
+			for _ = 1, cnt do
+				const nextCf = band(res, 1) ~= 0
+				res = band(bor(rshift(res, 1), if cf then msb else 0), 0xFFFFFFFF)
+				cf = nextCf
+			end
+			if cnt % 33 == 0 then
+				cf = cpu:getF(CF)
+			end
 		else
-			local mask = lshift(1, width) - 1
-			local rot = band(bor(rshift(combined, c), lshift(combined, width - c)), mask)
-			res = band(rot, maxv)
-			cf = band(rshift(rot, bits), 1) == 1
+			const rotWidth = bits + 1
+			const c = cnt % rotWidth
+			const combined = bor(v, if cf then lshift(1, bits) else 0)
+			if c == 0 then
+				res = band(v, maxv)
+			else
+				const mask = lshift(1, rotWidth) - 1
+				const rot = band(bor(rshift(combined, c), lshift(combined, rotWidth - c)), mask)
+				res = band(rot, maxv)
+				cf = band(rshift(rot, bits), 1) == 1
+			end
 		end
 		of = cnt == 1 and ((band(res, msb) ~= 0) ~= (band(res, rshift(msb, 1)) ~= 0)) or false
 	end
@@ -1022,7 +1533,7 @@ local function doShift(cpu: any, op: number, v: number, cnt: number, w: boolean)
 	cpu:setbits(CF, cf)
 	cpu:setbits(OFLG, of)
 	if op == 4 or op == 5 or op == 6 or op == 7 then
-		cpu:setSZP(res, w)
+		cpu:setSZP(res, width)
 	end
 	return res
 end
@@ -1042,9 +1553,10 @@ for aluOp = 0, 7 do
 	end
 	H[base + 1] = function(cpu: any)
 		local e = cpu:modrm()
-		local res = doALU(cpu, aluOp, cpu:readRM16(e), cpu:rr(e.reg), true)
+		const width = if cpu.operand32 then 32 else 16
+		local res = doALU(cpu, aluOp, cpu:readRM(e), cpu:rrw(e.reg), width)
 		if aluOp ~= 7 then
-			cpu:writeRM16(e, res)
+			cpu:writeRM(e, res)
 		end
 	end
 	H[base + 2] = function(cpu: any)
@@ -1056,9 +1568,10 @@ for aluOp = 0, 7 do
 	end
 	H[base + 3] = function(cpu: any)
 		local e = cpu:modrm()
-		local res = doALU(cpu, aluOp, cpu:rr(e.reg), cpu:readRM16(e), true)
+		const width = if cpu.operand32 then 32 else 16
+		local res = doALU(cpu, aluOp, cpu:rrw(e.reg), cpu:readRM(e), width)
 		if aluOp ~= 7 then
-			cpu:wr(e.reg, res)
+			cpu:wrw(e.reg, res)
 		end -- CMP r16,r/m16 (0x39) must not write
 	end
 	H[base + 4] = function(cpu: any)
@@ -1068,9 +1581,16 @@ for aluOp = 0, 7 do
 		end -- CMP AL,imm8 (0x3C) must not write
 	end
 	H[base + 5] = function(cpu: any)
-		local res = doALU(cpu, aluOp, cpu:rr(0), cpu:fetch16(), true)
+		const width = if cpu.operand32 then 32 else 16
+		local res = doALU(
+			cpu,
+			aluOp,
+			cpu:rrw(0),
+			if width == 32 then cpu:fetch32() else cpu:fetch16(),
+			width
+		)
 		if aluOp ~= 7 then
-			cpu:wr(0, res)
+			cpu:wrw(0, res)
 		end -- CMP AX,imm16 (0x3D) must not write
 	end
 end
@@ -1171,19 +1691,21 @@ end
 for i = 0, 7 do
 	H[0x40 + i] = function(cpu: any)
 		local cf = cpu:getF(CF)
-		cpu:wr(i, doALU(cpu, 0, cpu:rr(i), 1, true))
+		const width = if cpu.operand32 then 32 else 16
+		cpu:wrw(i, doALU(cpu, 0, cpu:rrw(i), 1, width))
 		cpu:setbits(CF, cf)
 	end
 	H[0x48 + i] = function(cpu: any)
 		local cf = cpu:getF(CF)
-		cpu:wr(i, doALU(cpu, 5, cpu:rr(i), 1, true))
+		const width = if cpu.operand32 then 32 else 16
+		cpu:wrw(i, doALU(cpu, 5, cpu:rrw(i), 1, width))
 		cpu:setbits(CF, cf)
 	end
 	H[0x50 + i] = function(cpu: any)
 		if cpu.operand32 then
 			cpu:push32(cpu:rr32(i))
-		elseif i == 4 then
-			-- 8086 quirk: PUSH SP pushes the DECREMENTED value
+		elseif i == 4 and cpu.level == CPU_8086 then
+			-- 8086 quirk: PUSH SP pushes the DECREMENTED value.
 			cpu:push16(band(cpu.r[5] - 2, 0xFFFF))
 		else
 			cpu:push16(cpu:rr(i))
@@ -1262,44 +1784,50 @@ for i = 0, 15 do
 			d -= 0x100
 		end
 		if COND[i + 1](cpu.flags) then
-			cpu.ip = band(cpu.ip + d, 0xFFFF)
+			cpu.ip = band(cpu.ip + d, cpu:ipMask())
 		end
 	end
 	H[0x60 + i] = H[0x70 + i]
 end
 
 -- group 1: 80/81/82/83
-local function group1(cpu: any, w: boolean, signExtImm: boolean)
+local function group1(cpu: any, width: number, signExtImm: boolean)
 	local e = cpu:modrm()
 	local op = e.reg
-	local a = w and cpu:readRM16(e) or cpu:readRM8(e)
+	local a = if width == 8 then cpu:readRM8(e) else cpu:readRM(e)
 	local b
-	if w and signExtImm then
-		b = cpu:fetch8()
-		if b >= 0x80 then
-			b += 0xFF00
-		end
-	else
-		b = w and cpu:fetch16() or cpu:fetch8()
-	end
-	local res = doALU(cpu, op, a, b, w)
-	if op ~= 7 then
-		if w then
-			cpu:writeRM16(e, res)
+	if width ~= 8 and signExtImm then
+		b = sign8(cpu:fetch8())
+		if width == 32 then
+			b = band(b, 0xFFFFFFFF)
 		else
+			b = band(b, 0xFFFF)
+		end
+	elseif width == 32 then
+		b = cpu:fetch32()
+	elseif width == 16 then
+		b = cpu:fetch16()
+	else
+		b = cpu:fetch8()
+	end
+	local res = doALU(cpu, op, a, b, width)
+	if op ~= 7 then
+		if width == 8 then
 			cpu:writeRM8(e, res)
+		else
+			cpu:writeRM(e, res)
 		end
 	end
 end
 H[0x80] = function(cpu: any)
-	group1(cpu, false, false)
+	group1(cpu, 8, false)
 end
 H[0x81] = function(cpu: any)
-	group1(cpu, true, false)
+	group1(cpu, if cpu.operand32 then 32 else 16, false)
 end
 H[0x82] = H[0x80]
 H[0x83] = function(cpu: any)
-	group1(cpu, true, true)
+	group1(cpu, if cpu.operand32 then 32 else 16, true)
 end
 
 -- TEST r/m,reg
@@ -1309,7 +1837,7 @@ H[0x84] = function(cpu: any)
 end
 H[0x85] = function(cpu: any)
 	local e = cpu:modrm()
-	doALU(cpu, 4, cpu:readRM16(e), cpu:rr(e.reg), true)
+	doALU(cpu, 4, cpu:readRM(e), cpu:rrw(e.reg), if cpu.operand32 then 32 else 16)
 end
 
 -- XCHG r/m,reg
@@ -1321,9 +1849,9 @@ H[0x86] = function(cpu: any)
 end
 H[0x87] = function(cpu: any)
 	local e = cpu:modrm()
-	local a, b = cpu:readRM16(e), cpu:rr(e.reg)
-	cpu:writeRM16(e, b)
-	cpu:wr(e.reg, a)
+	local a, b = cpu:readRM(e), cpu:rrw(e.reg)
+	cpu:writeRM(e, b)
+	cpu:wrw(e.reg, a)
 end
 
 -- MOV family
@@ -1333,7 +1861,7 @@ H[0x88] = function(cpu: any)
 end
 H[0x89] = function(cpu: any)
 	local e = cpu:modrm()
-	cpu:writeRM16(e, cpu:rr(e.reg))
+	cpu:writeRM(e, cpu:rrw(e.reg))
 end
 H[0x8A] = function(cpu: any)
 	local e = cpu:modrm()
@@ -1341,7 +1869,7 @@ H[0x8A] = function(cpu: any)
 end
 H[0x8B] = function(cpu: any)
 	local e = cpu:modrm()
-	cpu:wr(e.reg, cpu:readRM16(e))
+	cpu:wrw(e.reg, cpu:readRM(e))
 end
 
 local SEGREG = { "es", "cs", "ss", "ds", "fs", "gs" }
@@ -1354,7 +1882,7 @@ H[0x8D] = function(cpu: any)
 	if e.mod == 3 then
 		error("LEA with register operand")
 	end
-	cpu:wr(e.reg, e.off)
+	cpu:wrw(e.reg, e.off)
 end
 H[0x8E] = function(cpu: any)
 	const e = cpu:modrm()
@@ -1365,39 +1893,62 @@ H[0x8E] = function(cpu: any)
 end
 H[0x8F] = function(cpu: any)
 	local e = cpu:modrm()
-	cpu:writeRM16(e, cpu:pop16())
+	if cpu.operand32 then
+		cpu:writeRM32(e, cpu:pop32())
+	else
+		cpu:writeRM16(e, cpu:pop16())
+	end
 end
 
 H[0x90] = function() end -- NOP
 for i = 1, 7 do
-	H[0x90 + i] = function(cpu: any) -- XCHG AX,r
-		local a = cpu:rr(0)
-		cpu:wr(0, cpu:rr(i))
-		cpu:wr(i, a)
+	H[0x90 + i] = function(cpu: any) -- XCHG eAX,r
+		const a = cpu:rrw(0)
+		cpu:wrw(0, cpu:rrw(i))
+		cpu:wrw(i, a)
 	end
 end
 
-H[0x98] = function(cpu: any) -- CBW
-	local al = cpu:rb(0)
-	cpu:wr(0, al >= 0x80 and bor(0xFF00, al) or al)
+H[0x98] = function(cpu: any) -- CBW / CWDE
+	if cpu.operand32 then
+		const ax = cpu:rr(0)
+		cpu:wr32(0, if ax >= 0x8000 then bor(0xFFFF0000, ax) else ax)
+	else
+		local al = cpu:rb(0)
+		cpu:wr(0, al >= 0x80 and bor(0xFF00, al) or al)
+	end
 end
-H[0x99] = function(cpu: any) -- CWD
-	cpu:wr(2, cpu:rr(0) >= 0x8000 and 0xFFFF or 0)
+H[0x99] = function(cpu: any) -- CWD / CDQ
+	if cpu.operand32 then
+		cpu:wr32(2, if cpu:rr32(0) >= 0x80000000 then 0xFFFFFFFF else 0)
+	else
+		cpu:wr(2, cpu:rr(0) >= 0x8000 and 0xFFFF or 0)
+	end
 end
 H[0x9A] = function(cpu: any) -- CALL far imm
-	const ip = cpu:fetch16()
+	const ip = if cpu.operand32 then cpu:fetch32() else cpu:fetch16()
 	const cs = cpu:fetch16()
 	cpu:farCall(cs, ip, true)
 end
 H[0x9B] = function() end -- WAIT
-H[0x9C] = function(cpu: any)
-	cpu:push16(cpu.flags)
+H[0x9C] = function(cpu: any) -- PUSHF / PUSHFD
+	if cpu.operand32 then
+		cpu:push32(bor(cpu.flags, ALWAYS))
+	else
+		cpu:push16(cpu.flags)
+	end
 end
-H[0x9D] = function(cpu: any)
+H[0x9D] = function(cpu: any) -- POPF / POPFD
 	const wasEnabled = cpu:getF(IFF)
-	cpu.flags = bor(band(cpu:pop16(), cpu.flagMask), cpu.fixedFlags)
+	local value
+	if cpu.operand32 then
+		value = cpu:pop32()
+	else
+		value = cpu:pop16()
+	end
+	cpu.flags = bor(band(value, cpu.flagMask), cpu.fixedFlags)
 	if not wasEnabled and cpu:getF(IFF) then
-		cpu.irqDelay = 1 -- 8086 interrupt shadow after POPF
+		cpu.irqDelay = 1 -- interrupt shadow after POPF
 	end
 end
 H[0x9E] = function(cpu: any) -- SAHF
@@ -1408,70 +1959,101 @@ H[0x9F] = function(cpu: any) -- LAHF
 	cpu:wb(4, bor(band(cpu.flags, 0xD5), ALWAYS))
 end
 
--- MOV AL/AX <-> moffs16 (segment override allowed)
+-- MOV AL/AX/EAX <-> moffs (address-size prefix controls the offset width).
 local function moffs(cpu: any, size: number)
-	const off = cpu:fetch16()
+	const off = if cpu.address32 then cpu:fetch32() else cpu:fetch16()
 	return cpu:linear(cpu.osegReg or "ds", off, size)
 end
 H[0xA0] = function(cpu: any)
-	cpu:wb(0, cpu.mem:read8(moffs(cpu, 1)))
+	cpu:wb(0, cpu:read8(moffs(cpu, 1)))
 end
 H[0xA1] = function(cpu: any)
-	cpu:wr(0, cpu.mem:read16(moffs(cpu, 2)))
+	if cpu.operand32 then
+		cpu:wr32(0, cpu:read32(moffs(cpu, 4)))
+	else
+		cpu:wr(0, cpu:read16(moffs(cpu, 2)))
+	end
 end
 H[0xA2] = function(cpu: any)
-	cpu.mem:write8(moffs(cpu, 1), cpu:rb(0))
+	cpu:write8(moffs(cpu, 1), cpu:rb(0))
 end
 H[0xA3] = function(cpu: any)
-	cpu.mem:write16(moffs(cpu, 2), cpu:rr(0))
+	if cpu.operand32 then
+		cpu:write32(moffs(cpu, 4), cpu:rr32(0))
+	else
+		cpu:write16(moffs(cpu, 2), cpu:rr(0))
+	end
 end
 
 -- string ops: 0 MOVS, 1 CMPS, 2 STOS, 3 LODS, 4 SCAS
-local function stringOp(cpu: any, id: number, w: boolean)
-	local sz = w and 2 or 1
-	local d = cpu:getF(DFF) and -sz or sz
-	local mem = cpu.mem
+local function stringOp(cpu: any, id: number, width: number)
+	const sz = width
+	const delta = if cpu:getF(DFF) then -sz else sz
+	const mask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
 	const sReg = cpu.osegReg or "ds"
+	local function indexValue(index: number): number
+		return if cpu.address32 then cpu:rr32(index) else cpu:rr(index)
+	end
+	local function setIndex(index: number, value: number)
+		if cpu.address32 then
+			cpu:wr32(index, value)
+		else
+			cpu:wr(index, value)
+		end
+	end
 	local function srcAddr(): number
-		return cpu:linear(sReg, cpu.r[7], sz)
+		return cpu:linear(sReg, indexValue(6), sz)
 	end
 	local function dstAddr(): number
-		return cpu:linear("es", cpu.r[8], sz)
+		return cpu:linear("es", indexValue(7), sz)
+	end
+	local function readMem(addr: number): number
+		if sz == 4 then
+			return cpu:read32(addr)
+		elseif sz == 2 then
+			return cpu:read16(addr)
+		end
+		return cpu:read8(addr)
+	end
+	local function writeMem(addr: number, value: number)
+		if sz == 4 then
+			cpu:write32(addr, value)
+		elseif sz == 2 then
+			cpu:write16(addr, value)
+		else
+			cpu:write8(addr, value)
+		end
 	end
 
 	local function step()
 		if id == 0 then
-			if w then
-				mem:write16(dstAddr(), mem:read16(srcAddr()))
-			else
-				mem:write8(dstAddr(), mem:read8(srcAddr()))
-			end
-			cpu.r[7] = band(cpu.r[7] + d, 0xFFFF)
-			cpu.r[8] = band(cpu.r[8] + d, 0xFFFF)
+			writeMem(dstAddr(), readMem(srcAddr()))
+			setIndex(6, band(indexValue(6) + delta, mask))
+			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 1 then
-			local a = w and mem:read16(srcAddr()) or mem:read8(srcAddr())
-			local b = w and mem:read16(dstAddr()) or mem:read8(dstAddr())
-			doALU(cpu, 5, a, b, w)
-			cpu.r[7] = band(cpu.r[7] + d, 0xFFFF)
-			cpu.r[8] = band(cpu.r[8] + d, 0xFFFF)
+			doALU(cpu, 5, readMem(srcAddr()), readMem(dstAddr()), sz)
+			setIndex(6, band(indexValue(6) + delta, mask))
+			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 2 then
-			if w then
-				mem:write16(dstAddr(), cpu:rr(0))
-			else
-				mem:write8(dstAddr(), cpu:rb(0))
-			end
-			cpu.r[8] = band(cpu.r[8] + d, 0xFFFF)
+			writeMem(
+				dstAddr(),
+				if sz == 4 then cpu:rr32(0) elseif sz == 2 then cpu:rr(0) else cpu:rb(0)
+			)
+			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 3 then
-			if w then
-				cpu:wr(0, mem:read16(srcAddr()))
+			const value = readMem(srcAddr())
+			if sz == 4 then
+				cpu:wr32(0, value)
+			elseif sz == 2 then
+				cpu:wr(0, value)
 			else
-				cpu:wb(0, mem:read8(srcAddr()))
+				cpu:wb(0, value)
 			end
-			cpu.r[7] = band(cpu.r[7] + d, 0xFFFF)
+			setIndex(6, band(indexValue(6) + delta, mask))
 		else
-			local b = w and mem:read16(dstAddr()) or mem:read8(dstAddr())
-			doALU(cpu, 5, w and cpu:rr(0) or cpu:rb(0), b, w)
-			cpu.r[8] = band(cpu.r[8] + d, 0xFFFF)
+			const value = if sz == 4 then cpu:rr32(0) elseif sz == 2 then cpu:rr(0) else cpu:rb(0)
+			doALU(cpu, 5, value, readMem(dstAddr()), sz)
+			setIndex(7, band(indexValue(7) + delta, mask))
 		end
 	end
 
@@ -1479,12 +2061,12 @@ local function stringOp(cpu: any, id: number, w: boolean)
 		step()
 		return
 	end
-	local isCmp = (id == 1 or id == 4)
-	while cpu.r[2] ~= 0 do
+	const isCmp = (id == 1 or id == 4)
+	while indexValue(1) ~= 0 do
 		step()
-		cpu.r[2] = band(cpu.r[2] - 1, 0xFFFF)
+		setIndex(1, band(indexValue(1) - 1, mask))
 		if isCmp then
-			local zf = cpu:getF(ZF)
+			const zf = cpu:getF(ZF)
 			if cpu.rep == 1 and not zf then
 				break
 			end
@@ -1495,34 +2077,34 @@ local function stringOp(cpu: any, id: number, w: boolean)
 	end
 end
 H[0xA4] = function(cpu: any)
-	stringOp(cpu, 0, false)
+	stringOp(cpu, 0, 1)
 end
 H[0xA5] = function(cpu: any)
-	stringOp(cpu, 0, true)
+	stringOp(cpu, 0, if cpu.operand32 then 4 else 2)
 end
 H[0xA6] = function(cpu: any)
-	stringOp(cpu, 1, false)
+	stringOp(cpu, 1, 1)
 end
 H[0xA7] = function(cpu: any)
-	stringOp(cpu, 1, true)
+	stringOp(cpu, 1, if cpu.operand32 then 4 else 2)
 end
 H[0xAA] = function(cpu: any)
-	stringOp(cpu, 2, false)
+	stringOp(cpu, 2, 1)
 end
 H[0xAB] = function(cpu: any)
-	stringOp(cpu, 2, true)
+	stringOp(cpu, 2, if cpu.operand32 then 4 else 2)
 end
 H[0xAC] = function(cpu: any)
-	stringOp(cpu, 3, false)
+	stringOp(cpu, 3, 1)
 end
 H[0xAD] = function(cpu: any)
-	stringOp(cpu, 3, true)
+	stringOp(cpu, 3, if cpu.operand32 then 4 else 2)
 end
 H[0xAE] = function(cpu: any)
-	stringOp(cpu, 4, false)
+	stringOp(cpu, 4, 1)
 end
 H[0xAF] = function(cpu: any)
-	stringOp(cpu, 4, true)
+	stringOp(cpu, 4, if cpu.operand32 then 4 else 2)
 end
 
 H[0xA8] = function(cpu: any)
@@ -1537,30 +2119,47 @@ for i = 0, 7 do
 		cpu:wb(i, cpu:fetch8())
 	end
 	H[0xB8 + i] = function(cpu: any)
-		cpu:wr(i, cpu:fetch16())
+		if cpu.operand32 then
+			cpu:wr32(i, cpu:fetch32())
+		else
+			cpu:wr(i, cpu:fetch16())
+		end
 	end
 end
 
 H[0xC2] = function(cpu: any) -- RET imm16
-	local n = cpu:fetch16()
-	cpu.ip = cpu:pop16()
-	cpu.r[5] = band(cpu.r[5] + n, 0xFFFF)
+	const n = cpu:fetch16()
+	cpu.ip = if cpu.operand32 then cpu:pop32() else cpu:pop16()
+	const mask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
+	cpu:setSP(band(cpu:getSP() + n, mask))
 end
 H[0xC3] = function(cpu: any)
-	cpu.ip = cpu:pop16()
+	cpu.ip = if cpu.operand32 then cpu:pop32() else cpu:pop16()
 end
 
-H[0xC4] = function(cpu: any) -- LES r16, m32
+H[0xC4] = function(cpu: any) -- LES r, m16:16 / m16:32
 	const e = cpu:modrm()
-	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	cpu:wr(e.reg, cpu.mem:read16(addr))
-	cpu:loadSeg("es", cpu.mem:read16(addr + 2))
+	if cpu.operand32 then
+		const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
+		cpu:wr32(e.reg, cpu:read32(addr))
+		cpu:loadSeg("es", cpu:read16(addr + 4))
+	else
+		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
+		cpu:wr(e.reg, cpu:read16(addr))
+		cpu:loadSeg("es", cpu:read16(addr + 2))
+	end
 end
-H[0xC5] = function(cpu: any) -- LDS r16, m32
+H[0xC5] = function(cpu: any) -- LDS r, m16:16 / m16:32
 	const e = cpu:modrm()
-	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	cpu:wr(e.reg, cpu.mem:read16(addr))
-	cpu:loadSeg("ds", cpu.mem:read16(addr + 2))
+	if cpu.operand32 then
+		const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
+		cpu:wr32(e.reg, cpu:read32(addr))
+		cpu:loadSeg("ds", cpu:read16(addr + 4))
+	else
+		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
+		cpu:wr(e.reg, cpu:read16(addr))
+		cpu:loadSeg("ds", cpu:read16(addr + 2))
+	end
 end
 
 H[0xC6] = function(cpu: any)
@@ -1569,25 +2168,31 @@ H[0xC6] = function(cpu: any)
 end
 H[0xC7] = function(cpu: any)
 	local e = cpu:modrm()
-	cpu:writeRM16(e, cpu:fetch16())
+	if cpu.operand32 then
+		cpu:writeRM32(e, cpu:fetch32())
+	else
+		cpu:writeRM16(e, cpu:fetch16())
+	end
 end
 
 local function retf(cpu: any, extra: number)
-	const ip = cpu:pop16()
+	const width = if cpu.operand32 then 4 else 2
+	const ip = cpu:popValue(width)
 	const csSel = cpu:pop16()
 	local outerSp, outerSs
-	if band(cpu.cr0, 1) ~= 0 and band(csSel, 3) > band(cpu.cs, 3) then
-		outerSp = cpu:pop16()
+	if cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
+		outerSp = cpu:popValue(width)
 		outerSs = cpu:pop16()
 	end
 	cpu.ip = ip
 	cpu:loadSeg("cs", csSel)
 	if outerSs then
 		cpu:loadSeg("ss", outerSs)
-		cpu.r[5] = outerSp :: number
+		cpu:setSP(outerSp :: number)
 	end
 	if extra ~= 0 then
-		cpu.r[5] = band(cpu.r[5] + extra, 0xFFFF)
+		const mask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
+		cpu:setSP(band(cpu:getSP() + extra, mask))
 	end
 end
 
@@ -1609,37 +2214,51 @@ H[0xCE] = function(cpu: any)
 		cpu:interrupt(4, nil, true)
 	end
 end
-H[0xCF] = function(cpu: any) -- IRET
-	const ip = cpu:pop16()
+H[0xCF] = function(cpu: any) -- IRET / IRETD
+	const width = if cpu.operand32 then 4 else 2
+	const ip = if width == 4 then cpu:pop32() else cpu:pop16()
 	const csSel = cpu:pop16()
+	const newFlags = if width == 4 then cpu:pop32() else cpu:pop16()
 	const wasEnabled = cpu:getF(IFF)
-	const newFlags = cpu:pop16()
+	const targetV86 = band(newFlags, VM) ~= 0
 	local outerSp, outerSs
-	if band(cpu.cr0, 1) ~= 0 and band(csSel, 3) > band(cpu.cs, 3) then
-		outerSp = cpu:pop16()
+	local outerSegs: { number }? = nil
+	if targetV86 and cpu:cpl() == 0 then
+		outerSp = cpu:pop32()
+		outerSs = cpu:pop16()
+		outerSegs = { cpu:pop32(), cpu:pop32(), cpu:pop32(), cpu:pop32() } -- ES DS FS GS
+	elseif cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
+		outerSp = if width == 4 then cpu:pop32() else cpu:pop16()
 		outerSs = cpu:pop16()
 	end
+	cpu.flags = bor(band(newFlags, cpu.flagMask), cpu.fixedFlags)
 	cpu.ip = ip
 	cpu:loadSeg("cs", csSel)
-	cpu.flags = bor(band(newFlags, cpu.flagMask), cpu.fixedFlags)
+	if outerSegs then
+		cpu:loadSeg("es", outerSegs[1])
+		cpu:loadSeg("ds", outerSegs[2])
+		cpu:loadSeg("fs", outerSegs[3])
+		cpu:loadSeg("gs", outerSegs[4])
+	end
 	if outerSs then
 		cpu:loadSeg("ss", outerSs)
-		cpu.r[5] = outerSp :: number
+		cpu:setSP(outerSp :: number)
 	end
 	if not wasEnabled and cpu:getF(IFF) then
-		cpu.irqDelay = 1 -- 8086 interrupt shadow after IRET
+		cpu.irqDelay = 1 -- interrupt shadow after IRET
 	end
 end
 
 -- group 2: shifts/rotates
 local function group2(cpu: any, w: boolean, useCL: boolean)
 	local e = cpu:modrm()
-	local v = w and cpu:readRM16(e) or cpu:readRM8(e)
-	local cnt = useCL and cpu:rb(1) or 1
-	local res = doShift(cpu, e.reg, v, cnt, w)
+	const width = if not w then 8 elseif cpu.operand32 then 32 else 16
+	const v = if w then cpu:readRM(e) else cpu:readRM8(e)
+	const cnt = useCL and cpu:rb(1) or 1
+	const res = doShift(cpu, e.reg, v, cnt, width)
 	if cnt > 0 then
 		if w then
-			cpu:writeRM16(e, res)
+			cpu:writeRM(e, res)
 		else
 			cpu:writeRM8(e, res)
 		end
@@ -1663,12 +2282,13 @@ end
 -- C0/C1 as the undocumented RET/RET imm16 aliases.
 local function group2Imm(cpu: any, w: boolean)
 	local e = cpu:modrm()
-	local v = w and cpu:readRM16(e) or cpu:readRM8(e)
-	local cnt = cpu:fetch8()
-	local res = doShift(cpu, e.reg, v, cnt, w)
+	const width = if not w then 8 elseif cpu.operand32 then 32 else 16
+	const v = if w then cpu:readRM(e) else cpu:readRM8(e)
+	const cnt = cpu:fetch8()
+	const res = doShift(cpu, e.reg, v, cnt, width)
 	if cnt > 0 then
 		if w then
-			cpu:writeRM16(e, res)
+			cpu:writeRM(e, res)
 		else
 			cpu:writeRM8(e, res)
 		end
@@ -1704,7 +2324,7 @@ H[0xD6] = function(cpu: any)
 end -- SALC
 H[0xD7] = function(cpu: any) -- XLAT
 	const off = band(cpu.r[4] + cpu:rb(0), 0xFFFF)
-	cpu:wb(0, cpu.mem:read8(cpu:linear(cpu.osegReg or "ds", off, 1)))
+	cpu:wb(0, cpu:read8(cpu:linear(cpu.osegReg or "ds", off, 1)))
 end
 
 for i = 0, 7 do
@@ -1718,8 +2338,14 @@ local function loopCommon(cpu: any, mode: number)
 	if d >= 0x80 then
 		d -= 0x100
 	end
-	local cx = band(cpu.r[2] - 1, 0xFFFF)
-	cpu.r[2] = cx
+	const mask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
+	const old = if cpu.address32 then cpu:rr32(1) else cpu:rr(1)
+	const cx = band(old - 1, mask)
+	if cpu.address32 then
+		cpu:wr32(1, cx)
+	else
+		cpu:wr(1, cx)
+	end
 	local take
 	if mode == 0 then
 		take = cx ~= 0 and not cpu:getF(ZF)
@@ -1729,7 +2355,7 @@ local function loopCommon(cpu: any, mode: number)
 		take = cx ~= 0
 	end
 	if take then
-		cpu.ip = band(cpu.ip + d, 0xFFFF)
+		cpu.ip = band(cpu.ip + d, cpu:ipMask())
 	end
 end
 H[0xE0] = function(cpu: any)
@@ -1746,40 +2372,106 @@ H[0xE3] = function(cpu: any)
 	if d >= 0x80 then
 		d -= 0x100
 	end
-	if cpu.r[2] == 0 then
-		cpu.ip = band(cpu.ip + d, 0xFFFF)
+	const cx = if cpu.address32 then cpu:rr32(1) else cpu:rr(1)
+	if cx == 0 then
+		cpu.ip = band(cpu.ip + d, cpu:ipMask())
+	end
+end
+
+local function ioIn(cpu: any, port: number, width: number): number
+	if width == 4 then
+		const read32 = cpu.io.in32 :: ((p: number) -> number)?
+		if read32 then
+			return read32(port)
+		end
+		return bor(
+			cpu.io.in8(port),
+			lshift(cpu.io.in8(band(port + 1, 0xFFFF)), 8),
+			lshift(cpu.io.in8(band(port + 2, 0xFFFF)), 16),
+			lshift(cpu.io.in8(band(port + 3, 0xFFFF)), 24)
+		)
+	elseif width == 2 then
+		const read16 = cpu.io.in16 :: ((p: number) -> number)?
+		if read16 then
+			return read16(port)
+		end
+		return bor(cpu.io.in8(port), lshift(cpu.io.in8(band(port + 1, 0xFFFF)), 8))
+	end
+	return cpu.io.in8(port)
+end
+
+local function ioOut(cpu: any, port: number, width: number, value: number)
+	if width == 4 then
+		const write32 = cpu.io.out32 :: ((p: number, v: number) -> ())?
+		if write32 then
+			write32(port, value)
+			return
+		end
+		cpu.io.out8(port, band(value, 0xFF))
+		cpu.io.out8(band(port + 1, 0xFFFF), band(rshift(value, 8), 0xFF))
+		cpu.io.out8(band(port + 2, 0xFFFF), band(rshift(value, 16), 0xFF))
+		cpu.io.out8(band(port + 3, 0xFFFF), band(rshift(value, 24), 0xFF))
+	elseif width == 2 then
+		const write16 = cpu.io.out16 :: ((p: number, v: number) -> ())?
+		if write16 then
+			write16(port, value)
+			return
+		end
+		cpu.io.out8(port, band(value, 0xFF))
+		cpu.io.out8(band(port + 1, 0xFFFF), band(rshift(value, 8), 0xFF))
+	else
+		cpu.io.out8(port, band(value, 0xFF))
 	end
 end
 
 H[0xE4] = function(cpu: any)
 	local p = cpu:fetch8()
-	cpu:wb(0, cpu.io.in8(p))
+	cpu:wb(0, ioIn(cpu, p, 1))
 end
 H[0xE5] = function(cpu: any)
 	local p = cpu:fetch8()
-	cpu:wr(0, bor(cpu.io.in8(p), lshift(cpu.io.in8(band(p + 1, 0xFFFF)), 8)))
+	const width = if cpu.operand32 then 4 else 2
+	if width == 4 then
+		cpu:wr32(0, ioIn(cpu, p, 4))
+	else
+		cpu:wr(0, ioIn(cpu, p, 2))
+	end
 end
 H[0xE6] = function(cpu: any)
 	local p = cpu:fetch8()
-	cpu.io.out8(p, cpu:rb(0))
+	ioOut(cpu, p, 1, cpu:rb(0))
 end
 H[0xE7] = function(cpu: any)
 	local p = cpu:fetch8()
-	cpu.io.out8(p, cpu:rb(0))
-	cpu.io.out8(band(p + 1, 0xFFFF), band(rshift(cpu:rr(0), 8), 0xFF))
+	if cpu.operand32 then
+		ioOut(cpu, p, 4, cpu:rr32(0))
+	else
+		ioOut(cpu, p, 2, cpu:rr(0))
+	end
 end
 
-H[0xE8] = function(cpu: any) -- CALL rel16
-	local d = cpu:fetch16()
-	cpu:push16(cpu.ip)
-	cpu.ip = band(cpu.ip + sign16(d), 0xFFFF)
+H[0xE8] = function(cpu: any) -- CALL rel16/32
+	if cpu.operand32 then
+		const d = sign32(cpu:fetch32())
+		cpu:push32(cpu.ip)
+		cpu.ip = band(cpu.ip + d, cpu:ipMask())
+	else
+		const d = cpu:fetch16()
+		cpu:push16(cpu.ip)
+		cpu.ip = band(cpu.ip + sign16(d), cpu:ipMask())
+	end
 end
-H[0xE9] = function(cpu: any)
-	local d = cpu:fetch16()
-	cpu.ip = band(cpu.ip + sign16(d), 0xFFFF)
+H[0xE9] = function(cpu: any) -- JMP rel16/32
+	if cpu.operand32 then
+		const d = sign32(cpu:fetch32())
+		cpu.ip = band(cpu.ip + d, cpu:ipMask())
+	else
+		const d = cpu:fetch16()
+		cpu.ip = band(cpu.ip + sign16(d), cpu:ipMask())
+	end
 end
 H[0xEA] = function(cpu: any)
-	const ip = cpu:fetch16()
+	const ip = if cpu.operand32 then cpu:fetch32() else cpu:fetch16()
 	const cs = cpu:fetch16()
 	cpu:farCall(cs, ip, false)
 end
@@ -1788,23 +2480,30 @@ H[0xEB] = function(cpu: any)
 	if d >= 0x80 then
 		d -= 0x100
 	end
-	cpu.ip = band(cpu.ip + d, 0xFFFF)
+	cpu.ip = band(cpu.ip + d, cpu:ipMask())
 end
 
 H[0xEC] = function(cpu: any)
-	cpu:wb(0, cpu.io.in8(cpu.r[3]))
+	cpu:wb(0, ioIn(cpu, cpu.r[3], 1))
 end
 H[0xED] = function(cpu: any)
-	local p = cpu.r[3]
-	cpu:wr(0, bor(cpu.io.in8(p), lshift(cpu.io.in8(band(p + 1, 0xFFFF)), 8)))
+	const p = cpu.r[3]
+	if cpu.operand32 then
+		cpu:wr32(0, ioIn(cpu, p, 4))
+	else
+		cpu:wr(0, ioIn(cpu, p, 2))
+	end
 end
 H[0xEE] = function(cpu: any)
-	cpu.io.out8(cpu.r[3], cpu:rb(0))
+	ioOut(cpu, cpu.r[3], 1, cpu:rb(0))
 end
 H[0xEF] = function(cpu: any)
-	local p = cpu.r[3]
-	cpu.io.out8(p, cpu:rb(0))
-	cpu.io.out8(band(p + 1, 0xFFFF), band(rshift(cpu:rr(0), 8), 0xFF))
+	const p = cpu.r[3]
+	if cpu.operand32 then
+		ioOut(cpu, p, 4, cpu:rr32(0))
+	else
+		ioOut(cpu, p, 2, cpu:rr(0))
+	end
 end
 
 H[0xF1] = function() end -- undefined on 8086, treat as NOP
@@ -1815,54 +2514,143 @@ H[0xF5] = function(cpu: any)
 	cpu.flags = bxor(cpu.flags, CF)
 end
 
+-- Exact 32x32 -> 64 multiply for the 486 MUL/IMUL path (the host is
+-- double-precision, so splitting into 16-bit limbs keeps every partial exact).
+local function mul32(a: number, b: number): (number, number)
+	const a0 = band(a, 0xFFFF)
+	const a1 = rshift(a, 16)
+	const b0 = band(b, 0xFFFF)
+	const b1 = rshift(b, 16)
+	const p0 = a0 * b0
+	const p1 = a0 * b1
+	const p2 = a1 * b0
+	const p3 = a1 * b1
+	const mid = math.floor(p0 / 0x10000) + band(p1, 0xFFFF) + band(p2, 0xFFFF)
+	const lo = band(band(p0, 0xFFFF) + band(mid, 0xFFFF) * 0x10000, 0xFFFFFFFF)
+	const hi = band(
+		p3 + math.floor(p1 / 0x10000) + math.floor(p2 / 0x10000) + math.floor(mid / 0x10000),
+		0xFFFFFFFF
+	)
+	return lo, hi
+end
+
+local function negate64(lo: number, hi: number): (number, number)
+	const newLo = band(0 - lo, 0xFFFFFFFF)
+	const newHi = band(bnot(hi) + (if newLo == 0 then 1 else 0), 0xFFFFFFFF)
+	return newLo, newHi
+end
+
+-- Restoring division of a 64-bit unsigned value by a 32-bit divisor. Returns
+-- (quotient, remainder); callers check the overflow conditions first.
+local function div64by32(hi: number, lo: number, divisor: number): (number, number)
+	local remainder = 0
+	local quotient = 0
+	for bit = 63, 0, -1 do
+		const sourceBit = if bit >= 32
+			then band(rshift(hi, bit - 32), 1)
+			else band(rshift(lo, bit), 1)
+		remainder = remainder * 2 + sourceBit
+		if remainder >= divisor then
+			remainder -= divisor
+			quotient = quotient * 2 + 1
+		else
+			quotient = quotient * 2
+		end
+	end
+	return quotient, remainder
+end
+
 local function group3(cpu: any, w: boolean)
-	local e = cpu:modrm()
-	local op = e.reg
+	const e = cpu:modrm()
+	const op = e.reg
+	const width = if not w then 8 elseif cpu.operand32 then 32 else 16
+	const readOperand = function(): number
+		if width == 32 then
+			return cpu:readRM32(e)
+		elseif width == 16 then
+			return cpu:readRM16(e)
+		end
+		return cpu:readRM8(e)
+	end
+	const writeOperand = function(value: number)
+		if width == 32 then
+			cpu:writeRM32(e, value)
+		elseif width == 16 then
+			cpu:writeRM16(e, value)
+		else
+			cpu:writeRM8(e, value)
+		end
+	end
 	if op == 0 or op == 1 then
-		local a = w and cpu:readRM16(e) or cpu:readRM8(e)
-		local b = w and cpu:fetch16() or cpu:fetch8()
-		doALU(cpu, 4, a, b, w)
+		const a = readOperand()
+		const b = if width == 32
+			then cpu:fetch32()
+			elseif width == 16 then cpu:fetch16()
+			else cpu:fetch8()
+		doALU(cpu, 4, a, b, width)
 	elseif op == 2 then
-		local res = band(bnot(w and cpu:readRM16(e) or cpu:readRM8(e)), w and 0xFFFF or 0xFF)
-		if w then
-			cpu:writeRM16(e, res)
-		else
-			cpu:writeRM8(e, res)
-		end
+		writeOperand(
+			band(
+				bnot(readOperand()),
+				if width == 32 then 0xFFFFFFFF elseif width == 16 then 0xFFFF else 0xFF
+			)
+		)
 	elseif op == 3 then
-		local a = w and cpu:readRM16(e) or cpu:readRM8(e)
-		local res = doALU(cpu, 5, 0, a, w)
-		if w then
-			cpu:writeRM16(e, res)
-		else
-			cpu:writeRM8(e, res)
-		end
+		writeOperand(doALU(cpu, 5, 0, readOperand(), width))
 	elseif op == 4 then
-		if w then
-			local prod = cpu:rr(0) * cpu:readRM16(e)
+		if width == 32 then
+			const lo, hi = mul32(cpu:rr32(0), cpu:readRM32(e))
+			cpu:wr32(0, lo)
+			cpu:wr32(2, hi)
+			cpu:setbits(bor(CF, OFLG), hi ~= 0)
+		elseif width == 16 then
+			const prod = cpu:rr(0) * cpu:readRM16(e)
 			cpu:wr(0, band(prod, 0xFFFF))
 			cpu:wr(2, band(rshift(prod, 16), 0xFFFF))
 			cpu:setbits(bor(CF, OFLG), prod > 0xFFFF)
 		else
-			local prod = cpu:rb(0) * cpu:readRM8(e)
+			const prod = cpu:rb(0) * cpu:readRM8(e)
 			cpu:wr(0, band(prod, 0xFFFF))
 			cpu:setbits(bor(CF, OFLG), prod > 0xFF)
 		end
 	elseif op == 5 then
-		if w then
-			local prod = sign16(cpu:rr(0)) * sign16(cpu:readRM16(e))
+		if width == 32 then
+			const a = sign32(cpu:rr32(0))
+			const b = sign32(cpu:readRM32(e))
+			const negative = (a < 0) ~= (b < 0)
+			local lo, hi = mul32(math.abs(a), math.abs(b))
+			if negative then
+				lo, hi = negate64(lo, hi)
+			end
+			cpu:wr32(0, lo)
+			cpu:wr32(2, hi)
+			const signExt = if band(lo, 0x80000000) ~= 0 then 0xFFFFFFFF else 0
+			cpu:setbits(bor(CF, OFLG), hi ~= signExt)
+		elseif width == 16 then
+			const prod = sign16(cpu:rr(0)) * sign16(cpu:readRM16(e))
 			cpu:wr(0, band(prod, 0xFFFF))
 			cpu:wr(2, band(truncDiv(prod, 0x10000), 0xFFFF))
 			cpu:setbits(bor(CF, OFLG), prod < -0x8000 or prod > 0x7FFF)
 		else
-			local prod = sign8(cpu:rb(0)) * sign8(cpu:readRM8(e))
+			const prod = sign8(cpu:rb(0)) * sign8(cpu:readRM8(e))
 			cpu:wr(0, band(prod, 0xFFFF))
 			cpu:setbits(bor(CF, OFLG), prod < -0x80 or prod > 0x7F)
 		end
 	elseif op == 6 then
-		if w then
-			local dv = cpu:readRM16(e)
-			local n = bor(lshift(cpu:rr(2), 16), cpu:rr(0))
+		if width == 32 then
+			const dv = cpu:readRM32(e)
+			const hi = cpu:rr32(2)
+			const lo = cpu:rr32(0)
+			if dv == 0 or hi >= dv then
+				cpu:interrupt(0)
+				return
+			end
+			const q, rem = div64by32(hi, lo, dv)
+			cpu:wr32(0, q)
+			cpu:wr32(2, rem)
+		elseif width == 16 then
+			const dv = cpu:readRM16(e)
+			const n = bor(lshift(cpu:rr(2), 16), cpu:rr(0))
 			if dv == 0 or n >= lshift(dv, 16) then
 				cpu:interrupt(0)
 				return
@@ -1870,8 +2658,8 @@ local function group3(cpu: any, w: boolean)
 			cpu:wr(0, math.floor(n / dv))
 			cpu:wr(2, n % dv)
 		else
-			local dv = cpu:readRM8(e)
-			local n = cpu:rr(0)
+			const dv = cpu:readRM8(e)
+			const n = cpu:rr(0)
 			if dv == 0 or n >= lshift(dv, 8) then
 				cpu:interrupt(0)
 				return
@@ -1880,15 +2668,51 @@ local function group3(cpu: any, w: boolean)
 			cpu:wb(4, n % dv)
 		end
 	else
-		if w then
-			local dv = sign16(cpu:readRM16(e))
+		if width == 32 then
+			const dvSigned = sign32(cpu:readRM32(e))
+			if dvSigned == 0 then
+				cpu:interrupt(0)
+				return
+			end
+			const nHi = cpu:rr32(2)
+			const nLo = cpu:rr32(0)
+			const negativeN = band(nHi, 0x80000000) ~= 0
+			const negativeD = dvSigned < 0
+			local magLo, magHi = nLo, nHi
+			if negativeN then
+				magLo, magHi = negate64(nLo, nHi)
+			end
+			const magDiv = math.abs(dvSigned)
+			if magHi >= magDiv then
+				cpu:interrupt(0)
+				return
+			end
+			local q, rem = div64by32(magHi, magLo, magDiv)
+			const negativeQ = negativeN ~= negativeD
+			if negativeQ then
+				if q > 0x80000000 then
+					cpu:interrupt(0)
+					return
+				end
+				q = band(0 - q, 0xFFFFFFFF)
+				if rem ~= 0 then
+					rem = band(0 - rem, 0xFFFFFFFF)
+				end
+			elseif q > 0x7FFFFFFF then
+				cpu:interrupt(0)
+				return
+			end
+			cpu:wr32(0, q)
+			cpu:wr32(2, rem)
+		elseif width == 16 then
+			const dv = sign16(cpu:readRM16(e))
 			if dv == 0 then
 				cpu:interrupt(0)
 				return
 			end
-			local n = sign32(bor(lshift(cpu:rr(2), 16), cpu:rr(0)))
-			local q = truncDiv(n, dv)
-			local r = n - q * dv
+			const n = sign32(bor(lshift(cpu:rr(2), 16), cpu:rr(0)))
+			const q = truncDiv(n, dv)
+			const r = n - q * dv
 			if q < -0x8000 or q > 0x7FFF then
 				cpu:interrupt(0)
 				return
@@ -1896,14 +2720,14 @@ local function group3(cpu: any, w: boolean)
 			cpu:wr(0, band(q, 0xFFFF))
 			cpu:wr(2, band(r, 0xFFFF))
 		else
-			local dv = sign8(cpu:readRM8(e))
+			const dv = sign8(cpu:readRM8(e))
 			if dv == 0 then
 				cpu:interrupt(0)
 				return
 			end
-			local n = sign16(cpu:rr(0))
-			local q = truncDiv(n, dv)
-			local r = n - q * dv
+			const n = sign16(cpu:rr(0))
+			const q = truncDiv(n, dv)
+			const r = n - q * dv
 			if q < -0x80 or q > 0x7F then
 				cpu:interrupt(0)
 				return
@@ -1957,29 +2781,38 @@ end
 H[0xFF] = function(cpu: any)
 	local e = cpu:modrm()
 	local reg = e.reg
+	const width = if cpu.operand32 then 4 else 2
 	if reg == 0 or reg == 1 then
-		local cf = cpu:getF(CF)
-		local res = doALU(cpu, reg == 0 and 0 or 5, cpu:readRM16(e), 1, true)
-		cpu:writeRM16(e, res)
+		const cf = cpu:getF(CF)
+		const res = doALU(cpu, reg == 0 and 0 or 5, cpu:readRM(e), 1, if width == 4 then 32 else 16)
+		cpu:writeRM(e, res)
 		cpu:setbits(CF, cf)
 	elseif reg == 2 then
-		local t = cpu:readRM16(e)
-		cpu:push16(cpu.ip)
-		cpu.ip = t
+		const target = cpu:readRM(e)
+		if width == 4 then
+			cpu:push32(cpu.ip)
+		else
+			cpu:push16(cpu.ip)
+		end
+		cpu.ip = target
 	elseif reg == 3 then
-		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-		const ip = cpu.mem:read16(addr)
-		const cs = cpu.mem:read16(addr + 2)
+		const addr = cpu:linear(e.seg :: string, e.off :: number, width + 2)
+		const ip = if width == 4 then cpu:read32(addr) else cpu:read16(addr)
+		const cs = cpu:read16(addr + width)
 		cpu:farCall(cs, ip, true)
 	elseif reg == 4 then
-		cpu.ip = cpu:readRM16(e)
+		cpu.ip = cpu:readRM(e)
 	elseif reg == 5 then
-		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-		const cs = cpu.mem:read16(addr + 2)
-		const ip = cpu.mem:read16(addr)
+		const addr = cpu:linear(e.seg :: string, e.off :: number, width + 2)
+		const cs = cpu:read16(addr + width)
+		const ip = if width == 4 then cpu:read32(addr) else cpu:read16(addr)
 		cpu:farCall(cs, ip, false)
 	elseif reg == 6 then
-		cpu:push16(cpu:readRM16(e))
+		if width == 4 then
+			cpu:push32(cpu:readRM32(e))
+		else
+			cpu:push16(cpu:readRM16(e))
+		end
 	else
 		error(("bad FF /7 at %04X:%04X"):format(cpu.cs, cpu.ip - 2))
 	end
@@ -1992,24 +2825,30 @@ end
 -- guest, so implement the 80186 group-2 immediate forms instead.
 -- On 286+ C8/C9 are ENTER/LEAVE, so pick at runtime to keep 3.0a identical.
 local function enter(cpu: any)
-	const size = cpu:fetch16()
+	const size = if cpu.operand32 then cpu:fetch16() else cpu:fetch16()
 	const nesting = band(cpu:fetch8(), 0x1F)
-	cpu:push16(cpu.r[6]) -- BP
-	const frame = cpu.r[5]
+	const width = if cpu.operand32 then 4 else 2
+	const mask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
+	cpu:pushValue(cpu:rrw(5), width) -- BP
+	const frame = cpu:getSP()
 	if nesting > 0 then
-		local bp = cpu.r[6]
+		local bp = cpu:rrw(5)
 		for _ = 1, nesting - 1 do
-			bp = band(bp - 2, 0xFFFF)
-			cpu:push16(cpu.mem:read16(cpu:linear("ss", bp, 2)))
+			bp = band(bp - width, mask)
+			const value = if width == 4
+				then cpu:read32(cpu:linear("ss", bp, 4))
+				else cpu:read16(cpu:linear("ss", bp, 2))
+			cpu:pushValue(value, width)
 		end
-		cpu:push16(frame)
+		cpu:pushValue(frame, width)
 	end
-	cpu.r[6] = frame
-	cpu.r[5] = band(cpu.r[5] - size, 0xFFFF)
+	cpu:wrw(5, frame)
+	cpu:setSP(band(cpu:getSP() - size, mask))
 end
 local function leave(cpu: any)
-	cpu.r[5] = cpu.r[6]
-	cpu.r[6] = cpu:pop16()
+	const width = if cpu.operand32 then 4 else 2
+	cpu:setSP(cpu:rrw(5))
+	cpu:wrw(5, cpu:popValue(width))
 end
 local function jccShort(cpu: any, index: number)
 	local d = cpu:fetch8()
@@ -2017,7 +2856,7 @@ local function jccShort(cpu: any, index: number)
 		d -= 0x100
 	end
 	if COND[index + 1](cpu.flags) then
-		cpu.ip = band(cpu.ip + d, 0xFFFF)
+		cpu.ip = band(cpu.ip + d, cpu:ipMask())
 	end
 end
 H[0xC8] = function(cpu: any)
@@ -2041,22 +2880,24 @@ end
 
 -- 80186+ instructions that collide with the 8086 Jcc aliases at 60-6F.
 local function pusha(cpu: any)
-	const sp = cpu.r[5]
+	const width = if cpu.operand32 then 4 else 2
+	const sp = cpu:rrw(4)
 	for _, i in ipairs({ 0, 1, 2, 3 }) do
-		cpu:push16(cpu:rr(i))
+		cpu:pushValue(cpu:rrw(i), width)
 	end
-	cpu:push16(sp)
+	cpu:pushValue(sp, width)
 	for _, i in ipairs({ 5, 6, 7 }) do
-		cpu:push16(cpu:rr(i))
+		cpu:pushValue(cpu:rrw(i), width)
 	end
 end
 local function popa(cpu: any)
+	const width = if cpu.operand32 then 4 else 2
 	for _, i in ipairs({ 7, 6, 5 }) do
-		cpu:wr(i, cpu:pop16())
+		cpu:wrw(i, cpu:popValue(width))
 	end
-	cpu:pop16() -- discard saved SP
+	cpu:popValue(width) -- discard saved SP
 	for _, i in ipairs({ 3, 2, 1, 0 }) do
-		cpu:wr(i, cpu:pop16())
+		cpu:wrw(i, cpu:popValue(width))
 	end
 end
 local function bound(cpu: any)
@@ -2066,14 +2907,22 @@ local function bound(cpu: any)
 	end
 	const index = sign16(cpu:rr(e.reg))
 	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	const lower = sign16(cpu.mem:read16(addr))
-	const upper = sign16(cpu.mem:read16(addr + 2))
+	const lower = sign16(cpu:read16(addr))
+	const upper = sign16(cpu:read16(addr + 2))
 	if index < lower or index > upper then
 		cpu:interrupt(5)
 	end
 end
 local function imulImm(cpu: any, wide: boolean)
 	const e = cpu:modrm()
+	if cpu.operand32 then
+		const src = sign32(cpu:readRM32(e))
+		const imm = if wide then sign32(cpu:fetch32()) else sign8(cpu:fetch8())
+		const product = src * imm
+		cpu:wr32(e.reg, band(product, 0xFFFFFFFF))
+		cpu:setbits(bor(CF, OFLG), product < -0x80000000 or product > 0x7FFFFFFF)
+		return
+	end
 	const src = cpu:readRM16(e)
 	const imm = if wide then sign16(cpu:fetch16()) else sign8(cpu:fetch8())
 	const product = sign16(src) * imm
@@ -2104,7 +2953,11 @@ H[0x62] = function(cpu: any)
 end
 H[0x68] = function(cpu: any)
 	if cpu.level >= CPU_286 then
-		cpu:push16(cpu:fetch16())
+		if cpu.operand32 then
+			cpu:push32(cpu:fetch32())
+		else
+			cpu:push16(cpu:fetch16())
+		end
 	else
 		jccShort(cpu, 8)
 	end
@@ -2118,7 +2971,11 @@ H[0x69] = function(cpu: any)
 end
 H[0x6A] = function(cpu: any)
 	if cpu.level >= CPU_286 then
-		cpu:push16(band(sign8(cpu:fetch8()), 0xFFFF)) -- sign-extend imm8
+		if cpu.operand32 then
+			cpu:push32(band(sign8(cpu:fetch8()), 0xFFFFFFFF))
+		else
+			cpu:push16(band(sign8(cpu:fetch8()), 0xFFFF))
+		end
 	else
 		jccShort(cpu, 10)
 	end
@@ -2132,39 +2989,62 @@ H[0x6B] = function(cpu: any)
 end
 
 local function ioString(cpu: any, wide: boolean, input: boolean)
-	const size = if wide then 2 else 1
+	const size = if wide then (if cpu.operand32 then 4 else 2) else 1
 	const delta = if cpu:getF(DFF) then -size else size
+	const addrMask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
 	const port = cpu.r[3]
 	local count = 1
 	if cpu.rep then
-		count = cpu.r[2]
+		count = if cpu.address32 then cpu:rr32(1) else cpu:rr(1)
 		if count == 0 then
 			return
 		end
 	end
+	if input and size >= 1 then
+		cpu.lastIoStringDest = if cpu.address32 then cpu:rr32(7) else cpu:rr(7)
+		cpu.lastIoStringCount = count
+		cpu.lastIoStringPort = port
+	end
 	for _ = 1, count do
+		const di = if cpu.address32 then cpu:rr32(7) else cpu:rr(7)
+		const si = if cpu.address32 then cpu:rr32(6) else cpu:rr(6)
 		if input then
-			const low = cpu.io.in8(port)
-			if wide then
-				const value = bor(low, lshift(cpu.io.in8(band(port + 1, 0xFFFF)), 8))
-				cpu.mem:write16(cpu:linear("es", cpu.r[8], 2), value)
+			const dst = cpu:linear("es", di, size)
+			if size == 4 then
+				cpu:write32(dst, ioIn(cpu, port, 4))
+			elseif size == 2 then
+				cpu:write16(dst, ioIn(cpu, port, 2))
 			else
-				cpu.mem:write8(cpu:linear("es", cpu.r[8], 1), low)
+				cpu:write8(dst, ioIn(cpu, port, 1))
 			end
-			cpu.r[8] = band(cpu.r[8] + delta, 0xFFFF)
+			const next = band(di + delta, addrMask)
+			if cpu.address32 then
+				cpu:wr32(7, next)
+			else
+				cpu:wr(7, next)
+			end
 		else
-			const src = cpu:linear(cpu.osegReg or "ds", cpu.r[7], size)
-			if wide then
-				const value = cpu.mem:read16(src)
-				cpu.io.out8(port, band(value, 0xFF))
-				cpu.io.out8(band(port + 1, 0xFFFF), band(rshift(value, 8), 0xFF))
+			const src = cpu:linear(cpu.osegReg or "ds", si, size)
+			if size == 4 then
+				ioOut(cpu, port, 4, cpu:read32(src))
+			elseif size == 2 then
+				ioOut(cpu, port, 2, cpu:read16(src))
 			else
-				cpu.io.out8(port, cpu.mem:read8(src))
+				ioOut(cpu, port, 1, cpu:read8(src))
 			end
-			cpu.r[7] = band(cpu.r[7] + delta, 0xFFFF)
+			const next = band(si + delta, addrMask)
+			if cpu.address32 then
+				cpu:wr32(6, next)
+			else
+				cpu:wr(6, next)
+			end
 		end
 		if cpu.rep then
-			cpu.r[2] = band(cpu.r[2] - 1, 0xFFFF)
+			if cpu.address32 then
+				cpu:wr32(1, band(cpu:rr32(1) - 1, 0xFFFFFFFF))
+			else
+				cpu:wr(1, band(cpu:rr(1) - 1, 0xFFFF))
+			end
 		end
 	end
 end
@@ -2206,12 +3086,12 @@ local function loadTable(cpu: any, e: ModRM, which: string)
 		error("LGDT/LIDT with register operand")
 	end
 	const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
-	const limit = cpu.mem:read16(addr)
+	const limit = cpu:read16(addr)
 	local base
 	if cpu.operand32 then
-		base = bor(cpu.mem:read16(addr + 2), lshift(cpu.mem:read16(addr + 4), 16))
+		base = bor(cpu:read16(addr + 2), lshift(cpu:read16(addr + 4), 16))
 	else
-		base = bor(cpu.mem:read16(addr + 2), lshift(cpu.mem:read8(addr + 4), 16))
+		base = bor(cpu:read16(addr + 2), lshift(cpu:read8(addr + 4), 16))
 	end
 	if which == "gdt" then
 		cpu.gdtr = { base = base, limit = limit }
@@ -2233,7 +3113,7 @@ local function loadTable(cpu: any, e: ModRM, which: string)
 			-- once the compact table is live, keep it (real mode ignores IDTR).
 			if cpu.idtr.limit ~= 0x3F then
 				const compactBase = cpu.idtr.base + 0x470
-				const compactAccess = cpu.mem:read8(compactBase + 3 * 8 + 5)
+				const compactAccess = cpu:read8(compactBase + 3 * 8 + 5)
 				const compactType = band(compactAccess, 0x1F)
 				if
 					compactType == 0x06
@@ -2242,11 +3122,11 @@ local function loadTable(cpu: any, e: ModRM, which: string)
 					or compactType == 0x0F
 				then
 					const gate = compactBase + 3 * 8
-					cpu.mem:write16(gate, 0x0C63) -- real switch helper at 0078:0C63
-					cpu.mem:write16(gate + 2, 0x0078)
-					cpu.mem:write8(gate + 4, 0)
-					cpu.mem:write8(gate + 5, bor(band(compactAccess, 0x60), 0x86))
-					cpu.mem:write16(gate + 6, 0)
+					cpu:write16(gate, 0x0C63) -- real switch helper at 0078:0C63
+					cpu:write16(gate + 2, 0x0078)
+					cpu:write8(gate + 4, 0)
+					cpu:write8(gate + 5, bor(band(compactAccess, 0x60), 0x86))
+					cpu:write16(gate + 6, 0)
 					cpu.idtr = { base = compactBase, limit = 0x3F }
 				end
 			end
@@ -2262,13 +3142,13 @@ local function storeTable(cpu: any, e: ModRM, which: string)
 	end
 	const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
 	const table = if which == "gdt" then cpu.gdtr else cpu.idtr
-	cpu.mem:write16(addr, table.limit)
-	cpu.mem:write16(addr + 2, band(table.base, 0xFFFF))
+	cpu:write16(addr, table.limit)
+	cpu:write16(addr + 2, band(table.base, 0xFFFF))
 	if cpu.operand32 then
-		cpu.mem:write16(addr + 4, band(rshift(table.base, 16), 0xFFFF))
+		cpu:write16(addr + 4, band(rshift(table.base, 16), 0xFFFF))
 	else
-		cpu.mem:write8(addr + 4, band(rshift(table.base, 16), 0xFF))
-		cpu.mem:write8(addr + 5, 0)
+		cpu:write8(addr + 4, band(rshift(table.base, 16), 0xFF))
+		cpu:write8(addr + 5, 0)
 	end
 end
 
@@ -2307,7 +3187,13 @@ local function movControl(cpu: any, op: number)
 	if op == 0x20 or op == 0x21 then
 		local value: number = 0
 		if op == 0x20 then
-			value = if e.reg == 0 then cpu.cr0 else (cpu.cr[e.reg] or 0)
+			if e.reg == 0 then
+				value = cpu.cr0
+			elseif e.reg == 3 then
+				value = cpu.cr3
+			else
+				value = cpu.cr[e.reg] or 0
+			end
 		else
 			value = cpu.dr[e.reg] or 0
 		end
@@ -2321,6 +3207,10 @@ local function movControl(cpu: any, op: number)
 		if op == 0x22 then
 			if e.reg == 0 then
 				cpu.cr0 = value
+				cpu.cr[0] = value
+			elseif e.reg == 3 then
+				cpu.cr3 = value
+				cpu.cr[3] = value
 			else
 				cpu.cr[e.reg] = value
 			end
@@ -2348,7 +3238,7 @@ local function bitScan(cpu: any, reverse: boolean)
 	const e = cpu:modrm()
 	const width = if cpu.operand32 then 32 else 16
 	const mask = if width == 32 then 0xFFFFFFFF else 0xFFFF
-	const value = band(if width == 32 then cpu:rr32(e.rm) else cpu:readRM16(e), mask)
+	const value = band(if width == 32 then cpu:readRM32(e) else cpu:readRM16(e), mask)
 	if value == 0 then
 		cpu:setbits(ZF, true)
 		return
@@ -2388,29 +3278,25 @@ local function bitTest(cpu: any, operation: number, immediate: boolean?)
 	else
 		index = band(if width == 32 then cpu:rr32(e.reg) else cpu:rr(e.reg), width - 1)
 	end
-	local value = if width == 32 then cpu:rr32(e.rm) else cpu:readRM16(e)
+	const value = if width == 32 then cpu:readRM32(e) else cpu:readRM16(e)
 	const bit = band(rshift(value, index), 1)
 	cpu:setbits(CF, bit ~= 0)
 	if op == 0 then
 		return
 	end
+	local updated
 	if op == 1 then
-		value = bor(value, lshift(1, index))
-	elseif operation == 2 then
-		value = band(value, bnot(lshift(1, index)))
+		updated = bor(value, lshift(1, index))
+	elseif op == 2 then
+		updated = band(value, bnot(lshift(1, index)))
 	else
-		value = bxor(value, lshift(1, index))
+		updated = bxor(value, lshift(1, index))
 	end
 	if width == 32 then
-		cpu:wr32(e.rm, value)
+		cpu:writeRM32(e, updated)
 	else
-		cpu:wr(e.rm, band(value, 0xFFFF))
+		cpu:writeRM16(e, band(updated, 0xFFFF))
 	end
-end
-
-local function fetch32(cpu: any): number
-	const lo = cpu:fetch16()
-	return bor(lo, lshift(cpu:fetch16(), 16))
 end
 
 local H0F: { [number]: (cpu: any) -> () } = {}
@@ -2435,9 +3321,9 @@ H0F[0x00] = function(cpu: any)
 			cpu.ldtrLimit = desc.limit
 		else
 			const tssType = band(desc.access, 0x1F)
-			if tssType ~= 0x01 and tssType ~= 0x03 then
+			if tssType ~= 0x01 and tssType ~= 0x03 and tssType ~= 0x09 and tssType ~= 0x0B then
 				error(
-					("#GP: LTR selector %04X is not a 286 TSS (access %02X)"):format(
+					("#GP: LTR selector %04X is not a TSS (access %02X)"):format(
 						selector,
 						desc.access
 					)
@@ -2446,11 +3332,12 @@ H0F[0x00] = function(cpu: any)
 			cpu.tr = selector
 			cpu.trBase = desc.base
 			cpu.trLimit = desc.limit
+			cpu.tr32 = tssType == 0x09 or tssType == 0x0B
 			-- Mark the TSS busy like LTR does (bit 1 of the type field).
 			const addr = if band(selector, 4) ~= 0
 				then cpu.ldtrBase + band(selector, 0xFFF8)
 				else cpu.gdtr.base + band(selector, 0xFFF8)
-			cpu.mem:write8(addr + 5, bor(desc.access, 2))
+			cpu:write8(addr + 5, bor(desc.access, 2))
 		end
 	elseif e.reg == 4 or e.reg == 5 then
 		-- VERR/VERW: set ZF when the selector denotes a readable (reg 4) or
@@ -2505,13 +3392,14 @@ H0F[0x01] = function(cpu: any)
 				cpu:wr(e.rm, band(cpu.cr0, 0xFFFF))
 			end
 		else
-			cpu.mem:write16(cpu:linear(e.seg :: string, e.off :: number, 2), band(cpu.cr0, 0xFFFF))
+			cpu:write16(cpu:linear(e.seg :: string, e.off :: number, 2), band(cpu.cr0, 0xFFFF))
 		end
 	elseif reg == 6 then
 		const value = cpu:readRM16(e)
 		cpu.cr0 = bor(band(cpu.cr0, 0xFFFF0000), band(value, 0xFFFF))
+		cpu.cr[0] = cpu.cr0
 	elseif reg == 7 then
-		-- INVLPG: no paging model yet
+		-- INVLPG: this core has no TLB, so flushing is a no-op.
 	else
 		error("bad 0F 01 /" .. reg)
 	end
@@ -2524,8 +3412,11 @@ H0F[0x03] = function(cpu: any)
 	larLsl(cpu, false)
 end
 H0F[0x06] = function(cpu: any)
-	cpu.cr0 = band(cpu.cr0, bnot(8))
+	cpu.cr0 = band(cpu.cr0, bnot(CR0_TS))
+	cpu.cr[0] = cpu.cr0
 end
+H0F[0x08] = function() end -- INVD (no caches in this model)
+H0F[0x09] = function() end -- WBINVD
 H0F[0x20] = function(cpu: any)
 	if cpu.level < CPU_386 then
 		error("#UD: MOV CR0 requires 386")
@@ -2552,35 +3443,45 @@ H0F[0x23] = function(cpu: any)
 end
 
 H0F[0xA0] = function(cpu: any)
-	cpu:push16(cpu.fs)
+	if cpu.operand32 then
+		cpu:push32(cpu.fs)
+	else
+		cpu:push16(cpu.fs)
+	end
 end
 H0F[0xA1] = function(cpu: any)
-	cpu:loadSeg("fs", cpu:pop16())
+	cpu:loadSeg("fs", if cpu.operand32 then cpu:pop32() else cpu:pop16())
 end
 H0F[0xA8] = function(cpu: any)
-	cpu:push16(cpu.gs)
+	if cpu.operand32 then
+		cpu:push32(cpu.gs)
+	else
+		cpu:push16(cpu.gs)
+	end
 end
 H0F[0xA9] = function(cpu: any)
-	cpu:loadSeg("gs", cpu:pop16())
+	cpu:loadSeg("gs", if cpu.operand32 then cpu:pop32() else cpu:pop16())
 end
 
+local function loadFarSeg(cpu: any, e: ModRM, reg: string)
+	const width = if cpu.operand32 then 6 else 4
+	const addr = cpu:linear(e.seg :: string, e.off :: number, width)
+	if cpu.operand32 then
+		cpu:wr32(e.reg, cpu:read32(addr))
+		cpu:loadSeg(reg, cpu:read16(addr + 4))
+	else
+		cpu:wr(e.reg, cpu:read16(addr))
+		cpu:loadSeg(reg, cpu:read16(addr + 2))
+	end
+end
 H0F[0xB2] = function(cpu: any)
-	const e = cpu:modrm()
-	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	cpu:wr(e.reg, cpu.mem:read16(addr))
-	cpu:loadSeg("ss", cpu.mem:read16(addr + 2))
+	loadFarSeg(cpu, cpu:modrm(), "ss")
 end
 H0F[0xB4] = function(cpu: any)
-	const e = cpu:modrm()
-	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	cpu:wr(e.reg, cpu.mem:read16(addr))
-	cpu:loadSeg("fs", cpu.mem:read16(addr + 2))
+	loadFarSeg(cpu, cpu:modrm(), "fs")
 end
 H0F[0xB5] = function(cpu: any)
-	const e = cpu:modrm()
-	const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-	cpu:wr(e.reg, cpu.mem:read16(addr))
-	cpu:loadSeg("gs", cpu.mem:read16(addr + 2))
+	loadFarSeg(cpu, cpu:modrm(), "gs")
 end
 
 H0F[0xB6] = function(cpu: any)
@@ -2604,9 +3505,14 @@ end
 
 for index = 0, 15 do
 	H0F[0x80 + index] = function(cpu: any)
-		const d = fetch32(cpu)
+		local delta
+		if cpu.operand32 then
+			delta = sign32(cpu:fetch32())
+		else
+			delta = sign16(cpu:fetch16())
+		end
 		if COND[index + 1](cpu.flags) then
-			cpu.ip = band(cpu.ip + sign32(d), 0xFFFF)
+			cpu.ip = band(cpu.ip + delta, cpu:ipMask())
 		end
 	end
 	H0F[0x90 + index] = function(cpu: any)
@@ -2631,6 +3537,101 @@ H0F[0xBA] = function(cpu: any)
 	bitTest(cpu, 0, true) -- /4..7 applied inside after decoding modrm
 end
 
+H0F[0x0B] = function(cpu: any): ()
+	error(("#UD: UD2 at %04X:%08X"):format(cpu.cs, cpu.ip))
+end
+H0F[0xA2] = function(cpu: any) -- CPUID
+	const leaf = cpu:rr32(0)
+	if leaf == 0 then
+		cpu:wr32(0, 1)
+		cpu:wr32(3, 0x756E6547) -- "Genu"
+		cpu:wr32(2, 0x49656E69) -- "ineI"
+		cpu:wr32(1, 0x6C65746E) -- "ntel"
+	elseif leaf == 1 then
+		cpu:wr32(0, 0x00000400) -- 486-class signature
+		cpu:wr32(3, 0)
+		cpu:wr32(1, 0)
+		cpu:wr32(2, 0)
+	elseif leaf == 0x80000000 then
+		cpu:wr32(0, 0x80000000)
+		cpu:wr32(3, 0)
+		cpu:wr32(1, 0)
+		cpu:wr32(2, 0)
+	else
+		cpu:wr32(0, 0)
+		cpu:wr32(3, 0)
+		cpu:wr32(1, 0)
+		cpu:wr32(2, 0)
+	end
+end
+
+H0F[0x31] = function(cpu: any) -- RDTSC (monotonic instruction count)
+	cpu:wr32(0, band(cpu.tsc or 0, 0xFFFFFFFF))
+	cpu:wr32(2, band(rshift(cpu.tsc or 0, 32), 0xFFFFFFFF))
+end
+
+H0F[0xAF] = function(cpu: any) -- IMUL r, r/m
+	const e = cpu:modrm()
+	if cpu.operand32 then
+		const a = sign32(cpu:rr32(e.reg))
+		const b = sign32(cpu:readRM32(e))
+		const product = a * b
+		cpu:wr32(e.reg, band(product, 0xFFFFFFFF))
+		cpu:setbits(bor(CF, OFLG), product < -0x80000000 or product > 0x7FFFFFFF)
+	else
+		const a = sign16(cpu:rr(e.reg))
+		const b = sign16(cpu:readRM16(e))
+		const product = a * b
+		cpu:wr(e.reg, band(product, 0xFFFF))
+		cpu:setbits(bor(CF, OFLG), product < -0x8000 or product > 0x7FFF)
+	end
+end
+
+local function doubleShift(cpu: any, left: boolean, immediate: boolean)
+	const e = cpu:modrm()
+	const width = if cpu.operand32 then 32 else 16
+	const mask = if width == 32 then 0xFFFFFFFF else 0xFFFF
+	const bits = width
+	const count = if immediate then cpu:fetch8() else band(cpu:rb(1), 0x1F)
+	local dest = if width == 32 then cpu:readRM32(e) else cpu:readRM16(e)
+	const src = cpu:rrw(e.reg)
+	const cnt = band(count, 0x1F)
+	if cnt == 0 then
+		return
+	end
+	const old = dest
+	const shift = cnt % bits
+	if shift == 0 then
+		cpu:setbits(CF, band(dest, 1) ~= 0)
+		return
+	end
+	if left then
+		dest = band(bor(band(lshift(old, shift), mask), rshift(src, bits - shift)), mask)
+		cpu:setbits(CF, band(rshift(old, bits - shift), 1) ~= 0)
+	else
+		dest = band(bor(rshift(old, shift), lshift(src, bits - shift)), mask)
+		cpu:setbits(CF, band(rshift(old, shift - 1), 1) ~= 0)
+	end
+	if width == 32 then
+		cpu:writeRM32(e, dest)
+	else
+		cpu:writeRM16(e, dest)
+	end
+	cpu:setSZP(dest, width)
+end
+H0F[0xA4] = function(cpu: any)
+	doubleShift(cpu, true, true)
+end
+H0F[0xA5] = function(cpu: any)
+	doubleShift(cpu, true, false)
+end
+H0F[0xAC] = function(cpu: any)
+	doubleShift(cpu, false, true)
+end
+H0F[0xAD] = function(cpu: any)
+	doubleShift(cpu, false, false)
+end
+
 H0F[0xC0] = function(cpu: any)
 	const e = cpu:modrm()
 	const a = cpu:readRM8(e)
@@ -2640,10 +3641,25 @@ H0F[0xC0] = function(cpu: any)
 end
 H0F[0xC1] = function(cpu: any)
 	const e = cpu:modrm()
-	const a = cpu:readRM16(e)
-	const b = cpu:rr(e.reg)
-	cpu:writeRM16(e, band(a + b, 0xFFFF))
-	cpu:wr(e.reg, a)
+	const a = cpu:readRM(e)
+	const b = cpu:rrw(e.reg)
+	cpu:writeRM(e, band(a + b, if cpu.operand32 then 0xFFFFFFFF else 0xFFFF))
+	cpu:wrw(e.reg, a)
+end
+
+for index = 0, 7 do
+	H0F[0xC8 + index] = function(cpu: any)
+		const value = cpu:rr32(index)
+		cpu:wr32(
+			index,
+			bor(
+				lshift(band(value, 0xFF), 24),
+				lshift(band(value, 0xFF00), 8),
+				rshift(band(value, 0xFF0000), 8),
+				rshift(band(value, 0xFF000000), 24)
+			)
+		)
+	end
 end
 
 H[0x0F] = function(cpu: any)
@@ -2679,6 +3695,7 @@ end
 --     the stub's IRET pops the frame the guest built; write the handler's flags
 --     into that frame, exactly like a real DOS/BIOS ISR does.
 function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boolean?)
+	self.intCounts[n] = (self.intCounts[n] or 0) + 1
 	if band(self.cr0, 1) ~= 0 then
 		if self.idtr.limit == 0 then
 			-- No usable IDT: #GP -> double fault -> triple fault/reset. DOSX
@@ -2729,7 +3746,7 @@ function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boole
 	end
 end
 
-function Cpu.step(self: Cpu): number
+function Cpu.executeStep(self: Cpu): number
 	if self.halted then
 		return 0
 	end
@@ -2739,8 +3756,10 @@ function Cpu.step(self: Cpu): number
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil
-	self.operand32 = false
-	self.address32 = false
+	self.baseOperand32 = self.level >= CPU_386 and self:code32()
+	self.baseAddress32 = self.baseOperand32
+	self.operand32 = self.baseOperand32
+	self.address32 = self.baseAddress32
 	local op = 0
 	while true do
 		op = self:fetch8()
@@ -2756,10 +3775,12 @@ function Cpu.step(self: Cpu): number
 			self.oseg, self.osegReg = self.fs, "fs"
 		elseif op == 0x65 and self.level >= CPU_386 then
 			self.oseg, self.osegReg = self.gs, "gs"
+		elseif op == 0x66 and self.level >= CPU_386 then
+			self.operand32 = not self.operand32
 		elseif op == 0x66 and self.level >= CPU_286 then
 			self.operand32 = true
 		elseif op == 0x67 and self.level >= CPU_386 then
-			self.address32 = true
+			self.address32 = not self.address32
 		elseif op == 0xF2 then
 			self.rep = 2
 		elseif op == 0xF3 then
@@ -2773,10 +3794,10 @@ function Cpu.step(self: Cpu): number
 	const h = H[op] :: ((cpu: any) -> ())?
 	if not h then
 		error(
-			("unimplemented opcode %02X at %04X:%04X"):format(
+			("unimplemented opcode %02X at %04X:%08X"):format(
 				op,
 				self.cs,
-				band(self.ip - 1, 0xFFFF)
+				band(self.ip - 1, self:ipMask())
 			)
 		)
 	end
@@ -2784,7 +3805,27 @@ function Cpu.step(self: Cpu): number
 	self.oseg = nil
 	self.osegReg = nil
 	self.rep = nil
+	self.tsc = (self.tsc or 0) + 1
 	return 1
+end
+
+-- Paging faults unwind the faulting instruction after #PF has been delivered.
+-- The pcall is only paid while CR0.PG is set; real-mode/PM bring-up stays fast.
+function Cpu.step(self: Cpu): number
+	if not self:pagingEnabled() then
+		return (self :: any):executeStep()
+	end
+	const ok, result = pcall(function()
+		return (self :: any):executeStep()
+	end)
+	self.aborting = false
+	if not ok then
+		if result == ABORT_INSTRUCTION then
+			return 1
+		end
+		error(result, 0)
+	end
+	return result :: number
 end
 
 function Cpu.dump(self: Cpu): { [string]: number }
