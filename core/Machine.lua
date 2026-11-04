@@ -20,6 +20,8 @@ const CMOS_DATA = 0x71
 const PORT_A20 = 0x92
 const PCI_ADDRESS = 0xCF8
 const PCI_DATA = 0xCFC
+-- The ISP side must not share the guest NIC's default MAC (52:54:00:12:34:56).
+const DEFAULT_ISP_MAC = "52:54:00:12:34:57"
 
 export type Deps = {
 	Memory: any,
@@ -32,9 +34,18 @@ export type Deps = {
 	Ide: any?,
 	Kbc: any?,
 	Fpu: any?,
+	Ne2000: any?,
+	Isp: any?,
 	Xms: any?,
 	Uart: any?,
 	Lpt: any?,
+}
+
+export type NetworkConfig = {
+	mac: string?,
+	ispMac: string?,
+	ip: string?,
+	enabled: boolean?,
 }
 
 export type Config = {
@@ -47,6 +58,7 @@ export type Config = {
 	vgaRom: buffer?,
 	hdd: buffer?,
 	cdrom: buffer?,
+	network: NetworkConfig?,
 }
 
 export type Machine = typeof(setmetatable(
@@ -61,6 +73,8 @@ export type Machine = typeof(setmetatable(
 		ide: any?,
 		kbc: any?,
 		fpu: any?,
+		ne2000: any?,
+		isp: any?,
 		xms: any?,
 		uart: any?,
 		lpt: any?,
@@ -109,7 +123,7 @@ end
 -- Bochs/QEMU stdvga-compatible PCI VGA device at 00:02.0. The VGA BIOS option
 -- ROM at C0000 is what installs INT 10h; the legacy VGA register model lives in
 -- core/Vga.lua. BAR0 is intentionally absent (no linear framebuffer yet).
-local function vgaDword(offset: number): number
+local function vgaDword(machine: any, offset: number): number
 	if offset == 0x00 then
 		return 0x11111234 -- Bochs VGA, vendor 1234 device 1111
 	elseif offset == 0x04 then
@@ -118,6 +132,8 @@ local function vgaDword(offset: number): number
 		return 0x03000001 -- VGA controller, revision 1
 	elseif offset == 0x0C then
 		return 0x00000000 -- type 0 header
+	elseif offset == 0x10 then
+		return machine.vgaBar
 	elseif offset == 0x2C then
 		return 0x11001AF4
 	elseif offset == 0x30 then
@@ -164,7 +180,7 @@ local function pciRead(machine: any, address: number): number
 		elseif device == 1 and functionNumber == 0 then
 			return ideDword(offset)
 		elseif device == 2 and functionNumber == 0 then
-			return vgaDword(offset)
+			return vgaDword(machine, offset)
 		end
 	end
 	return 0xFFFFFFFF
@@ -178,6 +194,15 @@ local function pciWrite(machine: any, address: number, value: number)
 	const device = band(rshift(address, 11), 0x1F)
 	const functionNumber = band(rshift(address, 8), 0x07)
 	const offset = band(address, 0xFC)
+	if bus == 0 and device == 2 and functionNumber == 0 and offset == 0x10 then
+		-- VGA LFB BAR0: 4 MiB memory BAR at 0xE0000000.
+		if value == 0xFFFFFFFF then
+			machine.vgaBar = 0xFFC00000
+		else
+			machine.vgaBar = band(value, 0xFFC00000)
+		end
+		return
+	end
 	if bus ~= 0 or device ~= 0 or functionNumber ~= 0 then
 		return
 	end
@@ -220,6 +245,21 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	if deps.Ide then
 		self.ide = deps.Ide.new({ hdd = cfg.hdd, cdrom = cfg.cdrom })
 	end
+	const network = cfg.network
+	const networkEnabled = network == nil or network.enabled ~= false
+	if deps.Ne2000 and networkEnabled then
+		self.ne2000 = deps.Ne2000.new({ mac = if network then network.mac else nil })
+	end
+	if deps.Isp and networkEnabled then
+		local ispMac = if network then network.ispMac else nil
+		if not ispMac and self.ne2000 then
+			ispMac = DEFAULT_ISP_MAC
+		end
+		self.isp = deps.Isp.new({ mac = ispMac, ip = if network then network.ip else nil })
+		if self.ne2000 then
+			self.isp:attach(self.ne2000)
+		end
+	end
 	if deps.Kbc then
 		self.kbc = deps.Kbc.new()
 	end
@@ -233,6 +273,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		self.lpt = deps.Lpt.new(cfg.printer)
 	end
 	self.pciAddress = 0
+	self.vgaBar = 0xE0000000
 	self.hostConfig = {}
 	self.lastInPort = 0
 	self.lastOutPort = 0
@@ -259,6 +300,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
 				return self.ide:in8(port)
+			end
+			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
+				return self.ne2000:in8(port)
+			end
+			if self.vga and (port == 0x1CE or port == 0x1CF or port == 0x1D0) then
+				return self.vga:in8(port)
 			end
 			if self.vga and port >= 0x3C0 and port <= 0x3DF then
 				return self.vga:in8(port)
@@ -304,6 +351,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.ide and port == 0x1F0 then
 				return self.ide:in16(port)
 			end
+			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
+				return self.ne2000:in16(port)
+			end
+			if self.vga and (port == 0x1CE or port == 0x1CF) then
+				return self.vga:in16(port)
+			end
 			if port == PCI_ADDRESS then
 				return band(self.pciAddress, 0xFFFF)
 			elseif port == PCI_DATA then
@@ -342,6 +395,14 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
 				self.ide:out8(port, value)
+				return
+			end
+			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
+				self.ne2000:out8(port, value)
+				return
+			end
+			if self.vga and (port == 0x1CE or port == 0x1CF or port == 0x1D0) then
+				self.vga:out8(port, value)
 				return
 			end
 			if self.vga and port >= 0x3C0 and port <= 0x3DF then
@@ -398,6 +459,14 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.ide and port == 0x1F0 then
 				self.ide:out16(port, value)
+				return
+			end
+			if self.ne2000 and port >= self.ne2000.base and port <= self.ne2000.base + 0x1F then
+				self.ne2000:out16(port, value)
+				return
+			end
+			if self.vga and (port == 0x1CE or port == 0x1CF) then
+				self.vga:out16(port, value)
 				return
 			end
 			if port == PCI_ADDRESS then
@@ -458,6 +527,9 @@ function Machine.reset(self: Machine)
 	if self.ide then
 		self.ide:reset()
 	end
+	if self.ne2000 then
+		self.ne2000:reset()
+	end
 	if self.kbc then
 		self.kbc:reset()
 	end
@@ -504,6 +576,9 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			end
 			if self.ide and self.ide:takeIrq() then
 				self.pic:raise(14)
+			end
+			if self.ne2000 and self.ne2000:takeIrq() then
+				self.pic:raise(10)
 			end
 		end
 		if self.cpu.halted then

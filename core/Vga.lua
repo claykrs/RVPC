@@ -30,7 +30,44 @@ const TEXT_CELL_WIDTH = 8
 const TEXT_CELL_HEIGHT = 16
 const RGBA_BLACK = 0xFF000000
 
-type ModeKind = "text" | "planar" | "linear"
+-- Bochs/QEMU DISPI VBE interface. The LFB sits at the Bochs default physical
+-- address (also what SeaVGABIOS uses when the PCI BAR is zero) and is 4 MiB so
+-- 1024x768x32 plus virtual-row headroom fit. Memory must route this range to
+-- Vga:read8/write8 (and ideally read16/32/write16/32).
+const VBE_FRAMEBUFFER_BASE = 0xE0000000
+const VBE_VRAM_SIZE = 0x400000
+const VBE_FRAMEBUFFER_END = VBE_FRAMEBUFFER_BASE + VBE_VRAM_SIZE
+const VBE_MAX_XRES = 2560
+const VBE_MAX_YRES = 1600
+const VBE_MAX_BPP = 32
+
+const VBE_DISPI_INDEX_ID = 0x0
+const VBE_DISPI_INDEX_XRES = 0x1
+const VBE_DISPI_INDEX_YRES = 0x2
+const VBE_DISPI_INDEX_BPP = 0x3
+const VBE_DISPI_INDEX_ENABLE = 0x4
+const VBE_DISPI_INDEX_BANK = 0x5
+const VBE_DISPI_INDEX_VIRT_WIDTH = 0x6
+const VBE_DISPI_INDEX_VIRT_HEIGHT = 0x7
+const VBE_DISPI_INDEX_X_OFFSET = 0x8
+const VBE_DISPI_INDEX_Y_OFFSET = 0x9
+const VBE_DISPI_INDEX_VIDEO_MEMORY_64K = 0xA
+
+const VBE_DISPI_ID0 = 0xB0C0
+const VBE_DISPI_ID1 = 0xB0C1
+const VBE_DISPI_ID2 = 0xB0C2
+const VBE_DISPI_ID3 = 0xB0C3
+const VBE_DISPI_ID4 = 0xB0C4
+const VBE_DISPI_ID5 = 0xB0C5
+
+const VBE_DISPI_DISABLED = 0x00
+const VBE_DISPI_ENABLED = 0x01
+const VBE_DISPI_GETCAPS = 0x02
+const VBE_DISPI_8BIT_DAC = 0x20
+const VBE_DISPI_LFB_ENABLED = 0x40
+const VBE_DISPI_NOCLEARMEM = 0x80
+
+type ModeKind = "text" | "planar" | "linear" | "vbe"
 
 export type ModeInfo = {
 	mode: number,
@@ -39,6 +76,14 @@ export type ModeInfo = {
 	height: number,
 	rowBytes: number,
 	bitsPerPixel: number,
+	label: string,
+}
+
+export type VbeMode = {
+	mode: number,
+	width: number,
+	height: number,
+	bpp: number,
 	label: string,
 }
 
@@ -101,6 +146,34 @@ const MODES: { [number]: ModeInfo } = {
 		label = "320x200x256 linear",
 	},
 }
+
+-- Standard VBE mode numbers from SeaVGABIOS's svga_modes table. The LFB bit
+-- (0x4000) is supplied by the caller when setting a linear mode.
+const VBE_MODES: { VbeMode } = {
+	{ mode = 0x101, width = 640, height = 480, bpp = 8, label = "640x480x8" },
+	{ mode = 0x111, width = 640, height = 480, bpp = 16, label = "640x480x16" },
+	{ mode = 0x142, width = 640, height = 480, bpp = 32, label = "640x480x32" },
+	{ mode = 0x103, width = 800, height = 600, bpp = 8, label = "800x600x8" },
+	{ mode = 0x114, width = 800, height = 600, bpp = 16, label = "800x600x16" },
+	{ mode = 0x143, width = 800, height = 600, bpp = 32, label = "800x600x32" },
+	{ mode = 0x105, width = 1024, height = 768, bpp = 8, label = "1024x768x8" },
+	{ mode = 0x117, width = 1024, height = 768, bpp = 16, label = "1024x768x16" },
+	{ mode = 0x144, width = 1024, height = 768, bpp = 32, label = "1024x768x32" },
+}
+
+const VBE_MODE_BY_NUMBER: { [number]: VbeMode } = {}
+for _, vbeMode in VBE_MODES do
+	VBE_MODE_BY_NUMBER[vbeMode.mode] = vbeMode
+end
+
+local function vbeMatchMode(width: number, height: number, bpp: number): number?
+	for _, vbeMode in VBE_MODES do
+		if vbeMode.width == width and vbeMode.height == height and vbeMode.bpp == bpp then
+			return vbeMode.mode
+		end
+	end
+	return nil
+end
 
 -- Canonical VGA BIOS register loads. CRTC 0x11 keeps bit 7 set, which is the
 -- real write-protect state for CRTC 0..7; guests unlock by writing bit 7 = 0.
@@ -453,8 +526,63 @@ Vga.APERTURE_BASE = APERTURE_BASE
 Vga.APERTURE_SIZE = APERTURE_SIZE
 Vga.PLANE_SIZE = PLANE_SIZE
 
--- Cheap routing predicate for a future Memory/CPU aperture hook.
+Vga.VBE_FRAMEBUFFER_BASE = VBE_FRAMEBUFFER_BASE
+Vga.FRAMEBUFFER_BASE = VBE_FRAMEBUFFER_BASE
+Vga.VBE_VRAM_SIZE = VBE_VRAM_SIZE
+Vga.FRAMEBUFFER_SIZE = VBE_VRAM_SIZE
+Vga.VBE_FRAMEBUFFER_END = VBE_FRAMEBUFFER_END
+Vga.FRAMEBUFFER_END = VBE_FRAMEBUFFER_END
+Vga.VBE_MAX_XRES = VBE_MAX_XRES
+Vga.VBE_MAX_YRES = VBE_MAX_YRES
+Vga.VBE_MAX_BPP = VBE_MAX_BPP
+Vga.VBE_MODES = VBE_MODES
+
+Vga.VBE_DISPI_INDEX = {
+	ID = VBE_DISPI_INDEX_ID,
+	XRES = VBE_DISPI_INDEX_XRES,
+	YRES = VBE_DISPI_INDEX_YRES,
+	BPP = VBE_DISPI_INDEX_BPP,
+	ENABLE = VBE_DISPI_INDEX_ENABLE,
+	BANK = VBE_DISPI_INDEX_BANK,
+	VIRT_WIDTH = VBE_DISPI_INDEX_VIRT_WIDTH,
+	VIRT_HEIGHT = VBE_DISPI_INDEX_VIRT_HEIGHT,
+	X_OFFSET = VBE_DISPI_INDEX_X_OFFSET,
+	Y_OFFSET = VBE_DISPI_INDEX_Y_OFFSET,
+	VIDEO_MEMORY_64K = VBE_DISPI_INDEX_VIDEO_MEMORY_64K,
+}
+
+Vga.VBE_DISPI_INDEX_ID = VBE_DISPI_INDEX_ID
+Vga.VBE_DISPI_INDEX_XRES = VBE_DISPI_INDEX_XRES
+Vga.VBE_DISPI_INDEX_YRES = VBE_DISPI_INDEX_YRES
+Vga.VBE_DISPI_INDEX_BPP = VBE_DISPI_INDEX_BPP
+Vga.VBE_DISPI_INDEX_ENABLE = VBE_DISPI_INDEX_ENABLE
+Vga.VBE_DISPI_INDEX_BANK = VBE_DISPI_INDEX_BANK
+Vga.VBE_DISPI_INDEX_VIRT_WIDTH = VBE_DISPI_INDEX_VIRT_WIDTH
+Vga.VBE_DISPI_INDEX_VIRT_HEIGHT = VBE_DISPI_INDEX_VIRT_HEIGHT
+Vga.VBE_DISPI_INDEX_X_OFFSET = VBE_DISPI_INDEX_X_OFFSET
+Vga.VBE_DISPI_INDEX_Y_OFFSET = VBE_DISPI_INDEX_Y_OFFSET
+Vga.VBE_DISPI_INDEX_VIDEO_MEMORY_64K = VBE_DISPI_INDEX_VIDEO_MEMORY_64K
+
+Vga.VBE_DISPI_ID0 = VBE_DISPI_ID0
+Vga.VBE_DISPI_ID1 = VBE_DISPI_ID1
+Vga.VBE_DISPI_ID2 = VBE_DISPI_ID2
+Vga.VBE_DISPI_ID3 = VBE_DISPI_ID3
+Vga.VBE_DISPI_ID4 = VBE_DISPI_ID4
+Vga.VBE_DISPI_ID5 = VBE_DISPI_ID5
+Vga.VBE_DISPI_DISABLED = VBE_DISPI_DISABLED
+Vga.VBE_DISPI_ENABLED = VBE_DISPI_ENABLED
+Vga.VBE_DISPI_GETCAPS = VBE_DISPI_GETCAPS
+Vga.VBE_DISPI_8BIT_DAC = VBE_DISPI_8BIT_DAC
+Vga.VBE_DISPI_LFB_ENABLED = VBE_DISPI_LFB_ENABLED
+Vga.VBE_DISPI_NOCLEARMEM = VBE_DISPI_NOCLEARMEM
+Vga.VBE_DISPI_LFB_PHYSICAL_ADDRESS = VBE_FRAMEBUFFER_BASE
+
+-- Cheap routing predicate for a Memory/CPU aperture hook. The low VGA aperture
+-- is still reported for compatibility; the high LFB is the SVGA addition.
 function Vga.containsAddress(addr: number): boolean
+	if addr >= VBE_FRAMEBUFFER_BASE and addr < VBE_FRAMEBUFFER_END then
+		return true
+	end
 	const physical = band(addr, 0xFFFFF)
 	return physical >= APERTURE_BASE and physical < APERTURE_BASE + APERTURE_SIZE
 end
@@ -499,6 +627,14 @@ export type Vga = typeof(setmetatable(
 		paletteRGBA: { number },
 		color16RGBA: { number },
 		latched: { [number]: number },
+		vbeIndex: number,
+		vbeRegs: { number },
+		vbeFramebuffer: buffer,
+		vbeLineOffset: number,
+		vbeStartAddr: number,
+		vbeBankOffset: number,
+		vbeInfo: ModeInfo?,
+		dac8: boolean,
 	},
 	Vga
 ))
@@ -548,6 +684,15 @@ function Vga.new(mem: Memory): Vga
 	self.paletteRGBA = table.create(256, 0) :: { number }
 	self.color16RGBA = table.create(16, 0) :: { number }
 	self.latched = {}
+	self.vbeIndex = VBE_DISPI_INDEX_ID
+	self.vbeRegs = table.create(16, 0) :: { number }
+	self.vbeRegs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5
+	self.vbeFramebuffer = buffer.create(VBE_VRAM_SIZE)
+	self.vbeLineOffset = 0
+	self.vbeStartAddr = 0
+	self.vbeBankOffset = 0
+	self.vbeInfo = nil
+	self.dac8 = false
 	self:resetPalette()
 	self:setMode(0x03)
 	return self
@@ -560,6 +705,10 @@ function Vga.mode(self: Vga): number
 end
 
 function Vga.modeInfo(self: Vga): ModeInfo
+	const vbe = self.vbeInfo
+	if vbe then
+		return vbe
+	end
 	return self.info
 end
 
@@ -575,7 +724,28 @@ function Vga.stride(self: Vga): number
 	return self.widthPx * 4
 end
 
+function Vga.isVbeEnabled(self: Vga): boolean
+	return band(self.vbeRegs[VBE_DISPI_INDEX_ENABLE], VBE_DISPI_ENABLED) ~= 0
+end
+
+function Vga.vbeModes(): { VbeMode }
+	return VBE_MODES
+end
+
+-- Accepts either Vga.vbeModeInfo(mode) or vga:vbeModeInfo(mode); the second form
+-- checks the first argument so both call styles work in tests.
+function Vga.vbeModeInfo(mode: any, maybeMode: number?): VbeMode?
+	const value = if maybeMode ~= nil then maybeMode else mode
+	if type(value) ~= "number" then
+		return nil
+	end
+	return VBE_MODE_BY_NUMBER[band(value, 0x3FFF)]
+end
+
 function Vga.isTextMode(self: Vga): boolean
+	if self:isVbeEnabled() then
+		return false
+	end
 	return self.info.kind == "text"
 end
 
@@ -588,6 +758,11 @@ function Vga.isOddEven(self: Vga): boolean
 end
 
 function Vga.isBlanked(self: Vga): boolean
+	if self:isVbeEnabled() then
+		-- VBE owns its own enable state; the legacy sequencer/misc blanking
+		-- bits are not used by the DISPI path.
+		return false
+	end
 	return not self.attrPas or band(self.seq[1], 0x20) ~= 0 or band(self.misc, 0x02) == 0
 end
 
@@ -614,7 +789,234 @@ function Vga.readDac(self: Vga, index: number): (number, number, number)
 		buffer.readu8(self.dac, base + 2)
 end
 
+-- ----------------------------------------------------------- Bochs VBE DISPI
+
+function Vga.vbeReadRegister(self: Vga, index: number): number
+	if index == VBE_DISPI_INDEX_VIDEO_MEMORY_64K then
+		return math.floor(VBE_VRAM_SIZE / 0x10000)
+	end
+	return band(self.vbeRegs[index] or 0, 0xFFFF)
+end
+
+function Vga.vbeReadData(self: Vga): number
+	const index = self.vbeIndex
+	if band(self.vbeRegs[VBE_DISPI_INDEX_ENABLE], VBE_DISPI_GETCAPS) ~= 0 then
+		if index == VBE_DISPI_INDEX_XRES then
+			return VBE_MAX_XRES
+		elseif index == VBE_DISPI_INDEX_YRES then
+			return VBE_MAX_YRES
+		elseif index == VBE_DISPI_INDEX_BPP then
+			return VBE_MAX_BPP
+		end
+	end
+	return self:vbeReadRegister(index)
+end
+
+-- Clamp the DISPI registers the way QEMU does. XRES is eight-pixel aligned,
+-- VIRT_WIDTH cannot be narrower than the visible width, and the visible
+-- rectangle must fit in VRAM after the start offset.
+function Vga.fixupVbe(self: Vga)
+	if not self:isVbeEnabled() then
+		return
+	end
+	const regs = self.vbeRegs
+	local bpp = regs[VBE_DISPI_INDEX_BPP]
+	if bpp == 15 or bpp == 16 or bpp == 24 or bpp == 32 or bpp == 8 or bpp == 4 then
+		-- supported
+	else
+		bpp = 8
+		regs[VBE_DISPI_INDEX_BPP] = bpp
+	end
+
+	local xres = band(regs[VBE_DISPI_INDEX_XRES], 0xFFF8)
+	if xres == 0 then
+		xres = 8
+	elseif xres > VBE_MAX_XRES then
+		xres = VBE_MAX_XRES
+	end
+	regs[VBE_DISPI_INDEX_XRES] = xres
+
+	local virtWidth = band(regs[VBE_DISPI_INDEX_VIRT_WIDTH], 0xFFF8)
+	if virtWidth > VBE_MAX_XRES then
+		virtWidth = VBE_MAX_XRES
+	end
+	if virtWidth < xres then
+		virtWidth = xres
+	end
+	regs[VBE_DISPI_INDEX_VIRT_WIDTH] = virtWidth
+
+	local rowBytes: number
+	if bpp == 4 then
+		rowBytes = math.ceil(virtWidth / 2)
+	elseif bpp == 15 or bpp == 16 then
+		rowBytes = virtWidth * 2
+	elseif bpp == 24 then
+		rowBytes = virtWidth * 3
+	elseif bpp == 32 then
+		rowBytes = virtWidth * 4
+	else
+		rowBytes = virtWidth
+	end
+
+	const maxY = math.max(1, math.floor(VBE_VRAM_SIZE / rowBytes))
+	local yres = regs[VBE_DISPI_INDEX_YRES]
+	if yres == 0 then
+		yres = 1
+	elseif yres > VBE_MAX_YRES then
+		yres = VBE_MAX_YRES
+	end
+	if yres > maxY then
+		yres = maxY
+	end
+	regs[VBE_DISPI_INDEX_YRES] = yres
+	regs[VBE_DISPI_INDEX_VIRT_HEIGHT] = maxY
+
+	local xOffset = math.min(regs[VBE_DISPI_INDEX_X_OFFSET], VBE_MAX_XRES)
+	local yOffset = math.min(regs[VBE_DISPI_INDEX_Y_OFFSET], VBE_MAX_YRES)
+	local xBytes = if bpp == 4
+		then math.floor(xOffset / 2)
+		elseif bpp == 15 or bpp == 16 then xOffset * 2
+		elseif bpp == 24 then xOffset * 3
+		elseif bpp == 32 then xOffset * 4
+		else xOffset
+	local start = xBytes + yOffset * rowBytes
+	if start + yres * rowBytes > VBE_VRAM_SIZE then
+		yOffset = 0
+		start = xBytes
+		if start + yres * rowBytes > VBE_VRAM_SIZE then
+			xOffset = 0
+			start = 0
+		end
+	end
+	regs[VBE_DISPI_INDEX_X_OFFSET] = xOffset
+	regs[VBE_DISPI_INDEX_Y_OFFSET] = yOffset
+	self.vbeLineOffset = rowBytes
+	self.vbeStartAddr = start
+end
+
+function Vga.syncVbe(self: Vga)
+	if not self:isVbeEnabled() then
+		return
+	end
+	const regs = self.vbeRegs
+	const width = regs[VBE_DISPI_INDEX_XRES]
+	const height = regs[VBE_DISPI_INDEX_YRES]
+	const bpp = regs[VBE_DISPI_INDEX_BPP]
+	self.modeNumber = vbeMatchMode(width, height, bpp) or 0x1FF
+	self.vbeBankOffset = lshift(band(regs[VBE_DISPI_INDEX_BANK], 0x3F), 16)
+	self.widthPx = width
+	self.heightPx = height
+	if buffer.len(self.rgba) ~= width * height * 4 then
+		self.rgba = buffer.create(width * height * 4)
+	end
+	self.vbeInfo = {
+		mode = self.modeNumber,
+		kind = "vbe",
+		width = width,
+		height = height,
+		rowBytes = self.vbeLineOffset,
+		bitsPerPixel = bpp,
+		label = string.format("VBE %dx%d %dbpp", width, height, bpp),
+	}
+end
+
+local function restoreLegacyGeometry(self: Vga)
+	self.vbeInfo = nil
+	self.modeNumber = self.info.mode
+	self.widthPx = self.info.width
+	self.heightPx = self.info.height
+	self.rgba = buffer.create(self.widthPx * self.heightPx * 4)
+	self:markAllDirty()
+end
+
+function Vga.writeVbeEnable(self: Vga, value: number)
+	const wasEnabled = self:isVbeEnabled()
+	const oldDac8 = self.dac8
+	self.vbeRegs[VBE_DISPI_INDEX_ENABLE] = band(value, 0xFFFF)
+	self.dac8 = band(value, VBE_DISPI_8BIT_DAC) ~= 0
+	if self.dac8 ~= oldDac8 then
+		self.paletteDirty = true
+		self:markAllDirty()
+	end
+
+	if band(value, VBE_DISPI_ENABLED) ~= 0 then
+		if not wasEnabled then
+			-- A real DISPI discards the virtual width/offset until enabled.
+			self.vbeRegs[VBE_DISPI_INDEX_VIRT_WIDTH] = 0
+			self.vbeRegs[VBE_DISPI_INDEX_X_OFFSET] = 0
+			self.vbeRegs[VBE_DISPI_INDEX_Y_OFFSET] = 0
+		end
+		self:fixupVbe()
+		self:syncVbe()
+		if not wasEnabled and band(value, VBE_DISPI_NOCLEARMEM) == 0 then
+			const clearBytes = math.min(self.heightPx * self.vbeLineOffset, VBE_VRAM_SIZE)
+			if clearBytes > 0 then
+				buffer.fill(self.vbeFramebuffer, 0, 0, clearBytes)
+			end
+		end
+		self:markAllDirty()
+	elseif wasEnabled then
+		restoreLegacyGeometry(self)
+	end
+end
+
+function Vga.vbeWriteRegister(self: Vga, index: number, value: number)
+	value = band(value, 0xFFFF)
+	const regs = self.vbeRegs
+	if index == VBE_DISPI_INDEX_ID then
+		if value >= VBE_DISPI_ID0 and value <= VBE_DISPI_ID5 then
+			regs[VBE_DISPI_INDEX_ID] = value
+		end
+	elseif index == VBE_DISPI_INDEX_ENABLE then
+		self:writeVbeEnable(value)
+	elseif index == VBE_DISPI_INDEX_BANK then
+		regs[VBE_DISPI_INDEX_BANK] = band(value, 0x3F)
+		self.vbeBankOffset = lshift(regs[VBE_DISPI_INDEX_BANK], 16)
+	elseif
+		index == VBE_DISPI_INDEX_XRES
+		or index == VBE_DISPI_INDEX_YRES
+		or index == VBE_DISPI_INDEX_BPP
+		or index == VBE_DISPI_INDEX_VIRT_WIDTH
+		or index == VBE_DISPI_INDEX_X_OFFSET
+		or index == VBE_DISPI_INDEX_Y_OFFSET
+	then
+		regs[index] = value
+		if self:isVbeEnabled() then
+			self:fixupVbe()
+			self:syncVbe()
+			self:markAllDirty()
+		end
+	end
+end
+
+function Vga.setVbeMode(self: Vga, width: number, height: number, bpp: number, lfb: boolean?)
+	const regs = self.vbeRegs
+	regs[VBE_DISPI_INDEX_ENABLE] = 0
+	regs[VBE_DISPI_INDEX_XRES] = band(width, 0xFFFF)
+	regs[VBE_DISPI_INDEX_YRES] = band(height, 0xFFFF)
+	regs[VBE_DISPI_INDEX_BPP] = band(bpp, 0xFF)
+	regs[VBE_DISPI_INDEX_BANK] = 0
+	regs[VBE_DISPI_INDEX_VIRT_WIDTH] = 0
+	regs[VBE_DISPI_INDEX_X_OFFSET] = 0
+	regs[VBE_DISPI_INDEX_Y_OFFSET] = 0
+	const flags = bor(VBE_DISPI_ENABLED, if lfb then VBE_DISPI_LFB_ENABLED else VBE_DISPI_DISABLED)
+	self:writeVbeEnable(flags)
+end
+
 function Vga.setMode(self: Vga, mode: number): boolean
+	const fullMode = band(mode, 0x7FFF)
+	const vbeNumber = band(fullMode, 0x3FFF)
+	const vbeMode = VBE_MODE_BY_NUMBER[vbeNumber]
+	if vbeMode then
+		self:setVbeMode(vbeMode.width, vbeMode.height, vbeMode.bpp, band(fullMode, 0x4000) ~= 0)
+		return true
+	end
+	-- Do not let VBE numbers alias legacy modes through the low byte (0x103
+	-- would otherwise land on text mode 3, 0x112 on planar 12h, and so on).
+	if vbeNumber >= 0x100 then
+		return false
+	end
+
 	const key = band(mode, 0xFF)
 	const info = MODES[key]
 	const registers = MODE_REGISTERS[key]
@@ -622,6 +1024,10 @@ function Vga.setMode(self: Vga, mode: number): boolean
 		return false
 	end
 
+	-- A standard VGA set-mode leaves DISPI and restores the legacy geometry.
+	self.vbeRegs[VBE_DISPI_INDEX_ENABLE] = 0
+	self.vbeInfo = nil
+	self.dac8 = false
 	self.modeNumber = key
 	self.info = info
 	self.crtcProtected = false
@@ -735,9 +1141,14 @@ function Vga.ensurePalette(self: Vga)
 	end
 	for index = 0, 255 do
 		const base = index * 3
-		const red = dac6To8(buffer.readu8(self.dac, base))
-		const green = dac6To8(buffer.readu8(self.dac, base + 1))
-		const blue = dac6To8(buffer.readu8(self.dac, base + 2))
+		local red = buffer.readu8(self.dac, base)
+		local green = buffer.readu8(self.dac, base + 1)
+		local blue = buffer.readu8(self.dac, base + 2)
+		if not self.dac8 then
+			red = dac6To8(red)
+			green = dac6To8(green)
+			blue = dac6To8(blue)
+		end
 		self.paletteRGBA[index + 1] = rgbaWord(red, green, blue)
 	end
 	for index = 0, 15 do
@@ -750,6 +1161,9 @@ end
 -- 8-bit RGB for a DAC index (the snapshot path uses the same expansion).
 function Vga.paletteColor(self: Vga, index: number): (number, number, number)
 	const red, green, blue = self:readDac(band(index, self.dacMask))
+	if self.dac8 then
+		return red, green, blue
+	end
 	return dac6To8(red), dac6To8(green), dac6To8(blue)
 end
 
@@ -812,6 +1226,52 @@ end
 
 -- ------------------------------------------------------------ memory aperture
 
+local function vbeOffsetForAddress(self: Vga, addr: number): number?
+	if addr >= VBE_FRAMEBUFFER_BASE and addr < VBE_FRAMEBUFFER_END then
+		return addr - VBE_FRAMEBUFFER_BASE
+	end
+	if self:isVbeEnabled() and addr >= APERTURE_BASE and addr < APERTURE_BASE + APERTURE_SIZE then
+		return self.vbeBankOffset + (addr - APERTURE_BASE)
+	end
+	return nil
+end
+
+function Vga.markVbeWrite(self: Vga, offset: number, length: number)
+	if not self:isVbeEnabled() or length <= 0 then
+		return
+	end
+	const lineBytes = self.vbeLineOffset
+	if lineBytes <= 0 or self.vbeInfo == nil then
+		self:markAllDirty()
+		return
+	end
+	const visibleBytes = self.heightPx * lineBytes
+	local first = offset - self.vbeStartAddr
+	local last = first + length - 1
+	if last < 0 or first >= visibleBytes then
+		return
+	end
+	first = math.max(0, first)
+	last = math.min(last, visibleBytes - 1)
+
+	const bpp = self.vbeInfo.bitsPerPixel
+	const bytesPerPixel = if bpp == 4
+		then 1
+		elseif bpp == 15 or bpp == 16 then 2
+		elseif bpp == 24 then 3
+		elseif bpp == 32 then 4
+		else 1
+	const y0 = math.floor(first / lineBytes)
+	const y1 = math.floor(last / lineBytes)
+	if y0 == y1 then
+		const x0 = math.floor((first % lineBytes) / bytesPerPixel)
+		const x1 = math.floor((last % lineBytes) / bytesPerPixel)
+		self:markDirtyRect(x0, y0, math.max(1, x1 - x0 + 1), 1)
+	else
+		self:markDirtyRect(0, y0, self.widthPx, y1 - y0 + 1)
+	end
+end
+
 function Vga.displayStartBytes(self: Vga): number
 	const words = bor(lshift(band(self.crtc[0x0C], 0xFF), 8), band(self.crtc[0x0D], 0xFF))
 	return band(lshift(words, 1), 0xFFFF)
@@ -832,6 +1292,16 @@ function Vga.loadLatches(self: Vga, offset: number)
 end
 
 function Vga.read8(self: Vga, addr: number): number
+	const vbeOffset = vbeOffsetForAddress(self, addr)
+	if vbeOffset then
+		if vbeOffset >= VBE_VRAM_SIZE then
+			return 0xFF
+		end
+		return buffer.readu8(self.vbeFramebuffer, vbeOffset)
+	end
+	if addr >= VBE_FRAMEBUFFER_BASE and addr < 0x100000000 then
+		return 0xFF
+	end
 	if band(self.misc, 0x02) == 0 then
 		return 0xFF
 	end
@@ -870,6 +1340,17 @@ function Vga.read8(self: Vga, addr: number): number
 end
 
 function Vga.write8(self: Vga, addr: number, value: number)
+	const vbeOffset = vbeOffsetForAddress(self, addr)
+	if vbeOffset then
+		if vbeOffset < VBE_VRAM_SIZE then
+			buffer.writeu8(self.vbeFramebuffer, vbeOffset, band(value, 0xFF))
+			self:markVbeWrite(vbeOffset, 1)
+		end
+		return
+	end
+	if addr >= VBE_FRAMEBUFFER_BASE and addr < 0x100000000 then
+		return
+	end
 	if band(self.misc, 0x02) == 0 then
 		return
 	end
@@ -930,12 +1411,39 @@ function Vga.write8(self: Vga, addr: number, value: number)
 end
 
 function Vga.read16(self: Vga, addr: number): number
+	if addr >= VBE_FRAMEBUFFER_BASE and addr + 1 < VBE_FRAMEBUFFER_END then
+		return buffer.readu16(self.vbeFramebuffer, addr - VBE_FRAMEBUFFER_BASE)
+	end
 	return bor(self:read8(addr), lshift(self:read8(addr + 1), 8))
 end
 
 function Vga.write16(self: Vga, addr: number, value: number)
+	if addr >= VBE_FRAMEBUFFER_BASE and addr + 1 < VBE_FRAMEBUFFER_END then
+		const offset = addr - VBE_FRAMEBUFFER_BASE
+		buffer.writeu16(self.vbeFramebuffer, offset, band(value, 0xFFFF))
+		self:markVbeWrite(offset, 2)
+		return
+	end
 	self:write8(addr, band(value, 0xFF))
 	self:write8(addr + 1, band(rshift(value, 8), 0xFF))
+end
+
+function Vga.read32(self: Vga, addr: number): number
+	if addr >= VBE_FRAMEBUFFER_BASE and addr + 3 < VBE_FRAMEBUFFER_END then
+		return buffer.readu32(self.vbeFramebuffer, addr - VBE_FRAMEBUFFER_BASE)
+	end
+	return bor(self:read16(addr), lshift(self:read16(addr + 2), 16))
+end
+
+function Vga.write32(self: Vga, addr: number, value: number)
+	if addr >= VBE_FRAMEBUFFER_BASE and addr + 3 < VBE_FRAMEBUFFER_END then
+		const offset = addr - VBE_FRAMEBUFFER_BASE
+		buffer.writeu32(self.vbeFramebuffer, offset, band(value, 0xFFFFFFFF))
+		self:markVbeWrite(offset, 4)
+		return
+	end
+	self:write16(addr, band(value, 0xFFFF))
+	self:write16(addr + 2, band(rshift(value, 16), 0xFFFF))
 end
 
 function Vga.markApertureDirty(self: Vga, offset: number)
@@ -962,6 +1470,11 @@ end
 -- writes must go through vga:write8 so the write-mode logic runs.
 function Vga.noteWrite(self: Vga, addr: number, length: number)
 	if length <= 0 then
+		return
+	end
+	const vbeOffset = vbeOffsetForAddress(self, addr)
+	if vbeOffset then
+		self:markVbeWrite(vbeOffset, length)
 		return
 	end
 	const start = self:displayStartBytes()
@@ -1005,7 +1518,13 @@ end
 function Vga.in8(self: Vga, port: number): number
 	const address = band(port, 0xFFFF)
 
-	if address == 0x3C0 then
+	if address == 0x1CE then
+		return band(self.vbeIndex, 0xFF)
+	elseif address == 0x1CF then
+		return band(self:vbeReadData(), 0xFF)
+	elseif address == 0x1D0 then
+		return band(rshift(self:vbeReadData(), 8), 0xFF)
+	elseif address == 0x3C0 then
 		return band(self.attr[self.attrIndex] or 0, 0xFF)
 	elseif address == 0x3C1 then
 		return band(self.attr[self.attrIndex] or 0, 0xFF)
@@ -1069,7 +1588,8 @@ end
 
 function Vga.writeDac(self: Vga, value: number)
 	const base = self.dacWriteIndex * 3 + self.dacWriteComponent
-	buffer.writeu8(self.dac, base, band(value, 0x3F))
+	const component = if self.dac8 then band(value, 0xFF) else band(value, 0x3F)
+	buffer.writeu8(self.dac, base, component)
 	self.dacWriteComponent += 1
 	if self.dacWriteComponent >= 3 then
 		self.dacWriteComponent = 0
@@ -1083,7 +1603,18 @@ function Vga.out8(self: Vga, port: number, value: number)
 	const address = band(port, 0xFFFF)
 	const byte = band(value, 0xFF)
 
-	if address == 0x3C0 then
+	if address == 0x1CE then
+		self.vbeIndex = bor(band(self.vbeIndex, 0xFF00), byte)
+		return
+	elseif address == 0x1CF then
+		const current = self:vbeReadRegister(self.vbeIndex)
+		self:vbeWriteRegister(self.vbeIndex, bor(band(current, 0xFF00), byte))
+		return
+	elseif address == 0x1D0 then
+		const current = self:vbeReadRegister(self.vbeIndex)
+		self:vbeWriteRegister(self.vbeIndex, bor(band(current, 0x00FF), lshift(byte, 8)))
+		return
+	elseif address == 0x3C0 then
 		if self.attrFlipFlop then
 			const wasEnabled = self.attrPas
 			self.attrIndex = band(byte, 0x1F)
@@ -1134,6 +1665,31 @@ function Vga.out8(self: Vga, port: number, value: number)
 	else
 		self.latched[address] = byte
 	end
+end
+
+-- Word access for the DISPI pair. Machine should call these for 16-bit I/O at
+-- 0x1CE/0x1CF; the byte handlers above also support 0x1D0 as the data high byte.
+function Vga.in16(self: Vga, port: number): number
+	const address = band(port, 0xFFFF)
+	if address == 0x1CE then
+		return band(self.vbeIndex, 0xFFFF)
+	elseif address == 0x1CF then
+		return band(self:vbeReadData(), 0xFFFF)
+	end
+	return bor(self:in8(address), lshift(self:in8(address + 1), 8))
+end
+
+function Vga.out16(self: Vga, port: number, value: number)
+	const address = band(port, 0xFFFF)
+	if address == 0x1CE then
+		self.vbeIndex = band(value, 0xFFFF)
+		return
+	elseif address == 0x1CF then
+		self:vbeWriteRegister(self.vbeIndex, band(value, 0xFFFF))
+		return
+	end
+	self:out8(address, band(value, 0xFF))
+	self:out8(address + 1, band(rshift(value, 8), 0xFF))
 end
 
 -- --------------------------------------------------------------- conversion
@@ -1207,6 +1763,93 @@ local function blitLinear(self: Vga, x0: number, y0: number, x1: number, y1: num
 	end
 end
 
+-- VBE direct/linear framebuffer conversion. Direct modes use the VBE 3.0
+-- colour layout SeaVGABIOS reports: 16bpp RGB565, 32bpp BGRX with red at bit
+-- 16, and 24bpp stored as B,G,R bytes. 8bpp indexes the current DAC palette.
+local function renderVbe(self: Vga, x0: number, y0: number, x1: number, y1: number)
+	const bpp = self.vbeInfo and self.vbeInfo.bitsPerPixel or 8
+	const start = self.vbeStartAddr
+	const lineBytes = self.vbeLineOffset
+	const framebuffer = self.vbeFramebuffer
+	const target = self.rgba
+
+	if bpp == 8 or bpp == 4 then
+		self:ensurePalette()
+		const colors = self.paletteRGBA
+		for y = y0, y1 - 1 do
+			const rowBase = start + y * lineBytes
+			local dest = (y * self.widthPx + x0) * 4
+			for x = x0, x1 - 1 do
+				local index = 0
+				if bpp == 4 then
+					const byte = buffer.readu8(framebuffer, rowBase + math.floor(x / 2))
+					index = if x % 2 == 0 then rshift(byte, 4) else band(byte, 0x0F)
+				else
+					index = band(buffer.readu8(framebuffer, rowBase + x), 0xFF)
+				end
+				buffer.writeu32(target, dest, colors[index + 1] or RGBA_BLACK)
+				dest += 4
+			end
+		end
+		return
+	end
+
+	if bpp == 15 or bpp == 16 then
+		for y = y0, y1 - 1 do
+			const rowBase = start + y * lineBytes
+			local dest = (y * self.widthPx + x0) * 4
+			for x = x0, x1 - 1 do
+				const value = buffer.readu16(framebuffer, rowBase + x * 2)
+				local red, green, blue
+				if bpp == 15 then
+					const r5 = band(rshift(value, 10), 0x1F)
+					const g5 = band(rshift(value, 5), 0x1F)
+					const b5 = band(value, 0x1F)
+					red = bor(lshift(r5, 3), rshift(r5, 2))
+					green = bor(lshift(g5, 3), rshift(g5, 2))
+					blue = bor(lshift(b5, 3), rshift(b5, 2))
+				else
+					const r5 = band(rshift(value, 11), 0x1F)
+					const g6 = band(rshift(value, 5), 0x3F)
+					const b5 = band(value, 0x1F)
+					red = bor(lshift(r5, 3), rshift(r5, 2))
+					green = bor(lshift(g6, 2), rshift(g6, 4))
+					blue = bor(lshift(b5, 3), rshift(b5, 2))
+				end
+				buffer.writeu32(target, dest, rgbaWord(red, green, blue))
+				dest += 4
+			end
+		end
+		return
+	end
+
+	if bpp == 24 or bpp == 32 then
+		const bytesPerPixel = if bpp == 24 then 3 else 4
+		for y = y0, y1 - 1 do
+			const rowBase = start + y * lineBytes
+			local dest = (y * self.widthPx + x0) * 4
+			for x = x0, x1 - 1 do
+				const source = rowBase + x * bytesPerPixel
+				const blue = buffer.readu8(framebuffer, source)
+				const green = buffer.readu8(framebuffer, source + 1)
+				const red = buffer.readu8(framebuffer, source + 2)
+				buffer.writeu32(target, dest, rgbaWord(red, green, blue))
+				dest += 4
+			end
+		end
+		return
+	end
+
+	-- Unsupported format: leave the retained buffer black for this region.
+	for y = y0, y1 - 1 do
+		local dest = (y * self.widthPx + x0) * 4
+		for _ = x0, x1 - 1 do
+			buffer.writeu32(target, dest, RGBA_BLACK)
+			dest += 4
+		end
+	end
+end
+
 function Vga.renderPlanar(self: Vga)
 	blitPlanar(self, 0, 0, self.widthPx, self.heightPx)
 end
@@ -1256,6 +1899,10 @@ end
 -- buffer is overwritten by the next snapshotRGBA call (and replaced by
 -- setMode), so copy it before retaining it across frames.
 function Vga.snapshotRGBA(self: Vga): buffer
+	if self:isVbeEnabled() then
+		renderVbe(self, 0, 0, self.widthPx, self.heightPx)
+		return self.rgba
+	end
 	if self:isBlanked() then
 		self:blankTarget()
 		return self.rgba
@@ -1285,6 +1932,10 @@ function Vga.snapshotRegionRGBA(
 	const x1 = math.min(self.widthPx, math.floor(x + width))
 	const y1 = math.min(self.heightPx, math.floor(y + height))
 	if x1 <= x0 or y1 <= y0 then
+		return self.rgba
+	end
+	if self:isVbeEnabled() then
+		renderVbe(self, x0, y0, x1, y1)
 		return self.rgba
 	end
 	if self:isBlanked() then

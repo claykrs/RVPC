@@ -32,6 +32,8 @@ local lptTests = require("../tests/LptTests")
 local ne2000Tests = require("../tests/Ne2000Tests")
 local ispTests = require("../tests/IspTests")
 local vgaSinkTests = require("../tests/VgaSinkTests")
+local networkTests = require("../tests/NetworkTests")
+local vbeTests = require("../tests/VbeTests")
 local inputMapTests = require("../tests/InputMapTests")
 
 const deps = {
@@ -106,6 +108,8 @@ runDirectSuite("lpt", lptTests)
 runDirectSuite("ne2000", ne2000Tests)
 runDirectSuite("isp", ispTests)
 runDirectSuite("vga", vgaSinkTests)
+runDirectSuite("network", networkTests)
+runDirectSuite("vbe", vbeTests)
 runDirectSuite("inputmap", inputMapTests)
 
 print(("passed assertions: %d"):format(passed))

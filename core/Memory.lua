@@ -36,6 +36,8 @@ Memory.ROM_ALIAS = 0xF0000 -- legacy entry point inside the 256 KiB image
 const A20_BIT = 0x100000
 const APERTURE_START = 0xA0000
 const APERTURE_END = 0xAFFFF
+const VBE_LFB_START = 0xE0000000
+const VBE_LFB_END = 0xE0400000
 const TEXT_START = 0xB0000
 const TEXT_END = 0xBFFFF
 const ONE_MIB = 0x100000
@@ -250,6 +252,9 @@ function Memory:read8(addr: number): number
 	if addr >= APERTURE_START and addr <= APERTURE_END and self.aperture then
 		return self.aperture:read8(addr)
 	end
+	if addr >= VBE_LFB_START and addr < VBE_LFB_END and self.aperture then
+		return self.aperture:read8(addr)
+	end
 	-- No ROM installed: preserve the legacy hypervisor's writable high segment.
 	if not rom and addr >= Memory.ROM_BASE and addr <= 0xFFFFF and addr < self.size then
 		return buffer.readu8(self.buf, addr)
@@ -263,6 +268,9 @@ function Memory:read16(addr: number): number
 		return buffer.readu16(self.buf, addr)
 	end
 	if addr >= APERTURE_START and addr + 1 <= APERTURE_END and self.aperture then
+		return self.aperture:read16(addr)
+	end
+	if addr >= VBE_LFB_START and addr + 1 < VBE_LFB_END and self.aperture then
 		return self.aperture:read16(addr)
 	end
 	return bor(self:read8(addr), lshift(self:read8(addr + 1), 8))
@@ -292,6 +300,10 @@ function Memory:write8(addr: number, value: number)
 		self.aperture:write8(addr, value)
 		return
 	end
+	if addr >= VBE_LFB_START and addr < VBE_LFB_END and self.aperture then
+		self.aperture:write8(addr, value)
+		return
+	end
 	-- No ROM installed: keep the hypervisor stub window writable.
 	if not self.rom and addr >= Memory.ROM_BASE and addr <= 0xFFFFF and addr < self.size then
 		buffer.writeu8(self.buf, addr, band(value, 0xFF))
@@ -314,6 +326,10 @@ function Memory:write16(addr: number, value: number)
 		return
 	end
 	if addr >= APERTURE_START and addr + 1 <= APERTURE_END and self.aperture then
+		self.aperture:write16(addr, value)
+		return
+	end
+	if addr >= VBE_LFB_START and addr + 1 < VBE_LFB_END and self.aperture then
 		self.aperture:write16(addr, value)
 		return
 	end

@@ -18,6 +18,8 @@ const FwCfg = require("../core/FwCfg")
 const Ide = require("../core/Ide")
 const Kbc = require("../core/Kbc")
 const Fpu = require("../core/Fpu")
+const Ne2000 = require("../core/Ne2000")
+const Isp = require("../core/Isp")
 const Xms = require("../core/Xms")
 const Uart = require("../core/Uart")
 const Lpt = require("../core/Lpt")
@@ -30,6 +32,16 @@ const CDROM_PATH = if fs.isFile("media/win98se.iso")
 	elseif fs.isFile("media/freedos-boot.iso") then "media/freedos-boot.iso"
 	else "media/FD13LIVE.iso"
 const HDD_PATH = if fs.isFile("media/win98-hdd.img") then "media/win98-hdd.img" else "media/hdd.img"
+
+-- Network defaults to the built-in ISP; RVPC_NET=0 disables it. MAC/IP can be
+-- overridden without opening any host sockets.
+const networkEnabled = process.env.RVPC_NET ~= "0" and process.env.RVPC_NET ~= "off"
+const networkConfig = {
+	enabled = networkEnabled,
+	mac = process.env.RVPC_NET_MAC,
+	ispMac = process.env.RVPC_NET_ISP_MAC,
+	ip = process.env.RVPC_NET_IP,
+}
 
 if not fs.isFile(BIOS_PATH) then
 	print("missing " .. BIOS_PATH)
@@ -74,6 +86,8 @@ const machine = Machine.new({
 	Ide = Ide,
 	Kbc = Kbc,
 	Fpu = Fpu,
+	Ne2000 = Ne2000,
+	Isp = Isp,
 	Xms = Xms,
 	Uart = Uart,
 	Lpt = Lpt,
@@ -84,6 +98,7 @@ const machine = Machine.new({
 	vgaRom = vgaRom,
 	hdd = hdd,
 	cdrom = cdrom,
+	network = networkConfig,
 })
 
 print(
@@ -99,6 +114,24 @@ print(
 		if cdrom then ("%d KiB"):format(math.floor(buffer.len(cdrom) / 1024)) else "absent"
 	)
 )
+if machine.ne2000 then
+	print(
+		("NE2000: base=%04X irq=%d mac=%s"):format(
+			machine.ne2000.base,
+			machine.ne2000.irq,
+			machine.ne2000:macString()
+		)
+	)
+end
+if machine.isp then
+	print(
+		("ISP: ip=%s mac=%s attached=%s"):format(
+			machine.isp:ipString(),
+			machine.isp:macString(),
+			tostring(machine.isp.nic ~= nil)
+		)
+	)
+end
 print("reset vector " .. machine:bootPc())
 print(
 	"reset bytes "
