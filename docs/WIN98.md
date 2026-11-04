@@ -30,10 +30,15 @@ For Windows 98:
 - Synthetic MBR/partition boot and no-emulation El Torito boot are verified.
 - ATAPI READ(10/12/16), TOC, capacity and sense are implemented.
 - The 82077 FDC boots `media/freedos-boot.img` from A: through DMA2/IRQ6.
-- VGA text 3, planar 12h, linear 13h and VBE/DISPI SVGA modes work.
-- x87 context save/restore and TS/EM lazy switching are implemented; no full
-  80-bit precision or unmasked #MF yet.
+- VGA text 3, planar 12h (write modes 0–3, latches, palette banking), linear
+  13h and VBE/DISPI SVGA modes work; guest mode 12h is detected from the ports.
+- IDE is validated on a 512 MiB in-memory image at high LBAs with PIO and
+  multi-PRDT BMIDE, including clean out-of-range aborts.
+- x87 context save/restore, TS/EM lazy switching and deferred #MF delivery are
+  implemented; precision is host-double, not full 80-bit.
 - NE2000 plus the virtual ISP cover DHCP, DNS, TCP and a small HTTP server.
+- Raw floppy boot, CD boot and the FD13LIVE ISOLINUX LiveCD all reach guest
+  shells; hot-path work runs mixed code at ~1.6M steps/s.
 
 ## Install flow
 
@@ -63,11 +68,12 @@ is suggested for a real install.
 ## Known blockers to clear
 
 - The real Windows 98 SE ISO and a 512 MiB HDD image are not staged yet.
-- ACPI/APM/SMBIOS enumeration; Win98 currently falls back to Standard PC.
-- IDE protected-mode programming details and CD install throughput.
-- 80-bit x87 precision, x87 exception traps (#MF) and task gates.
-- PCI IRQ routing ($PIR) and any protected-mode driver details uncovered by
-  the first installer run.
+- No ACPI: Win98 currently falls back to Standard PC. SMBIOS 2.4 and APM 1.2
+  are present.
+- Paging has no TLB, so protected-mode/VMM workloads are slower than real mode.
+- 80-bit x87 precision, hardware task gates and READ/WRITE MULTIPLE remain
+  incomplete.
+- Any protected-mode driver details uncovered by the first installer run.
 - PS/2 mouse integration and audio/network drivers after first boot.
 
 ## Non-goals for the first 98 boot

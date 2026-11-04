@@ -61,15 +61,21 @@ screen.
 M1 boot is reached: the primary IDE channel exposes an ATA HDD and ATAPI
 CD-ROM. SeaBIOS enters `boot_cdrom`, boots the staged FreeDOS 1.3 floppy-
 emulation ISO through its language menu and reaches the **FreeCom 0.85a**
-shell (`tools/harness.lua`). The FD13LIVE no-emulation ISOLINUX path also boots,
-but its COM32 payload currently faults at `0020:67612816`; see
-`docs/M1-REPORT.md` for both traces.
+shell (`tools/harness.lua`). The same firmware also boots the raw floppy image
+through the 82077 FDC and the FD13LIVE no-emulation ISOLINUX image through to
+its LiveCD `D:\>` prompt.
 
-The Roblox client shell, EditableImage VGA presenter, set-1 keyboard/mouse
-input bridge, NE2000 controller and virtual ISP (ARP/IPv4/ICMP/DHCP/DNS) are
-in the tree. Stage `media/freedos-boot.iso`, `media/FD13LIVE.iso` and optional
-`media/hdd.img` as described in the report before running the harness. See also
-`HANDOFF.md`, `docs/M0-REPORT.md`, `docs/ARCHITECTURE.md` and `docs/WIN98.md`.
+M2 hardware is in place: PIIX3 PCI/IDE with BMIDE and a secondary channel,
+8237 DMA and SB16, VBE/DISPI SVGA plus a hardware-accurate mode 12h planar
+path, NE2000 with DHCP/DNS/TCP/HTTP, PS/2 keyboard and mouse, x87 with context
+switching and `#MF`, and 512 MiB IDE validation. `lune run tools/check.lua`
+passes 1618 assertions, and the 24M-step FreeDOS boot now takes about 33 s.
+Windows 98 SE media is not included; stage `media/win98se.iso` and a 512 MiB
+`media/win98-hdd.img` locally, then run `lune run tools/harness.lua 300`.
+
+The Roblox client shell, EditableImage VGA presenter and set-1 keyboard/mouse
+input bridge are in the tree. See `HANDOFF.md`, `docs/M1-REPORT.md`,
+`docs/M2-REPORT.md`, `docs/ARCHITECTURE.md` and `docs/WIN98.md`.
 
 ## License
 

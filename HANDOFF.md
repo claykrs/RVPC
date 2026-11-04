@@ -69,7 +69,7 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   the ring-0 stack switch; IRETD/RETF pop the correct 16/32-bit frame slots;
   #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
   are correct. CPU, 386 frame and XMS suites are in the gate again.
-- **Tests:** `lune run tools/check.lua` passes with 735 assertions.
+- **Tests:** `lune run tools/check.lua` passes with 1618 assertions.
 - **M1 bring-up (commit `4fbd3bc`):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
   (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
   FreeDOS LiveCD. SeaBIOS detects both drives, shows its boot menu, and starts
@@ -87,18 +87,34 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   (SeaBIOS BEV entries all landed in slot 0) and null LLDT. SeaBIOS now enters
   `boot_cdrom`, FreeDOS reaches its language menu and the FreeCom shell at 24M
   steps. `tools/harness.lua` uses the FreeDOS floppy-emulation ISO when staged.
-- **x87 (commit `8f202f5`):** `core/Fpu.lua` practical 486 FPU subset, wired
-  through `Machine`/`Cpu`; CPUID advertises FPU. Missing m80, FLDENV/FSTENV,
-  FNSAVE/FRSTOR, FBLD/FBSTP and unmasked exceptions.
+- **x87 (commits `8f202f5`, `65d4faf`):** practical 486 FPU with
+  FLDENV/FSTENV/FNSAVE/FRSTOR, m80/BCD transfer, TS/EM lazy switching, V86 I/O
+  bitmap traps and deferred vector-16 `#MF`. Precision is host-double, not
+  full 80-bit.
+- **M2 storage (commits `6b091a8`, `aceeaac`, `973c6f0`):** dirty-sector
+  write-back, MBR/no-emulation boot, PIIX3 primary/secondary IDE and BMIDE,
+  82077 FDC with DMA2/IRQ6, and a 512 MiB IDE scale validation (1,048,576 LBA
+  sectors, high-LBA PIO/BMIDE, clean out-of-range ABRT).
+- **M2 platform (commits `a846fd6`, `2c40d4e`):** VBE/DISPI 8/16/32bpp with a
+  4 MiB LFB, PIIX3 PIRQ routing, ELCR, SMBIOS 2.4 and APM 1.2. No ACPI.
+- **M2 CPU/VGA (commits `9715efe`, `ce4c7d4`):** fixed 16-bit writes to
+  preserve the high half and `MOV r32,Sreg` zero-extension, which unblocked
+  ISOLINUX/COM32; the FD13LIVE LiveCD now reaches `D:\>`. VGA mode 12h got
+  hardware write/read modes, latches, set/reset/ALU, CRTC start/offset and
+  palette banking.
+- **M2 speed (commit `49d13e9`):** unpaged CPU/memory fast paths and device IRQ
+  polling gates. The 24M-step FreeDOS boot drops from ~90 s to ~33 s; mixed
+  code runs at ~1.6M steps/s.
 
 ### Next blockers
 
-1. MBR/partition boot from the virtual HDD, then IDE install writes and a
-   persistent disk image.
-2. SVGA/VBE modes and the Roblox EditableImage sink for 800x600/1024x768.
-3. x87 context switching (FLDENV/FSTENV/FNSAVE/FRSTOR) and the remaining FPU
-   gaps before Windows 98 lazy-FPU paths.
-4. Then run the Windows 98 SE installer from the real CD onto C:.
+1. Stage `media/win98se.iso` and a 512 MiB `media/win98-hdd.img` locally, then
+   run `lune run tools/harness.lua 300` and fix the first installer fault.
+2. Add a paging TLB; protected-mode/VMM execution still walks page tables on
+   every access.
+3. Hardware task gates/TSS switching and full 80-bit x87 precision.
+4. ACPI is absent (Standard PC fallback); add it only if the installer requires
+   the ACPI HAL.
 
 
 ## Hard rules
