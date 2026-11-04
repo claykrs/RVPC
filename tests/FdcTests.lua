@@ -1,7 +1,7 @@
 --!nonstrict
 -- FdcTests.lua -- 82077AA register/command, DMA and IRQ behavior.
 
-const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
+const band, rshift = bit32.band, bit32.rshift
 const Fdc = require("../core/Fdc")
 const Dma = require("../core/Dma")
 const Memory = require("../core/Memory")
