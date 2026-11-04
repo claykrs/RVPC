@@ -468,4 +468,96 @@ T("lldt_null_is_legal", function(expect)
 	expect(m.cpu.halted, "LLDT did not complete")
 end)
 
+T("word_writes_preserve_eax_high_half", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	putCode(m, 0x1000, {
+		0xB8,
+		0x78,
+		0x56,
+		0x34,
+		0x12, -- MOV EAX,0x12345678
+		0x66,
+		0xB8,
+		0xEF,
+		0xBE, -- MOV AX,0xBEEF
+		0x66,
+		0x31,
+		0xC0, -- XOR AX,AX
+		0xF4,
+	})
+	m:run(2)
+	expect(m.cpu:rr32(0) == 0x1234BEEF, string.format("MOV AX EAX=%08X", m.cpu:rr32(0)))
+	m:run(1)
+	expect(m.cpu:rr32(0) == 0x12340000, string.format("XOR AX EAX=%08X", m.cpu:rr32(0)))
+end)
+
+T("real_mode_word_write_preserves_eax_high", function(expect)
+	const m = freshMachine()
+	m.cpu.cs = 0
+	m.cpu.segBase.cs = 0
+	m.cpu.ip = 0x1000
+	m.cpu.ds = 0
+	m.cpu.segBase.ds = 0
+	m.cpu.ss = 0
+	m.cpu.segBase.ss = 0
+	m.cpu.flags = 2
+	m.cpu:setSP(0x8000)
+	putCode(m, 0x1000, {
+		0x66,
+		0xB8,
+		0x00,
+		0x00,
+		0xFE,
+		0x01, -- MOV EAX,0x01FE0000
+		0x31,
+		0xC0, -- XOR AX,AX (must preserve EAX[31:16])
+		0x66,
+		0xA3,
+		0x00,
+		0x05, -- MOV [0x0500],EAX
+		0xF4,
+	})
+	m:run(4)
+	expect(m.cpu:rr32(0) == 0x01FE0000, string.format("EAX=%08X", m.cpu:rr32(0)))
+	expect(m.mem:read32(0x500) == 0x01FE0000, string.format("mem=%08X", m.mem:read32(0x500)))
+end)
+
+T("mov_r32_sreg_zero_extends", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	putCode(m, 0x1000, {
+		0xBE,
+		0xFF,
+		0xFF,
+		0xFF,
+		0xFF, -- MOV ESI,0xFFFFFFFF
+		0x8C,
+		0xD6, -- MOV ESI,SS (must zero-extend the selector)
+		0xF4,
+	})
+	m:run(2)
+	expect(m.cpu:rr32(6) == 0x10, string.format("ESI=%08X want 00000010", m.cpu:rr32(6)))
+end)
+
+T("real_mode_mov_r32_sreg_zero_extends", function(expect)
+	const m = freshMachine()
+	m.cpu.cs = 0
+	m.cpu.segBase.cs = 0
+	m.cpu.ip = 0x1000
+	m.cpu.ss = 0
+	m.cpu.segBase.ss = 0
+	m.cpu.flags = 2
+	m.cpu:setSP(0x8000)
+	m.cpu:wr32(6, 0xFFFF0000)
+	putCode(m, 0x1000, {
+		0x66,
+		0x8C,
+		0xD6, -- MOV ESI,SS with operand-size prefix
+		0xF4,
+	})
+	m:run(1)
+	expect(m.cpu:rr32(6) == 0, string.format("ESI=%08X want 00000000", m.cpu:rr32(6)))
+end)
+
 return TESTS

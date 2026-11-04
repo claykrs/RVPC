@@ -1160,7 +1160,11 @@ end
 
 function Cpu.wr(self: Cpu, i: number, v: number)
 	self.r[i + 1] = band(v, 0xFFFF)
-	self.rHi[i + 1] = 0 -- 16-bit writes zero-extend on 386; unused on 8086/286
+	-- On 386+, a 16-bit register write leaves the upper 16 bits intact.
+	-- The 8086/286 have no upper half, so keep it zero there.
+	if self.level < CPU_386 then
+		self.rHi[i + 1] = 0
+	end
 end
 
 function Cpu.rr32(self: Cpu, i: number): number
@@ -1951,7 +1955,14 @@ end
 local SEGREG = { "es", "cs", "ss", "ds", "fs", "gs" }
 H[0x8C] = function(cpu: any)
 	local e = cpu:modrm()
-	cpu:writeRM16(e, cpu[SEGREG[e.reg + 1]])
+	const value = cpu[SEGREG[e.reg + 1]]
+	if e.mod == 3 and cpu.level >= CPU_386 and cpu.operand32 then
+		-- MOV r32,Sreg zero-extends the 16-bit selector into the 32-bit
+		-- destination (386+). The memory form always stores 16 bits.
+		cpu:wr32(e.rm, value)
+	else
+		cpu:writeRM16(e, value)
+	end
 end
 H[0x8D] = function(cpu: any)
 	local e = cpu:modrm()
