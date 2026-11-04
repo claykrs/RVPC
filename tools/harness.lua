@@ -120,6 +120,36 @@ local lastPrint = 0
 local menuSelected = false
 local menuDebug = 0
 
+local function persistHdd()
+	const ide = machine.ide
+	if not ide or not ide:diskDirty() then
+		return
+	end
+	const first, last = ide:dirtySectorRange()
+	const changed = if first and last then (last - first + 1) * 512 else 0
+	if not hdd or not fs.isFile(HDD_PATH) then
+		print(
+			("HDD dirty sectors %s..%s (%d changed bytes); image absent, not written"):format(
+				tostring(first),
+				tostring(last),
+				changed
+			)
+		)
+		return
+	end
+	fs.writeFile(HDD_PATH, buffer.tostring(hdd))
+	ide:clearDiskDirty()
+	print(
+		("HDD persist: dirty sectors %s..%s (%d changed bytes), wrote %d bytes to %s"):format(
+			tostring(first),
+			tostring(last),
+			changed,
+			buffer.len(hdd),
+			HDD_PATH
+		)
+	)
+end
+
 while executed < budget do
 	const want = math.min(chunk, budget - executed)
 	local ok, result = pcall(function()
@@ -314,6 +344,8 @@ while executed < budget do
 		break
 	end
 end
+
+persistHdd()
 
 const screen = machine:outputText()
 const debug = machine:debugText()

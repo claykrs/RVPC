@@ -128,8 +128,11 @@ local function vgaDword(offset: number): number
 	return 0
 end
 
--- PIIX3-style IDE function at 00:01.1. prog_if=0 makes SeaBIOS use the legacy
+-- PIIX3-style IDE function at 00:01.0. prog_if=0 makes SeaBIOS use the legacy
 -- 0x1F0/0x3F6 task file instead of PCI BARs.
+-- Only the primary channel is modelled: 0x170/0x376 and IRQ15 are absent, so
+-- those ports read as open bus. The Win98 installer path uses the primary
+-- master HDD plus the primary slave CD-ROM pair.
 local function ideDword(offset: number): number
 	if offset == 0x00 then
 		return 0x70108086 -- Intel PIIX3 IDE

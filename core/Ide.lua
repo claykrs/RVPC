@@ -104,6 +104,12 @@ export type Ide = typeof(setmetatable(
 		lastCommand: number,
 		identifyCount: number,
 		packetCount: number,
+		dirty: boolean,
+		dirtyFirstSector: number?,
+		dirtyLastSector: number?,
+		diskDirty: (self: Ide) -> boolean,
+		clearDiskDirty: (self: Ide) -> (),
+		dirtySectorRange: (self: Ide) -> (number?, number?),
 		in8: (self: Ide, port: number) -> number,
 		out8: (self: Ide, port: number, value: number) -> (),
 		in16: (self: Ide, port: number) -> number,
@@ -149,6 +155,9 @@ function Ide.new(config: Config?): Ide
 	self.lastCommand = 0
 	self.identifyCount = 0
 	self.packetCount = 0
+	self.dirty = false
+	self.dirtyFirstSector = nil
+	self.dirtyLastSector = nil
 	return self
 end
 
@@ -210,11 +219,17 @@ local function identify(drive: Drive): buffer
 		return out
 	end
 	putWord(out, 0, 0x0040)
-	putWord(out, 1, 16383) -- cylinders
-	putWord(out, 3, 16) -- heads
-	putWord(out, 6, 63) -- sectors/track
-	putWord(out, 49, 0x0200) -- LBA
 	const total = capacitySectors(drive, 512)
+	-- Report a CHS geometry that matches the image size instead of the old
+	-- fixed 16383/16/63 (which described an 8 GiB disk on every image). LBA28
+	-- remains authoritative; CHS is only the INT13 fallback geometry.
+	const heads = 16
+	const sectorsPerTrack = 63
+	const cylinders = math.max(1, math.min(16383, math.floor(total / (heads * sectorsPerTrack))))
+	putWord(out, 1, cylinders) -- cylinders
+	putWord(out, 3, heads) -- heads
+	putWord(out, 6, sectorsPerTrack) -- sectors/track
+	putWord(out, 49, 0x0200) -- LBA
 	putWord(out, 60, band(total, 0xFFFF))
 	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
 	putWord(out, 80, 0x0004) -- ATA-2
@@ -254,6 +269,48 @@ local function beginWrite(self: Ide, lba: number, length: number)
 		lba = lba,
 	}
 	self.selected.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
+end
+
+-- Track guest writes so a host harness can decide whether the backing image
+-- needs to be persisted. The range is a conservative union: non-contiguous
+-- writes are reported as one span from the first to the last touched sector.
+local function markDiskDirty(self: Ide, lba: number, sectors: number)
+	if sectors <= 0 then
+		return
+	end
+	self.dirty = true
+	const last = lba + sectors - 1
+	if not self.dirtyFirstSector or lba < self.dirtyFirstSector then
+		self.dirtyFirstSector = lba
+	end
+	if not self.dirtyLastSector or last > self.dirtyLastSector then
+		self.dirtyLastSector = last
+	end
+end
+
+local function completeWrite(self: Ide, transfer: Transfer)
+	const drive = self.selected
+	if drive.kind == "hdd" and drive.image then
+		buffer.copy(drive.image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
+		markDiskDirty(self, transfer.lba, math.floor(transfer.length / 512))
+	end
+	finish(self, bor(ST_DRDY, ST_DSC))
+end
+
+function Ide.diskDirty(self: Ide): boolean
+	return self.dirty
+end
+
+function Ide.clearDiskDirty(self: Ide)
+	self.dirty = false
+	self.dirtyFirstSector = nil
+	self.dirtyLastSector = nil
+end
+
+-- Inclusive sector range touched since the last clearDiskDirty(), or nil when
+-- the image is clean.
+function Ide.dirtySectorRange(self: Ide): (number?, number?)
+	return self.dirtyFirstSector, self.dirtyLastSector
 end
 
 local function failCommand(self: Ide, errorCode: number)
@@ -781,6 +838,10 @@ local function command(self: Ide, cmd: number)
 		beginRead(self, data)
 		self.irqPending = true
 	elseif cmd == ATA_WRITE then
+		if drive.kind ~= "hdd" then
+			failCommand(self, 0x04)
+			return
+		end
 		const count = if self.sectorCount == 0 then 256 else self.sectorCount
 		const image = drive.image
 		const total = capacitySectors(drive, 512)
@@ -848,12 +909,7 @@ local function writeDataByte(self: Ide, value: number)
 	buffer.writeu8(transfer.buffer, transfer.pos, band(value, 0xFF))
 	transfer.pos += 1
 	if transfer.pos >= transfer.length then
-		const drive = self.selected
-		const image = drive.image
-		if image then
-			buffer.copy(image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
-		end
-		finish(self, bor(ST_DRDY, ST_DSC))
+		completeWrite(self, transfer)
 	end
 end
 
@@ -865,12 +921,7 @@ local function writeDataWord(self: Ide, value: number)
 	buffer.writeu16(transfer.buffer, transfer.pos, band(value, 0xFFFF))
 	transfer.pos += 2
 	if transfer.pos >= transfer.length then
-		const drive = self.selected
-		const image = drive.image
-		if image then
-			buffer.copy(image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
-		end
-		finish(self, bor(ST_DRDY, ST_DSC))
+		completeWrite(self, transfer)
 	end
 end
 

@@ -234,6 +234,97 @@ T("ata_write_and_flush", function(expect)
 	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "not ready after flush")
 end)
 
+local function writeSectors(ide, lba, count, firstWord)
+	selectDrive(ide, false)
+	ide:out8(0x1F2, band(count, 0xFF))
+	ide:out8(0x1F3, band(lba, 0xFF))
+	ide:out8(0x1F4, band(rshift(lba, 8), 0xFF))
+	ide:out8(0x1F5, band(rshift(lba, 16), 0xFF))
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x30)
+	for index = 0, count * 256 - 1 do
+		ide:out16(0x1F0, firstWord + index)
+	end
+end
+
+T("ata_write_dirty_tracking", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	expect(not ide:diskDirty(), "fresh image marked dirty")
+	local first, last = ide:dirtySectorRange()
+	expect(first == nil and last == nil, "fresh image has a dirty range")
+
+	writeSectors(ide, 100, 1, 0x5A00)
+	expect(ide:diskDirty(), "write did not mark the image dirty")
+	first, last = ide:dirtySectorRange()
+	expect(
+		first == 100 and last == 100,
+		string.format("range=%s..%s", tostring(first), tostring(last))
+	)
+	ide:out8(0x1F7, 0xE7)
+	expect(ide:diskDirty(), "ATA FLUSH cleared host dirty state")
+
+	writeSectors(ide, 150, 2, 0x6B00)
+	first, last = ide:dirtySectorRange()
+	expect(
+		first == 100 and last == 151,
+		string.format("merged range=%s..%s", tostring(first), tostring(last))
+	)
+
+	ide:clearDiskDirty()
+	expect(not ide:diskDirty(), "clearDiskDirty left the dirty flag set")
+	first, last = ide:dirtySectorRange()
+	expect(first == nil and last == nil, "clearDiskDirty left a range behind")
+
+	writeSectors(ide, 200, 1, 0x7C00)
+	ide:reset()
+	expect(ide:diskDirty(), "reset dropped unsaved dirty state")
+end)
+
+T("ata_write_rejects_cdrom", function(expect)
+	const iso = makeIso()
+	const ide = Ide.new({ cdrom = iso })
+	const before = buffer.readu8(iso, 0)
+	selectDrive(ide, true)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "ATA WRITE to CD did not fail")
+	expect(not ide:diskDirty(), "CD write marked the disk dirty")
+	expect(buffer.readu8(iso, 0) == before, "CD image was mutated by ATA WRITE")
+end)
+
+T("ata_identify_32m_geometry", function(expect)
+	const hdd = buffer.create(32 * 1024 * 1024)
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xEC)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY did not assert DRQ")
+	const words = readWords(ide, 256)
+	expect(words[61] == 0 and words[62] == 1, "LBA28 capacity words are not 65536")
+	expect(words[2] == 65, "cylinders=" .. words[2])
+	expect(words[4] == 16, "heads=" .. words[4])
+	expect(words[7] == 63, "sectors/track=" .. words[7])
+
+	-- Last sector of the 32 MiB image exercises the LBA28 register path.
+	writeSectors(ide, 65535, 1, 0xBEE0)
+	expect(buffer.readu16(hdd, 65535 * 512) == 0xBEE0, "last-sector write")
+	local first, last = ide:dirtySectorRange()
+	expect(first == 65535 and last == 65535, "last-sector dirty range")
+
+	-- DRIVE_HEAD bit 6 carries LBA27..24. Check the register latch directly;
+	-- a 32 MiB image cannot reach those sectors.
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE1)
+	expect(ide.lba == 0x01000000, string.format("LBA high nibble=%08X", ide.lba))
+	ide:out8(0x1F6, 0xE0)
+	expect(ide.lba == 0, string.format("LBA high nibble clear=%08X", ide.lba))
+end)
+
 T("ata_lba_high_nibble", function(expect)
 	const ide = Ide.new({ hdd = makeHdd() })
 	selectDrive(ide, false)
