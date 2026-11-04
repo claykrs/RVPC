@@ -161,3 +161,45 @@ media includes:
 
 The code commits are `4fbd3bc` (M1 bring-up) and `7986985` (M0 hardening).
 This report commit follows them and names the exact code state.
+
+## Update: M1 boot achieved (commit `8f202f5`)
+
+The first boot fault was two CPU bugs plus an ATAPI limitation, not a dead end:
+
+- **SIB bug:** `Cpu.modrm()` dropped `index * scale` for 32-bit
+  `[index*8 + disp32]` when the SIB base was absent. SeaBIOS's `add_bev()` uses
+  exactly that form, so all BEV entries were written to `BEV[0]`; the implicit
+  floppy fallback overwrote the CD entry and `do_boot` retried floppy three
+  times. Fixed in `core/Cpu.lua`; regression in `tests/Cpu386Tests.lua`.
+- **Null LLDT:** ISOLINUX executes `LLDT AX` with AX=0; null is legal and now
+  clears LDTR instead of raising #GP. Regression added.
+- **ATAPI:** the command set now covers READ(10/12/16), GET CONFIGURATION,
+  MODE SENSE 6/10, TOC formats, READ HEADER and correct sense/status. The real
+  FD13LIVE El Torito catalog at LBA 17/403/404 is byte-exact.
+- **x87:** a practical 486 FPU subset lives in `core/Fpu.lua`, injected through
+  `Machine`/`Cpu`; CPUID advertises FPU. Known gaps: m80, FLDENV/FSTENV,
+  FNSAVE/FRSTOR, FBLD/FBSTP, unmasked exceptions.
+
+Measured headless result with `media/freedos-boot.iso` (FreeDOS 1.3 floppy
+edition, El Torito floppy emulation) and the staged SeaBIOS:
+
+```text
+SeaBIOS ...
+Booting from DVD/CD...
+.............................................................................
+FreeDOS 1.3 Floppy Edition:
+Please select your language
+...
+FreeCom version 0.85a - WATCOMC - XMS_Swap [Jul 10 2021 19:28:06]
+steps: 24000000  halted: false  irqs: 445  page faults: 0
+```
+
+That is a real OS reaching its shell. The FD13LIVE no-emulation ISOLINUX path
+also boots, but its COM32 payload faults later at `0020:67612816` (`#GP`, CS
+selector `7880`); that is now a loader/com32 investigation, not the firmware or
+ATA path.
+
+`lune run tools/check.lua` passes with 735 assertions. The Roblox client,
+input bridge, VGA sink, NE2000 and virtual ISP are committed; next work is
+MBR/partition boot, IDE install writes, SVGA, and the Win98 SE installer path.
+

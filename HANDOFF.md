@@ -69,7 +69,7 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
   the ring-0 stack switch; IRETD/RETF pop the correct 16/32-bit frame slots;
   #PF frames restart the faulting instruction; PIC ISR priority and slave EOI
   are correct. CPU, 386 frame and XMS suites are in the gate again.
-- **Tests:** `lune run tools/check.lua` passes with 600 assertions.
+- **Tests:** `lune run tools/check.lua` passes with 735 assertions.
 - **M1 bring-up (commit `4fbd3bc`):** `Ide.lua` (ATA/ATAPI PIO), `Kbc.lua`
   (8042/PS2), PAM shadow locking, and the harness attach a 32 MiB HDD plus a
   FreeDOS LiveCD. SeaBIOS detects both drives, shows its boot menu, and starts
@@ -80,18 +80,25 @@ M0 is complete and committed. Details are in `docs/M0-REPORT.md`.
 - **Network (commit `ea7f43d`):** `Ne2000.lua` (DP8390 registers, remote DMA,
   ring, IRQ mask) and `Isp.lua` (ARP, IPv4/ICMP, DHCP, DNS) with link tests.
 - **Video (commit `ea7f43d`):** `VgaSink.lua` dirty-region presenter and
-  `roblox/ui/VgaView.lua` EditableImage/ImageLabel adapter. Input/client bridge
-  is in progress.
+  `roblox/ui/VgaView.lua` EditableImage/ImageLabel adapter.
+- **Roblox client (commit `e3ffba1`):** `InputMap`, `Input`, client `Shell`,
+  `VgaView` sizing/cropping and a Heartbeat stepping loop.
+- **M1 boot achieved (commit `8f202f5`):** fixed the 32-bit SIB index loss
+  (SeaBIOS BEV entries all landed in slot 0) and null LLDT. SeaBIOS now enters
+  `boot_cdrom`, FreeDOS reaches its language menu and the FreeCom shell at 24M
+  steps. `tools/harness.lua` uses the FreeDOS floppy-emulation ISO when staged.
+- **x87 (commit `8f202f5`):** `core/Fpu.lua` practical 486 FPU subset, wired
+  through `Machine`/`Cpu`; CPUID advertises FPU. Missing m80, FLDENV/FSTENV,
+  FNSAVE/FRSTOR, FBLD/FBSTP and unmasked exceptions.
 
 ### Next blockers
 
-1. SeaBIOS boot selection: the IRQ return-frame bug is fixed, but the BEV list
-   still starts at the floppy fallback instead of `boot_cdrom`. ACPI/PNP0303 and
-   fw_cfg bootorder are the current leads.
-2. Once CD boot is selected, get the FreeDOS banner or the next fault with
-   PC/register evidence. ATAPI El Torito reads are already byte-exact.
-3. Finish the Roblox input/client bridge around the new `VgaView`/`VgaSink`.
-4. Then IDE writes/MBR partitions, SVGA, x87, and the Win98 SE installer path.
+1. MBR/partition boot from the virtual HDD, then IDE install writes and a
+   persistent disk image.
+2. SVGA/VBE modes and the Roblox EditableImage sink for 800x600/1024x768.
+3. x87 context switching (FLDENV/FSTENV/FNSAVE/FRSTOR) and the remaining FPU
+   gaps before Windows 98 lazy-FPU paths.
+4. Then run the Windows 98 SE installer from the real CD onto C:.
 
 
 ## Hard rules

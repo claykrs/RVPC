@@ -58,13 +58,18 @@ M0 is green: the machine boots real SeaBIOS, initializes PIC/PIT/CMOS/A20/PCI/
 fw_cfg, runs SeaVGABIOS in text mode 3, and reaches the no-bootable-device
 screen.
 
-M1 is in bring-up: the primary IDE channel exposes an ATA HDD and ATAPI CD-ROM,
-SeaBIOS detects both, and its boot menu lists a FreeDOS 1.3 LiveCD. Selecting
-the CD currently reaches a measured CPU fault at `F000:85EF` (`bad FF /7`); the
-exact trace and next actions are in `docs/M1-REPORT.md`. Stage the FreeDOS
-LiveCD (`media/FD13LIVE.iso`) and optional `media/hdd.img` as described there
-before running the harness. See also `HANDOFF.md`, `docs/M0-REPORT.md`,
-`docs/ARCHITECTURE.md` and `docs/WIN98.md`.
+M1 boot is reached: the primary IDE channel exposes an ATA HDD and ATAPI
+CD-ROM. SeaBIOS enters `boot_cdrom`, boots the staged FreeDOS 1.3 floppy-
+emulation ISO through its language menu and reaches the **FreeCom 0.85a**
+shell (`tools/harness.lua`). The FD13LIVE no-emulation ISOLINUX path also boots,
+but its COM32 payload currently faults at `0020:67612816`; see
+`docs/M1-REPORT.md` for both traces.
+
+The Roblox client shell, EditableImage VGA presenter, set-1 keyboard/mouse
+input bridge, NE2000 controller and virtual ISP (ARP/IPv4/ICMP/DHCP/DNS) are
+in the tree. Stage `media/freedos-boot.iso`, `media/FD13LIVE.iso` and optional
+`media/hdd.img` as described in the report before running the harness. See also
+`HANDOFF.md`, `docs/M0-REPORT.md`, `docs/ARCHITECTURE.md` and `docs/WIN98.md`.
 
 ## License
 
