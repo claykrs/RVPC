@@ -36,6 +36,7 @@ export type Deps = {
 	Fpu: any?,
 	Dma: any?,
 	Sb16: any?,
+	Fdc: any?,
 	Ne2000: any?,
 	Isp: any?,
 	Xms: any?,
@@ -50,6 +51,12 @@ export type NetworkConfig = {
 	enabled: boolean?,
 }
 
+export type FloppyConfig = {
+	image: buffer?,
+	writeProtected: boolean?,
+	dirty: ((drive: number, lba: number, count: number) -> ())?,
+}
+
 export type Config = {
 	memorySize: number?,
 	cpu: any?,
@@ -62,6 +69,8 @@ export type Config = {
 	cdrom: buffer?,
 	hdd2: buffer?,
 	cdrom2: buffer?,
+	floppy: FloppyConfig?,
+	floppy1: FloppyConfig?,
 	network: NetworkConfig?,
 	audioSink: ((samples: buffer) -> ())?,
 }
@@ -81,6 +90,7 @@ export type Machine = typeof(setmetatable(
 		fpu: any?,
 		dma: any?,
 		sb16: any?,
+		fdc: any?,
 		ne2000: any?,
 		isp: any?,
 		xms: any?,
@@ -312,7 +322,14 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		self.pit = deps.Pit.new()
 	end
 	if deps.Cmos then
-		self.cmos = deps.Cmos.new({ memorySize = self.mem.size })
+		local floppyType = 0
+		if cfg.floppy and cfg.floppy.image then
+			floppyType = bor(floppyType, 0x40) -- drive A: 1.44M
+		end
+		if cfg.floppy1 and cfg.floppy1.image then
+			floppyType = bor(floppyType, 0x04) -- drive B: 1.44M
+		end
+		self.cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
 	end
 	if deps.FwCfg then
 		self.fwcfg = deps.FwCfg.new(self.mem.size, cfg.vgaRom)
@@ -369,6 +386,17 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			write16 = function(address: number, value: number)
 				self.mem:write16(address, value)
 			end,
+		})
+	end
+	if deps.Fdc then
+		self.fdc = deps.Fdc.new({
+			floppy = cfg.floppy and cfg.floppy.image,
+			floppy1 = cfg.floppy1 and cfg.floppy1.image,
+			writeProtected = cfg.floppy and cfg.floppy.writeProtected,
+			writeProtected1 = cfg.floppy1 and cfg.floppy1.writeProtected,
+			dirty = cfg.floppy and cfg.floppy.dirty,
+			dirty1 = cfg.floppy1 and cfg.floppy1.dirty,
+			dma = self.dma,
 		})
 	end
 	if deps.Sb16 then
@@ -436,6 +464,9 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.kbc and (port == 0x60 or port == 0x64) then
 				return self.kbc:in8(port)
+			end
+			if self.fdc and ((port >= 0x3F0 and port <= 0x3F5) or port == 0x3F7) then
+				return self.fdc:in8(port)
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
 				return self.ide:in8(port)
@@ -587,6 +618,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if self.kbc and (port == 0x60 or port == 0x64) then
 				self.kbc:out8(port, value)
+				return
+			end
+			if self.fdc and ((port >= 0x3F0 and port <= 0x3F5) or port == 0x3F7) then
+				self.fdc:out8(port, value)
 				return
 			end
 			if self.ide and ((port >= 0x1F0 and port <= 0x1F7) or port == 0x3F6) then
@@ -780,6 +815,9 @@ function Machine.reset(self: Machine)
 	if self.dma then
 		self.dma:reset()
 	end
+	if self.fdc then
+		self.fdc:reset()
+	end
 	if self.sb16 then
 		self.sb16:resetDsp()
 	end
@@ -836,6 +874,9 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			end
 			if self.sb16 and self.sb16:takeIrq() then
 				self.pic:raise(5)
+			end
+			if self.fdc and self.fdc:takeIrq() then
+				self.pic:raise(6)
 			end
 			self.sb16Clock += 1
 			if self.sb16 and self.sb16Clock % 1024 == 0 then

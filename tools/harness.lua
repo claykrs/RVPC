@@ -20,6 +20,7 @@ const Kbc = require("../core/Kbc")
 const Fpu = require("../core/Fpu")
 const Dma = require("../core/Dma")
 const Sb16 = require("../core/Sb16")
+const Fdc = require("../core/Fdc")
 const Ne2000 = require("../core/Ne2000")
 const Isp = require("../core/Isp")
 const Xms = require("../core/Xms")
@@ -34,6 +35,7 @@ const CDROM_PATH = if fs.isFile("media/win98se.iso")
 	elseif fs.isFile("media/freedos-boot.iso") then "media/freedos-boot.iso"
 	else "media/FD13LIVE.iso"
 const HDD_PATH = if fs.isFile("media/win98-hdd.img") then "media/win98-hdd.img" else "media/hdd.img"
+const FLOPPY_PATH = "media/freedos-boot.img"
 
 -- Network defaults to the built-in ISP; RVPC_NET=0 disables it. MAC/IP can be
 -- overridden without opening any host sockets.
@@ -70,6 +72,11 @@ if fs.isFile(HDD_PATH) then
 	hdd = buffer.fromstring(fs.readFile(HDD_PATH))
 end
 
+local floppy = nil
+if fs.isFile(FLOPPY_PATH) then
+	floppy = buffer.fromstring(fs.readFile(FLOPPY_PATH))
+end
+
 local cdrom = nil
 if fs.isFile(CDROM_PATH) then
 	cdrom = buffer.fromstring(fs.readFile(CDROM_PATH))
@@ -90,6 +97,7 @@ const machine = Machine.new({
 	Fpu = Fpu,
 	Dma = Dma,
 	Sb16 = Sb16,
+	Fdc = Fdc,
 	Ne2000 = Ne2000,
 	Isp = Isp,
 	Xms = Xms,
@@ -102,6 +110,7 @@ const machine = Machine.new({
 	vgaRom = vgaRom,
 	hdd = hdd,
 	cdrom = cdrom,
+	floppy = if floppy then { image = floppy } else nil,
 	network = networkConfig,
 })
 
@@ -135,6 +144,20 @@ if machine.isp then
 			tostring(machine.isp.nic ~= nil)
 		)
 	)
+end
+if machine.fdc then
+	for index = 0, 1 do
+		const drive = machine.fdc.drives[index + 1]
+		if drive.image then
+			print(
+				("FLOPPY %s: 80/2/18, %d KiB, wp=%s, dma=2, irq=6"):format(
+					if index == 0 then "A:" else "B:",
+					math.floor(buffer.len(drive.image) / 1024),
+					tostring(drive.writeProtected)
+				)
+			)
+		end
+	end
 end
 print("reset vector " .. machine:bootPc())
 print(

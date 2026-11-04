@@ -13,6 +13,7 @@ Cmos.__index = Cmos
 
 export type Config = {
 	memorySize: number?,
+	floppyType: number?,
 }
 
 export type Cmos = typeof(setmetatable(
@@ -20,6 +21,7 @@ export type Cmos = typeof(setmetatable(
 		index: number,
 		nmiMasked: boolean,
 		memorySize: number,
+		floppyType: number,
 		ram: { [number]: number },
 		shutdown: number,
 		lastReadIndex: number,
@@ -43,6 +45,7 @@ function Cmos.new(config: Config?): Cmos
 	self.index = 0
 	self.nmiMasked = false
 	self.memorySize = cfg.memorySize or (16 * 1024 * 1024)
+	self.floppyType = cfg.floppyType or 0
 	self.ram = {}
 	self.shutdown = 0
 	self.lastReadIndex = 0
@@ -96,7 +99,7 @@ local function readRegister(self: Cmos, index: number): number
 	elseif index == 0x0F then
 		return self.shutdown
 	elseif index == 0x10 then
-		return 0x00 -- no floppy drives
+		return self.floppyType -- high nibble drive A, low nibble drive B
 	elseif index == 0x12 then
 		return 0x00 -- no fixed disk types
 	elseif index == 0x14 then
