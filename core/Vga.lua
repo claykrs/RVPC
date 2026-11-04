@@ -8,14 +8,31 @@
 -- faulting; VGA.DRV probes several of them during mode set.
 --
 -- Implemented: mode 12h (640x480x16 planar), mode 13h (320x200x256 linear),
--- text mode 3 fallback, write modes 0/1/2/3, read map select, colour compare,
--- set/reset, data rotate, bit mask, map mask, CRTC start/offset, DAC writes.
--- Text mode 3 reads B8000 directly through mem and does not use odd/even plane
--- addressing. Mode 13h collapses chain-4 address decode to a linear 64 KiB
--- buffer; its write modes and bit mask are not applied.
--- Not implemented: sync timing, interlace/double-scan timing, odd/even chaining,
--- hardware panning/line compare/cursor, and the 256 KiB VGA
--- memory map beyond the first 64 KiB.
+-- text mode 3 fallback, write modes 0/1/2/3, read modes 0/1, set/reset,
+-- enable set/reset, data rotate, logical operations, read map select, colour
+-- compare/don't-care, bit mask, map mask, odd/even host addressing, CRTC
+-- start/offset, attribute-controller palette selection (including AR14 colour
+-- select), and DAC writes. Text mode 3 reads B8000 directly through mem and
+-- does not use odd/even plane addressing. Mode 13h collapses chain-4 address
+-- decode to a linear 64 KiB buffer; its write modes and bit mask are not
+-- applied.
+--
+-- Mode 12h reads and writes decode the four planes at the same byte address.
+-- Latches load on every aperture read. Write mode 3 always uses GC0 set/reset
+-- (GC1 is ignored) and preserves bit-mask-zero bits from the latches, matching
+-- VGA hardware. Odd/even host addressing is implemented for CPU reads/writes;
+-- the CGA/EGA shift-register display formats are not. The CRTC 0x22 alias
+-- exposes the four latches, as on real VGA hardware.
+--
+-- A guest VGA BIOS programs the controllers through I/O ports instead of
+-- calling setMode, so syncLegacyMode infers text/planar/linear and the visible
+-- geometry from GC6/AR10 and the CRTC registers. INT 10h AX=0012 therefore
+-- reaches the planar renderer on its own.
+--
+-- Not implemented: sync timing, interlace/double-scan timing, CGA/EGA 2bpp
+-- shift-register output, chain-2 memory, horizontal pel/byte panning,
+-- split-screen line compare, hardware text cursor, the GC6 memory-map windows
+-- at B0000/B8000, and the 256 KiB VGA memory map beyond the first 64 KiB.
 
 const band, bor, bxor, lshift, rshift, bnot =
 	bit32.band, bit32.bor, bit32.bxor, bit32.lshift, bit32.rshift, bit32.bnot
@@ -207,7 +224,7 @@ const MODE_REGISTERS: { [number]: ModeRegisters } = {
 			0xA3,
 			0xFF,
 		},
-		gfx = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF },
+		gfx = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x0F, 0xFF },
 		attr = {
 			0x00,
 			0x01,
@@ -263,6 +280,10 @@ const MODE_REGISTERS: { [number]: ModeRegisters } = {
 			0xFF,
 		},
 		gfx = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0F, 0xFF },
+		-- SeaVGABIOS mode 12h palette: the EGA gamut with brown at 0x14 and
+		-- the bright colours at 0x38..0x3F. The resulting RGB matches direct
+		-- 0..15 entries, but the register values are what real mode-set code
+		-- leaves behind (and what a driver may read back).
 		attr = {
 			0x00,
 			0x01,
@@ -270,16 +291,16 @@ const MODE_REGISTERS: { [number]: ModeRegisters } = {
 			0x03,
 			0x04,
 			0x05,
-			0x06,
+			0x14,
 			0x07,
-			0x08,
-			0x09,
-			0x0A,
-			0x0B,
-			0x0C,
-			0x0D,
-			0x0E,
-			0x0F,
+			0x38,
+			0x39,
+			0x3A,
+			0x3B,
+			0x3C,
+			0x3D,
+			0x3E,
+			0x3F,
 			0x01,
 			0x00,
 			0x0F,
@@ -611,6 +632,7 @@ export type Vga = typeof(setmetatable(
 		dacWriteComponent: number,
 		dacReadComponent: number,
 		dacMask: number,
+		dacState: number,
 		planes: { buffer },
 		chain4: buffer,
 		latches: { number },
@@ -663,6 +685,7 @@ function Vga.new(mem: Memory): Vga
 	self.dacWriteComponent = 0
 	self.dacReadComponent = 0
 	self.dacMask = 0xFF
+	self.dacState = 0x00
 	self.planes = {
 		buffer.create(PLANE_SIZE),
 		buffer.create(PLANE_SIZE),
@@ -701,10 +724,12 @@ end
 -- ---------------------------------------------------------------- mode state
 
 function Vga.mode(self: Vga): number
+	self:syncLegacyMode()
 	return self.modeNumber
 end
 
 function Vga.modeInfo(self: Vga): ModeInfo
+	self:syncLegacyMode()
 	const vbe = self.vbeInfo
 	if vbe then
 		return vbe
@@ -713,14 +738,17 @@ function Vga.modeInfo(self: Vga): ModeInfo
 end
 
 function Vga.width(self: Vga): number
+	self:syncLegacyMode()
 	return self.widthPx
 end
 
 function Vga.height(self: Vga): number
+	self:syncLegacyMode()
 	return self.heightPx
 end
 
 function Vga.stride(self: Vga): number
+	self:syncLegacyMode()
 	return self.widthPx * 4
 end
 
@@ -743,6 +771,7 @@ function Vga.vbeModeInfo(mode: any, maybeMode: number?): VbeMode?
 end
 
 function Vga.isTextMode(self: Vga): boolean
+	self:syncLegacyMode()
 	if self:isVbeEnabled() then
 		return false
 	end
@@ -767,6 +796,10 @@ function Vga.isBlanked(self: Vga): boolean
 end
 
 function Vga.readCrtc(self: Vga, index: number): number
+	if band(index, 0x3F) == 0x22 then
+		-- Undocumented CRTC 0x22 alias: the graphics-controller latches.
+		return self.latches[band(self.gfx[4], 0x03)]
+	end
 	return band(self.crtc[band(index, 0x1F)] or 0, 0xFF)
 end
 
@@ -1057,6 +1090,7 @@ function Vga.setMode(self: Vga, mode: number): boolean
 	self.dacWriteComponent = 0
 	self.dacReadComponent = 0
 	self.dacMask = 0xFF
+	self.dacState = 0x00
 	self.statusPhase = false
 	self.crtcProtected = band(self.crtc[0x11], 0x80) ~= 0
 
@@ -1151,8 +1185,21 @@ function Vga.ensurePalette(self: Vga)
 		end
 		self.paletteRGBA[index + 1] = rgbaWord(red, green, blue)
 	end
+	-- 16-colour palette selection: AR10 bit 7 picks the 16-bank/4-bit mode,
+	-- otherwise the attribute entry supplies six bits and AR14 bits 2-3 add
+	-- the two bank bits. This mirrors Bochs' get_vga_pixel path. AR14 is zero
+	-- in the standard modes, so the common case stays a direct 0..63 lookup.
+	const modeControl = self.attr[0x10]
+	const colorSelect = band(self.attr[0x14], 0x0F)
 	for index = 0, 15 do
-		const dacIndex = band(band(self.attr[index], 0x3F), self.dacMask)
+		const paletteValue = band(self.attr[index], 0x3F)
+		local dacIndex: number
+		if band(modeControl, 0x80) ~= 0 then
+			dacIndex = bor(band(paletteValue, 0x0F), lshift(band(colorSelect, 0x0F), 4))
+		else
+			dacIndex = bor(band(paletteValue, 0x3F), lshift(band(colorSelect, 0x0C), 4))
+		end
+		dacIndex = band(dacIndex, self.dacMask)
 		self.color16RGBA[index + 1] = self.paletteRGBA[dacIndex + 1]
 	end
 	self.paletteDirty = false
@@ -1203,6 +1250,7 @@ function Vga.markDirtyRect(self: Vga, x: number, y: number, width: number, heigh
 end
 
 function Vga.dirtyRect(self: Vga): DirtyRect?
+	self:syncLegacyMode()
 	if not self.dirty then
 		return nil
 	end
@@ -1222,6 +1270,143 @@ end
 
 function Vga.clearDirty(self: Vga)
 	self.dirty = false
+end
+
+-- Bytes between consecutive scanlines in the legacy framebuffer. CRTC 0x13
+-- counts words of the active addressing size: 2 bytes in byte mode, 4 in word
+-- mode, 8 in doubleword mode. The fallback keeps malformed offset-0 modes
+-- usable.
+local function legacyLineStride(self: Vga, fallbackWidth: number): number
+	local offset = band(self.crtc[0x13], 0xFF) * 2
+	if band(self.crtc[0x14], 0x40) ~= 0 then
+		offset *= 4
+	elseif band(self.crtc[0x17], 0x40) == 0 then
+		offset *= 2
+	end
+	if offset > 0 then
+		return offset
+	end
+	return math.max(1, math.ceil(fallbackWidth / 8))
+end
+
+-- A real VGA BIOS programs the controllers through the I/O ports; it does not
+-- call setMode. Infer the legacy mode from the register state so a guest mode
+-- set (notably INT 10h AX=0012) reaches the planar renderer. This is also the
+-- reason the standard-mode register tables above mirror SeaVGABIOS.
+--
+-- Only the geometry and kind are refreshed. Plane contents, latches, the DAC
+-- and the chain4 buffer survive, because the BIOS has already programmed them
+-- (and may have written font/pixel data) by the time the host presents a frame.
+function Vga.syncLegacyMode(self: Vga)
+	if self:isVbeEnabled() then
+		return
+	end
+
+	-- GC6 bit 0 (alpha disable) and AR10 bit 0 (graphics mode) both report
+	-- graphics. Require agreement: font loading in text mode briefly changes
+	-- GC6 for the A0000 plane-2 window while AR10 stays alphanumeric, and that
+	-- must not flip the host to a 640x480 planar frame.
+	const graphics = band(self.gfx[6], 0x01) ~= 0 and band(self.attr[0x10], 0x01) ~= 0
+	if not graphics then
+		const textInfo = MODES[0x03] :: ModeInfo
+		if
+			self.info.kind == "text"
+			and self.info.width == textInfo.width
+			and self.info.height == textInfo.height
+			and self.modeNumber == textInfo.mode
+		then
+			return
+		end
+		self.info = textInfo
+		self.modeNumber = textInfo.mode
+		self.widthPx = textInfo.width
+		self.heightPx = textInfo.height
+		self.rgba = buffer.create(textInfo.width * textInfo.height * 4)
+		self:markAllDirty()
+		return
+	end
+
+	const chain4 = self:isChain4()
+	local width = (band(self.crtc[0x01], 0xFF) + 1) * 8
+	if chain4 and band(self.gfx[5], 0x40) ~= 0 then
+		-- 256-colour shift mode clocks two pixels per dot clock, so the CRTC
+		-- horizontal display count is twice the visible pixel width.
+		width = math.floor(width / 2)
+	end
+	const verticalDisplay = (
+		band(self.crtc[0x12], 0xFF)
+		+ lshift(band(self.crtc[0x07], 0x02), 7)
+		+ lshift(band(self.crtc[0x07], 0x40), 3)
+	) + 1
+	const scanLines = band(self.crtc[0x09], 0x1F) + 1
+	local height = math.floor(verticalDisplay / scanLines)
+	if band(self.crtc[0x09], 0x80) ~= 0 then
+		-- Scan doubling repeats each source line twice.
+		height = math.floor(height / 2)
+	end
+	-- A half-programmed mode-set sequence can momentarily look like a
+	-- 640x25 planar mode (text CRTC values with the graphics bits already
+	-- set). Every supported VGA graphics mode is at least 200 lines; ignore
+	-- implausible geometry until the CRTC writes catch up.
+	if width < 8 or height < 100 then
+		return
+	end
+	width = math.min(width, VBE_MAX_XRES)
+	height = math.min(height, VBE_MAX_YRES)
+
+	local kind: ModeKind = if chain4 then "linear" else "planar"
+	const bitsPerPixel = if chain4 then 8 else 4
+	const lineStride = legacyLineStride(self, width)
+	const rowBytes = if chain4 then math.max(width, lineStride) else lineStride
+
+	-- Name the standard planar modes when the geometry matches. AR12 tells
+	-- the 1bpp variants (0x0F/0x11) apart from the 16-colour ones
+	-- (0x10/0x12); both use the same four-plane renderer with plane masking.
+	local modeNumber = 0x1FF
+	if kind == "planar" then
+		const planeEnable = band(self.attr[0x12], 0x0F)
+		if width == 320 and height == 200 then
+			modeNumber = 0x0D
+		elseif width == 640 and height == 200 then
+			modeNumber = 0x0E
+		elseif width == 640 and height == 350 then
+			modeNumber = if planeEnable == 0x01 then 0x0F else 0x10
+		elseif width == 640 and height == 480 then
+			modeNumber = if planeEnable == 0x01 then 0x11 else 0x12
+		elseif width == 800 and height == 600 then
+			modeNumber = 0x6A
+		end
+	elseif kind == "linear" and width == 320 and height == 200 then
+		modeNumber = 0x13
+	end
+
+	if
+		self.info.kind == kind
+		and self.info.width == width
+		and self.info.height == height
+		and self.info.rowBytes == rowBytes
+		and self.info.bitsPerPixel == bitsPerPixel
+		and self.modeNumber == modeNumber
+	then
+		return
+	end
+
+	self.info = {
+		mode = modeNumber,
+		kind = kind,
+		width = width,
+		height = height,
+		rowBytes = rowBytes,
+		bitsPerPixel = bitsPerPixel,
+		label = if kind == "planar"
+			then string.format("%dx%d planar", width, height)
+			else string.format("%dx%d linear", width, height),
+	}
+	self.modeNumber = modeNumber
+	self.widthPx = width
+	self.heightPx = height
+	self.rgba = buffer.create(width * height * 4)
+	self:markAllDirty()
 end
 
 -- ------------------------------------------------------------ memory aperture
@@ -1272,23 +1457,60 @@ function Vga.markVbeWrite(self: Vga, offset: number, length: number)
 	end
 end
 
+-- The CRTC start address is a memory-address counter. Its unit depends on the
+-- addressing mode: CRTC 0x14 bit 6 selects doubleword (x4), otherwise CRTC
+-- 0x17 bit 6 selects byte (x1) or word (x2). Mode 12h is byte mode, mode 13h
+-- is doubleword mode, and text mode is word mode. Getting this wrong makes
+-- page flipping and hardware panning show the wrong scanlines.
 function Vga.displayStartBytes(self: Vga): number
 	const words = bor(lshift(band(self.crtc[0x0C], 0xFF), 8), band(self.crtc[0x0D], 0xFF))
-	return band(lshift(words, 1), 0xFFFF)
+	local shift = 1
+	if band(self.crtc[0x14], 0x40) ~= 0 then
+		shift = 2
+	elseif band(self.crtc[0x17], 0x40) ~= 0 then
+		shift = 0
+	end
+	return band(lshift(words, shift), 0xFFFF)
 end
 
 function Vga.planarRowBytes(self: Vga): number
-	const offset = band(self.crtc[0x13], 0xFF) * 2
-	if offset > 0 then
-		return offset
-	end
-	return math.max(1, math.ceil(self.widthPx / 8))
+	return legacyLineStride(self, self.widthPx)
 end
 
 function Vga.loadLatches(self: Vga, offset: number)
 	for plane = 0, 3 do
 		self.latches[plane] = buffer.readu8(self.planes[plane + 1], band(offset, 0xFFFF))
 	end
+end
+
+-- Chain-4 reads select one plane per host byte. The retained chain4 buffer is
+-- the same byte sequence the guest sees, so the four latches for a host byte
+-- come from the aligned group of four entries.
+function Vga.loadChain4Latches(self: Vga, offset: number)
+	const base = band(offset, 0xFFFC)
+	for plane = 0, 3 do
+		self.latches[plane] = buffer.readu8(self.chain4, band(base + plane, 0xFFFF))
+	end
+end
+
+-- Resolve a planar host address to (plane byte offset, plane group mask). In
+-- odd/even mode host A0 selects the even (0/2) or odd (1/3) plane group and is
+-- not part of the byte address. The standard planar modes disable odd/even
+-- (sequencer memory-mode bit 2 set), so the common path is a direct map.
+local function planarAddress(self: Vga, offset: number): (number, number)
+	const masked = band(offset, 0xFFFF)
+	if self:isOddEven() then
+		const group = if band(masked, 0x01) ~= 0 then 0x0A else 0x05
+		return band(masked, 0xFFFE), group
+	end
+	return masked, 0x0F
+end
+
+local function planarReadPlane(self: Vga, offset: number): number
+	if self:isOddEven() then
+		return bor(band(self.gfx[4], 0x02), band(offset, 0x01))
+	end
+	return band(self.gfx[4], 0x03)
 end
 
 function Vga.read8(self: Vga, addr: number): number
@@ -1307,15 +1529,19 @@ function Vga.read8(self: Vga, addr: number): number
 	end
 	const offset = apertureOffset(addr)
 	if self.info.kind == "linear" or self:isChain4() then
+		self:loadChain4Latches(offset)
 		return buffer.readu8(self.chain4, band(offset, 0xFFFF))
 	end
 
-	self:loadLatches(offset)
+	const planeOffset = planarAddress(self, offset)
+	self:loadLatches(planeOffset)
 
-	-- Graphics Controller mode bit 3 selects colour-compare reads.
+	-- Graphics Controller mode bit 3 selects colour-compare reads. Despite its
+	-- name, GC7 is a compare-enable mask: a set bit means that plane takes part
+	-- in the comparison, a clear bit is ignored (Bochs and FreeVGA agree).
 	if band(rshift(self.gfx[5], 3), 0x01) == 1 then
 		const compare = band(self.gfx[2], 0x0F)
-		const ignore = band(self.gfx[7], 0x0F)
+		const compareMask = band(self.gfx[7], 0x0F)
 		local value = 0
 		for bit = 7, 0, -1 do
 			const index = bor(
@@ -1328,15 +1554,14 @@ function Vga.read8(self: Vga, addr: number): number
 					)
 				)
 			)
-			if band(bxor(index, compare), band(bnot(ignore), 0x0F)) == 0 then
+			if band(bxor(index, compare), compareMask) == 0 then
 				value = bor(value, lshift(1, bit))
 			end
 		end
 		return value
 	end
 
-	const plane = band(self.gfx[4], 0x03)
-	return buffer.readu8(self.planes[plane + 1], band(offset, 0xFFFF))
+	return self.latches[planarReadPlane(self, offset)]
 end
 
 function Vga.write8(self: Vga, addr: number, value: number)
@@ -1356,55 +1581,61 @@ function Vga.write8(self: Vga, addr: number, value: number)
 	end
 	const offset = apertureOffset(addr)
 	if self.info.kind == "linear" or self:isChain4() then
+		-- In chain-4 the low address bits select the plane, so the map mask
+		-- applies per host byte (QEMU behaves this way; mode 13h enables all
+		-- four planes).
+		if self:isChain4() and band(self.seq[2], lshift(1, band(offset, 0x03))) == 0 then
+			return
+		end
 		buffer.writeu8(self.chain4, band(offset, 0xFFFF), band(value, 0xFF))
 		self:markApertureDirty(offset)
 		return
 	end
 
 	const data = band(value, 0xFF)
-	const mode = band(self.gfx[5], 0x03)
-	const mapMask = band(self.seq[2], 0x0F)
+	const writeMode = band(self.gfx[5], 0x03)
+	const fn = band(rshift(self.gfx[3], 3), 0x03)
+	const rotated = rotateRight(data, band(self.gfx[3], 0x07))
 	const bitMask = band(self.gfx[8], 0xFF)
+	const setReset = band(self.gfx[0], 0x0F)
+	const setResetEnable = band(self.gfx[1], 0x0F)
+	const planeOffset, groupMask = planarAddress(self, offset)
+	const mapMask = band(band(self.seq[2], 0x0F), groupMask)
 
 	for plane = 0, 3 do
 		if band(mapMask, lshift(1, plane)) ~= 0 then
+			const latch = self.latches[plane]
 			local written: number
-			if mode == 1 then
+			if writeMode == 1 then
 				-- Write mode 1: copy the latches; CPU data is ignored.
-				written = self.latches[plane]
-			elseif mode == 2 then
-				-- Write mode 2: one data bit expands to a full plane byte.
-				const source = band(data, lshift(1, plane)) ~= 0 and 0xFF or 0x00
-				written =
-					bor(band(source, bitMask), band(self.latches[plane], band(bnot(bitMask), 0xFF)))
-			elseif mode == 3 then
-				-- Write mode 3: CPU data AND bit mask selects the latched (or
-				-- set/reset) source bits; the destination keeps the rest. This
-				-- is the transparent/masked blit path most Win16 sprites use.
-				const rotated = rotateRight(data, band(self.gfx[3], 0x07))
+				written = latch
+			elseif writeMode == 2 then
+				-- Write mode 2: one data bit expands to a full plane byte, then
+				-- the logical-operation stage runs against the latches.
+				const source = if band(data, lshift(1, plane)) ~= 0 then 0xFF else 0x00
+				const result = applyDataFunction(source, latch, fn)
+				written = bor(band(result, bitMask), band(latch, band(bnot(bitMask), 0xFF)))
+			elseif writeMode == 3 then
+				-- Write mode 3: set/reset is always the source (Enable
+				-- Set/Reset is ignored), the rotated CPU byte AND bit mask
+				-- selects source bits, and the latches supply the rest. Bochs
+				-- and QEMU both run the logical-operation stage here even
+				-- though FreeVGA only documents it for modes 0 and 2.
 				const mask = band(rotated, bitMask)
-				local source: number
-				if band(self.gfx[1], lshift(1, plane)) ~= 0 then
-					source = band(self.gfx[0], lshift(1, plane)) ~= 0 and 0xFF or 0x00
-				else
-					source = self.latches[plane]
-				end
-				const destination = buffer.readu8(self.planes[plane + 1], band(offset, 0xFFFF))
-				written = bor(band(source, mask), band(destination, band(bnot(mask), 0xFF)))
+				const source = if band(setReset, lshift(1, plane)) ~= 0 then 0xFF else 0x00
+				const result = applyDataFunction(source, latch, fn)
+				written = bor(band(result, mask), band(latch, band(bnot(mask), 0xFF)))
 			else
-				const rotated = rotateRight(data, band(self.gfx[3], 0x07))
-				const fn = band(rshift(self.gfx[3], 3), 0x03)
-				local source: number
-				if band(self.gfx[1], lshift(1, plane)) ~= 0 then
-					-- Set/reset overrides CPU data for this plane.
-					source = band(self.gfx[0], lshift(1, plane)) ~= 0 and 0xFF or 0x00
-				else
-					source = applyDataFunction(rotated, self.latches[plane], fn)
-				end
-				written =
-					bor(band(source, bitMask), band(self.latches[plane], band(bnot(bitMask), 0xFF)))
+				-- Write mode 0: rotate, choose set/reset or CPU data per plane,
+				-- pass through the logical-operation stage, then the bit mask
+				-- selects between the result and the latches.
+				const source = if band(setResetEnable, lshift(1, plane)) ~= 0
+					then (if band(setReset, lshift(1, plane)) ~= 0 then 0xFF else 0x00)
+					else rotated
+				const result = applyDataFunction(source, latch, fn)
+				written = bor(band(result, bitMask), band(latch, band(bnot(bitMask), 0xFF)))
 			end
-			buffer.writeu8(self.planes[plane + 1], band(offset, 0xFFFF), band(written, 0xFF))
+			buffer.writeu8(self.planes[plane + 1], planeOffset, band(written, 0xFF))
 		end
 	end
 	self:markApertureDirty(offset)
@@ -1454,9 +1685,17 @@ function Vga.markApertureDirty(self: Vga, offset: number)
 	end
 	const relative = offset - start
 	if self.info.kind == "linear" or self:isChain4() then
-		const x = relative % self.widthPx
-		const y = math.floor(relative / self.widthPx)
+		const rowBytes = math.max(self.widthPx, self:planarRowBytes())
+		const x = relative % rowBytes
+		const y = math.floor(relative / rowBytes)
 		self:markDirtyRect(x, y, 1, 1)
+		return
+	end
+	if self:isOddEven() then
+		-- Odd/even host addresses fold two host bytes into one plane byte and
+		-- the display uses a CGA/EGA shift format; a conservative full-frame
+		-- invalidation keeps the sink correct without modelling that format.
+		self:markAllDirty()
 		return
 	end
 	const rowBytes = self:planarRowBytes()
@@ -1491,13 +1730,18 @@ function Vga.noteWrite(self: Vga, addr: number, length: number)
 	end
 
 	if self.info.kind == "linear" or self:isChain4() then
-		const y0 = math.floor(relativeFirst / self.widthPx)
-		const y1 = math.floor(relativeLast / self.widthPx)
+		const rowBytes = math.max(self.widthPx, self:planarRowBytes())
+		const y0 = math.floor(relativeFirst / rowBytes)
+		const y1 = math.floor(relativeLast / rowBytes)
 		if y0 == y1 then
-			self:markDirtyRect(relativeFirst % self.widthPx, y0, length, 1)
+			self:markDirtyRect(relativeFirst % rowBytes, y0, length, 1)
 		else
 			self:markDirtyRect(0, y0, self.widthPx, y1 - y0 + 1)
 		end
+		return
+	end
+	if self:isOddEven() then
+		self:markAllDirty()
 		return
 	end
 
@@ -1525,6 +1769,11 @@ function Vga.in8(self: Vga, port: number): number
 	elseif address == 0x1D0 then
 		return band(rshift(self:vbeReadData(), 8), 0xFF)
 	elseif address == 0x3C0 then
+		-- Address/read flip-flop: in address mode 0x3C0 returns the index plus
+		-- the video-enable bit; in data mode it returns the selected register.
+		if self.attrFlipFlop then
+			return bor(if self.attrPas then 0x20 else 0x00, band(self.attrIndex, 0x1F))
+		end
 		return band(self.attr[self.attrIndex] or 0, 0xFF)
 	elseif address == 0x3C1 then
 		return band(self.attr[self.attrIndex] or 0, 0xFF)
@@ -1537,10 +1786,15 @@ function Vga.in8(self: Vga, port: number): number
 	elseif address == 0x3C6 then
 		return self.dacMask
 	elseif address == 0x3C7 then
-		return self.dacReadIndex
+		-- DAC state: 11b after a read-address write, 00b after a write-address
+		-- write. The read index itself is not visible through this port.
+		return self.dacState
 	elseif address == 0x3C8 then
 		return self.dacWriteIndex
 	elseif address == 0x3C9 then
+		if self.dacState ~= 0x03 then
+			return 0x3F
+		end
 		const base = self.dacReadIndex * 3 + self.dacReadComponent
 		const value = buffer.readu8(self.dac, base)
 		self.dacReadComponent += 1
@@ -1558,6 +1812,9 @@ function Vga.in8(self: Vga, port: number): number
 	elseif address == 0x3D4 or address == 0x3B4 then
 		return self.crtcIndex
 	elseif address == 0x3D5 or address == 0x3B5 then
+		if self.crtcIndex == 0x22 then
+			return self.latches[band(self.gfx[4], 0x03)]
+		end
 		return band(self.crtc[self.crtcIndex] or 0, 0xFF)
 	elseif address == 0x3DA or address == 0x3BA then
 		-- A toggling retrace bit lets both wait-for-set and wait-for-clear loops
@@ -1575,13 +1832,17 @@ end
 
 function Vga.writeCrtc(self: Vga, value: number)
 	const index = self.crtcIndex
+	if index == 0x22 then
+		-- CRTC 0x22 is the read-only latch alias.
+		return
+	end
 	if index == 0x11 then
 		self.crtcProtected = band(value, 0x80) ~= 0
 	elseif index <= 0x07 and self.crtcProtected then
 		return
 	end
 	self.crtc[index] = band(value, 0xFF)
-	if index == 0x0C or index == 0x0D or index == 0x13 then
+	if index == 0x0C or index == 0x0D or index == 0x13 or index == 0x14 or index == 0x17 then
 		self:markAllDirty()
 	end
 end
@@ -1609,10 +1870,12 @@ function Vga.out8(self: Vga, port: number, value: number)
 	elseif address == 0x1CF then
 		const current = self:vbeReadRegister(self.vbeIndex)
 		self:vbeWriteRegister(self.vbeIndex, bor(band(current, 0xFF00), byte))
+		self:syncLegacyMode()
 		return
 	elseif address == 0x1D0 then
 		const current = self:vbeReadRegister(self.vbeIndex)
 		self:vbeWriteRegister(self.vbeIndex, bor(band(current, 0x00FF), lshift(byte, 8)))
+		self:syncLegacyMode()
 		return
 	elseif address == 0x3C0 then
 		if self.attrFlipFlop then
@@ -1646,9 +1909,11 @@ function Vga.out8(self: Vga, port: number, value: number)
 	elseif address == 0x3C7 then
 		self.dacReadIndex = byte
 		self.dacReadComponent = 0
+		self.dacState = 0x03
 	elseif address == 0x3C8 then
 		self.dacWriteIndex = byte
 		self.dacWriteComponent = 0
+		self.dacState = 0x00
 	elseif address == 0x3C9 then
 		self:writeDac(byte)
 	elseif address == 0x3CE then
@@ -1656,7 +1921,8 @@ function Vga.out8(self: Vga, port: number, value: number)
 	elseif address == 0x3CF then
 		self.gfx[self.gfxIndex] = byte
 	elseif address == 0x3D4 or address == 0x3B4 then
-		self.crtcIndex = band(byte, 0x1F)
+		-- 0x22 is the latch readback alias, so allow the full 6-bit index.
+		self.crtcIndex = band(byte, 0x3F)
 	elseif address == 0x3D5 or address == 0x3B5 then
 		self:writeCrtc(byte)
 	elseif address == 0x3DA or address == 0x3BA then
@@ -1665,6 +1931,7 @@ function Vga.out8(self: Vga, port: number, value: number)
 	else
 		self.latched[address] = byte
 	end
+	self:syncLegacyMode()
 end
 
 -- Word access for the DISPI pair. Machine should call these for 16-bit I/O at
@@ -1686,6 +1953,7 @@ function Vga.out16(self: Vga, port: number, value: number)
 		return
 	elseif address == 0x1CF then
 		self:vbeWriteRegister(self.vbeIndex, band(value, 0xFFFF))
+		self:syncLegacyMode()
 		return
 	end
 	self:out8(address, band(value, 0xFF))
@@ -1749,11 +2017,12 @@ local function blitLinear(self: Vga, x0: number, y0: number, x1: number, y1: num
 	const target = self.rgba
 	const width = self.widthPx
 	const start = self:displayStartBytes()
+	const rowBytes = math.max(width, self:planarRowBytes())
 	const colors = self.paletteRGBA
 	const mask = self.dacMask
 
 	for y = y0, y1 - 1 do
-		const rowBase = start + y * width
+		const rowBase = start + y * rowBytes
 		local dest = (y * width + x0) * 4
 		for x = x0, x1 - 1 do
 			const index = band(buffer.readu8(self.chain4, band(rowBase + x, 0xFFFF)), mask)
@@ -1851,26 +2120,31 @@ local function renderVbe(self: Vga, x0: number, y0: number, x1: number, y1: numb
 end
 
 function Vga.renderPlanar(self: Vga)
+	self:syncLegacyMode()
 	blitPlanar(self, 0, 0, self.widthPx, self.heightPx)
 end
 
 function Vga.renderLinear(self: Vga)
+	self:syncLegacyMode()
 	blitLinear(self, 0, 0, self.widthPx, self.heightPx)
 end
 
 function Vga.renderText(self: Vga)
+	self:syncLegacyMode()
 	self:ensurePalette()
 	const target = self.rgba
 	const width = self.widthPx
-	const start = band(self:displayStartBytes(), 0xFFFF)
+	-- The colour text aperture is B8000-BFFFF (32 KiB); wrap the CRTC start
+	-- address inside that window instead of reading past it into option ROM.
+	const start = band(self:displayStartBytes(), 0x7FFF)
 	const colors = self.color16RGBA
 	const blank = FONT[63] :: { number }
 	const blink = band(self.attr[16], 0x08) ~= 0
 
 	for row = 0, TEXT_ROWS - 1 do
-		const sourceRow = band(start + row * TEXT_COLS * 2, 0xFFFF)
+		const sourceRow = band(start + row * TEXT_COLS * 2, 0x7FFF)
 		for col = 0, TEXT_COLS - 1 do
-			const cell = band(sourceRow + col * 2, 0xFFFF)
+			const cell = band(sourceRow + col * 2, 0x7FFF)
 			const code = self.mem:read8(TEXT_BASE + cell)
 			const attribute = self.mem:read8(TEXT_BASE + cell + 1)
 			const foreground = colors[band(attribute, 0x0F) + 1]
@@ -1899,6 +2173,7 @@ end
 -- buffer is overwritten by the next snapshotRGBA call (and replaced by
 -- setMode), so copy it before retaining it across frames.
 function Vga.snapshotRGBA(self: Vga): buffer
+	self:syncLegacyMode()
 	if self:isVbeEnabled() then
 		renderVbe(self, 0, 0, self.widthPx, self.heightPx)
 		return self.rgba
@@ -1927,6 +2202,7 @@ function Vga.snapshotRegionRGBA(
 	width: number,
 	height: number
 ): buffer
+	self:syncLegacyMode()
 	const x0 = math.max(0, math.floor(x))
 	const y0 = math.max(0, math.floor(y))
 	const x1 = math.min(self.widthPx, math.floor(x + width))
@@ -1981,8 +2257,9 @@ function Vga.fillRect(self: Vga, x: number, y: number, width: number, height: nu
 
 	if self.info.kind == "linear" or self:isChain4() then
 		const start = self:displayStartBytes()
+		const rowBytes = math.max(self.widthPx, self:planarRowBytes())
 		for row = y0, y1 - 1 do
-			const rowBase = start + row * self.widthPx
+			const rowBase = start + row * rowBytes
 			for column = x0, x1 - 1 do
 				buffer.writeu8(self.chain4, band(rowBase + column, 0xFFFF), index)
 			end
@@ -2081,6 +2358,7 @@ function Vga.fillTextPattern(self: Vga)
 end
 
 function Vga.fillTestPattern(self: Vga)
+	self:syncLegacyMode()
 	-- Diagnostics should be visible even after a guest left the display blanked.
 	self.attrPas = true
 	self.seq[1] = band(self.seq[1], band(bnot(0x20), 0xFF))

@@ -41,6 +41,7 @@ local dmaTests = require("../tests/DmaTests")
 local sb16Tests = require("../tests/Sb16Tests")
 local fdcTests = require("../tests/FdcTests")
 local platformTests = require("../tests/PlatformTests")
+local vgaMode12Tests = require("../tests/VgaMode12Tests")
 local inputMapTests = require("../tests/InputMapTests")
 
 const deps = {
@@ -124,6 +125,7 @@ runDirectSuite("dma", dmaTests)
 runDirectSuite("sb16", sb16Tests)
 runDirectSuite("fdc", fdcTests)
 runDirectSuite("platform", platformTests)
+runDirectSuite("vga12", vgaMode12Tests)
 runDirectSuite("inputmap", inputMapTests)
 
 print(("passed assertions: %d"):format(passed))
