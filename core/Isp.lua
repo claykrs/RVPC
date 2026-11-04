@@ -1,9 +1,11 @@
 --!strict
 -- Isp.lua -- small host-side ISP for the NE2000 link.
 --
--- The ISP terminates Ethernet/ARP, IPv4, ICMP echo, DHCP and DNS for a private
--- 10.0.2.0/24 network. It has no Roblox or host socket dependency: attach() a
--- NE2000 and it consumes transmitted frames and injects replies.
+-- The ISP terminates Ethernet/ARP, IPv4, ICMP echo, DHCP, DNS, TCP and a
+-- minimal HTTP/1.0 server for a private 10.0.2.0/24 network. It has no Roblox
+-- or host socket dependency: attach() a NE2000 and it consumes transmitted
+-- frames and injects replies. TCP retransmission is host-driven: call tick()
+-- if a machine wants idle/time-wait cleanup.
 
 const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
 
@@ -16,6 +18,45 @@ const IP_ICMP = 1
 const IP_UDP = 17
 const IP_TCP = 6
 
+const TCP_FIN = 0x01
+const TCP_SYN = 0x02
+const TCP_RST = 0x04
+const TCP_PSH = 0x08
+const TCP_ACK = 0x10
+
+const TCP_HTTP_PORT = 80
+const TCP_WINDOW = 0xFFFF
+const DEFAULT_HTTP_BODY = "<html><body><h1>RVPC virtual ISP</h1></body></html>"
+
+export type HttpRequest = {
+	method: string,
+	path: string,
+	version: string,
+	headers: { [string]: string },
+}
+
+export type HttpResponse = {
+	status: number?,
+	body: string?,
+	contentType: string?,
+}
+
+export type TcpConnection = {
+	guestIp: Ip,
+	guestPort: number,
+	serverIp: Ip,
+	serverPort: number,
+	state: string,
+	sndUna: number,
+	sndNxt: number,
+	sndWnd: number,
+	rcvNxt: number,
+	guestWnd: number,
+	requestText: string,
+	httpSent: boolean,
+	lastActivity: number,
+}
+
 export type Config = {
 	mac: string?,
 	ip: string?,
@@ -23,6 +64,9 @@ export type Config = {
 	dns: string?,
 	clientIp: string?,
 	hostname: string?,
+	httpBody: string?,
+	httpContentType: string?,
+	httpHandler: ((request: HttpRequest) -> HttpResponse)?,
 }
 
 type Ip = { number }
@@ -39,9 +83,17 @@ export type Isp = typeof(setmetatable(
 		nic: any,
 		arp: { [string]: Mac },
 		nextId: number,
+		tcp: { [string]: TcpConnection },
+		nextTcpSeq: number,
+		now: number,
+		httpBody: string,
+		httpContentType: string,
+		httpHandler: ((request: HttpRequest) -> HttpResponse)?,
 		new: (config: Config?) -> Isp,
 		attach: (self: Isp, nic: any) -> (),
 		receive: (self: Isp, frame: buffer) -> (),
+		setHttpHandler: (self: Isp, handler: ((request: HttpRequest) -> HttpResponse)?) -> (),
+		tick: (self: Isp, now: number?) -> (),
 		macString: (self: Isp) -> string,
 		ipString: (self: Isp) -> string,
 	},
@@ -196,7 +248,29 @@ function Isp.new(config: Config?): Isp
 		["10.0.2.80"] = self.mac,
 	}
 	self.nextId = 1
+	self.tcp = {}
+	self.nextTcpSeq = 0x10000000
+	self.now = 0
+	self.httpBody = cfg.httpBody or DEFAULT_HTTP_BODY
+	self.httpContentType = cfg.httpContentType or "text/html"
+	self.httpHandler = cfg.httpHandler
 	return self
+end
+
+function Isp.setHttpHandler(self: Isp, handler: ((request: HttpRequest) -> HttpResponse)?)
+	self.httpHandler = handler
+end
+
+function Isp.tick(self: Isp, now: number?)
+	self.now = now or (self.now + 1)
+	for key, connection in pairs(self.tcp) do
+		if
+			connection.state == "closed"
+			or (connection.state == "time_wait" and self.now - connection.lastActivity > 60)
+		then
+			self.tcp[key] = nil
+		end
+	end
 end
 
 function Isp.macString(self: Isp): string
@@ -428,6 +502,388 @@ local function handleDns(self: Isp, srcMac: Mac, srcIp: Ip, srcPort: number, pay
 	sendUdp(self, srcMac, srcIp, 53, srcPort, answer)
 end
 
+local function seqAdd(seq: number, count: number): number
+	return band(seq + count, 0xFFFFFFFF)
+end
+
+local function seqLess(a: number, b: number): boolean
+	return band(a - b, 0xFFFFFFFF) > 0x80000000
+end
+
+local function tcpChecksum(srcIp: Ip, dstIp: Ip, segment: buffer): number
+	const length = buffer.len(segment)
+	const pseudo = buffer.create(12 + length)
+	writeIp(pseudo, 0, srcIp)
+	writeIp(pseudo, 4, dstIp)
+	buffer.writeu8(pseudo, 8, 0)
+	buffer.writeu8(pseudo, 9, IP_TCP)
+	writeBE16(pseudo, 10, length)
+	buffer.copy(pseudo, 12, segment, 0, length)
+	return checksum(pseudo, 0, 12 + length)
+end
+
+local function sendTcp(
+	self: Isp,
+	destMac: Mac,
+	destIp: Ip,
+	srcPort: number,
+	dstPort: number,
+	seq: number,
+	ack: number,
+	flags: number,
+	window: number,
+	payload: buffer
+)
+	const segment = buffer.create(20 + buffer.len(payload))
+	writeBE16(segment, 0, srcPort)
+	writeBE16(segment, 2, dstPort)
+	writeBE32(segment, 4, seq)
+	writeBE32(segment, 8, ack)
+	buffer.writeu8(segment, 12, 0x50)
+	buffer.writeu8(segment, 13, flags)
+	writeBE16(segment, 14, window)
+	writeBE16(segment, 16, 0)
+	writeBE16(segment, 18, 0)
+	buffer.copy(segment, 20, payload, 0, buffer.len(payload))
+	writeBE16(segment, 16, tcpChecksum(self.ip, destIp, segment))
+	sendIpv4(self, destMac, destIp, IP_TCP, segment)
+end
+
+local function connectionKey(
+	guestIp: Ip,
+	guestPort: number,
+	serverIp: Ip,
+	serverPort: number
+): string
+	return ("%s:%d->%s:%d"):format(ipString(guestIp), guestPort, ipString(serverIp), serverPort)
+end
+
+local function bufferToString(buf: buffer): string
+	local chars = table.create(buffer.len(buf))
+	for index = 1, buffer.len(buf) do
+		chars[index] = string.char(buffer.readu8(buf, index - 1))
+	end
+	return table.concat(chars)
+end
+
+local REASONS: { [number]: string } = {
+	[200] = "OK",
+	[400] = "Bad Request",
+	[404] = "Not Found",
+	[405] = "Method Not Allowed",
+	[500] = "Internal Server Error",
+}
+
+local function defaultHttpResponse(self: Isp, request: HttpRequest): HttpResponse
+	if request.method ~= "GET" and request.method ~= "HEAD" then
+		return { status = 405, body = "Method Not Allowed", contentType = "text/plain" }
+	end
+	if request.path == "/" or request.path == "/index.html" then
+		return { status = 200, body = self.httpBody, contentType = self.httpContentType }
+	end
+	return { status = 404, body = "Not Found", contentType = "text/plain" }
+end
+
+local function buildHttpResponse(self: Isp, request: HttpRequest): string
+	local response: HttpResponse
+	if self.httpHandler then
+		response = self.httpHandler(request)
+	else
+		response = defaultHttpResponse(self, request)
+	end
+	const status = response.status or 200
+	const body = response.body or ""
+	const contentType = response.contentType or "text/html"
+	const reason = REASONS[status] or "Error"
+	local text = ("HTTP/1.0 %d %s\r\n"):format(status, reason)
+	text ..= ("Content-Type: %s\r\n"):format(contentType)
+	text ..= ("Content-Length: %d\r\n"):format(#body)
+	text ..= "Connection: close\r\n\r\n"
+	if request.method ~= "HEAD" then
+		text ..= body
+	end
+	return text
+end
+
+local function sendHttpResponse(
+	self: Isp,
+	conn: TcpConnection,
+	destMac: Mac,
+	destIp: Ip,
+	text: string
+)
+	const payload = buffer.fromstring(text)
+	sendTcp(
+		self,
+		destMac,
+		destIp,
+		conn.serverPort,
+		conn.guestPort,
+		conn.sndNxt,
+		conn.rcvNxt,
+		bor(TCP_ACK, TCP_PSH),
+		TCP_WINDOW,
+		payload
+	)
+	conn.sndNxt = seqAdd(conn.sndNxt, buffer.len(payload))
+	sendTcp(
+		self,
+		destMac,
+		destIp,
+		conn.serverPort,
+		conn.guestPort,
+		conn.sndNxt,
+		conn.rcvNxt,
+		bor(TCP_ACK, TCP_FIN),
+		TCP_WINDOW,
+		buffer.create(0)
+	)
+	conn.sndNxt = seqAdd(conn.sndNxt, 1)
+	conn.state = "fin_wait"
+	conn.httpSent = true
+	conn.lastActivity = self.now
+end
+
+local function processHttp(self: Isp, conn: TcpConnection, destMac: Mac, destIp: Ip): boolean
+	if conn.httpSent then
+		return false
+	end
+	const marker = string.find(conn.requestText, "\r\n\r\n", 1, true)
+	if not marker then
+		return false
+	end
+	const head = string.sub(conn.requestText, 1, marker - 1)
+	const requestLine = string.match(head, "^([^\r\n]*)") or ""
+	const headerText = string.match(head, "^[^\r\n]*\r?\n(.*)$") or ""
+	const method, rawPath, version = string.match(requestLine, "^(%S+)%s+(%S+)%s+(%S+)")
+	if not method or not rawPath or not version then
+		-- A malformed request still gets a deterministic HTTP error.
+		const response =
+			"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request"
+		sendHttpResponse(self, conn, destMac, destIp, response)
+		return true
+	end
+	const headers: { [string]: string } = {}
+	for line in string.gmatch(headerText or "", "([^\r\n]+)") do
+		const name, value = string.match(line, "^([^:]+):%s*(.*)$")
+		if name then
+			headers[string.lower(name)] = value
+		end
+	end
+	local path = string.match(rawPath, "^[^?]*") or rawPath
+	const request: HttpRequest = {
+		method = string.upper(method),
+		path = path,
+		version = version,
+		headers = headers,
+	}
+	const text = buildHttpResponse(self, request)
+	sendHttpResponse(self, conn, destMac, destIp, text)
+	return true
+end
+
+local function sendDuplicateAck(self: Isp, conn: TcpConnection, destMac: Mac, destIp: Ip)
+	sendTcp(
+		self,
+		destMac,
+		destIp,
+		conn.serverPort,
+		conn.guestPort,
+		conn.sndNxt,
+		conn.rcvNxt,
+		TCP_ACK,
+		TCP_WINDOW,
+		buffer.create(0)
+	)
+end
+
+local function sendReset(self: Isp, srcMac: Mac, srcIp: Ip, payload: buffer)
+	if buffer.len(payload) < 20 then
+		return
+	end
+	const srcPort = readBE16(payload, 0)
+	const dstPort = readBE16(payload, 2)
+	const seq = readBE32(payload, 4)
+	const ack = readBE32(payload, 8)
+	const dataOffset = rshift(buffer.readu8(payload, 12), 4) * 4
+	const flags = buffer.readu8(payload, 13)
+	const dataLength = math.max(0, buffer.len(payload) - dataOffset)
+	local seqOut, ackOut, flagsOut
+	if band(flags, TCP_ACK) ~= 0 then
+		seqOut, ackOut, flagsOut = ack, 0, TCP_RST
+	else
+		const consumed = dataLength
+			+ (if band(flags, TCP_SYN) ~= 0 then 1 else 0)
+			+ (if band(flags, TCP_FIN) ~= 0 then 1 else 0)
+		seqOut, ackOut, flagsOut = 0, seqAdd(seq, consumed), bor(TCP_RST, TCP_ACK)
+	end
+	sendTcp(
+		self,
+		srcMac,
+		srcIp,
+		dstPort,
+		srcPort,
+		seqOut,
+		ackOut,
+		flagsOut,
+		TCP_WINDOW,
+		buffer.create(0)
+	)
+end
+
+local function handleTcp(self: Isp, srcMac: Mac, srcIp: Ip, payload: buffer)
+	if buffer.len(payload) < 20 then
+		return
+	end
+	const srcPort = readBE16(payload, 0)
+	const dstPort = readBE16(payload, 2)
+	const seq = readBE32(payload, 4)
+	const ack = readBE32(payload, 8)
+	const dataOffset = rshift(buffer.readu8(payload, 12), 4) * 4
+	if dataOffset < 20 or dataOffset > buffer.len(payload) then
+		return
+	end
+	const flags = buffer.readu8(payload, 13)
+	const window = readBE16(payload, 14)
+	if tcpChecksum(srcIp, self.ip, payload) ~= 0 then
+		return
+	end
+	const dataLength = buffer.len(payload) - dataOffset
+	const data = buffer.create(dataLength)
+	if dataLength > 0 then
+		buffer.copy(data, 0, payload, dataOffset, dataLength)
+	end
+	const key = connectionKey(srcIp, srcPort, self.ip, dstPort)
+	local conn = self.tcp[key]
+	if band(flags, TCP_RST) ~= 0 then
+		if conn then
+			self.tcp[key] = nil
+		end
+		return
+	end
+	if not conn then
+		if band(flags, TCP_SYN) ~= 0 and dstPort == TCP_HTTP_PORT then
+			const serverSeq = self.nextTcpSeq
+			self.nextTcpSeq = seqAdd(self.nextTcpSeq, 0x10000)
+			conn = {
+				guestIp = srcIp,
+				guestPort = srcPort,
+				serverIp = self.ip,
+				serverPort = dstPort,
+				state = "syn_received",
+				sndUna = serverSeq,
+				sndNxt = seqAdd(serverSeq, 1),
+				sndWnd = TCP_WINDOW,
+				rcvNxt = seqAdd(seq, 1),
+				guestWnd = window,
+				requestText = "",
+				httpSent = false,
+				lastActivity = self.now,
+			}
+			self.tcp[key] = conn
+			sendTcp(
+				self,
+				srcMac,
+				srcIp,
+				conn.serverPort,
+				conn.guestPort,
+				serverSeq,
+				conn.rcvNxt,
+				bor(TCP_SYN, TCP_ACK),
+				TCP_WINDOW,
+				buffer.create(0)
+			)
+			return
+		end
+		sendReset(self, srcMac, srcIp, payload)
+		return
+	end
+	conn.lastActivity = self.now
+	conn.guestWnd = window
+	if conn.state == "syn_received" then
+		if band(flags, TCP_SYN) ~= 0 then
+			sendTcp(
+				self,
+				srcMac,
+				srcIp,
+				conn.serverPort,
+				conn.guestPort,
+				conn.sndUna,
+				conn.rcvNxt,
+				bor(TCP_SYN, TCP_ACK),
+				TCP_WINDOW,
+				buffer.create(0)
+			)
+			return
+		end
+		if band(flags, TCP_ACK) ~= 0 and ack == conn.sndNxt then
+			conn.state = "established"
+			conn.sndUna = ack
+		else
+			return
+		end
+	end
+	if band(flags, TCP_ACK) ~= 0 then
+		if seqLess(conn.sndUna, ack) and not seqLess(conn.sndNxt, ack) then
+			conn.sndUna = ack
+		end
+		if conn.state == "fin_wait" and ack == conn.sndNxt then
+			conn.state = "time_wait"
+			conn.lastActivity = self.now
+		elseif conn.state == "last_ack" and ack == conn.sndNxt then
+			conn.state = "closed"
+		end
+	end
+	if dataLength > 0 then
+		if seq == conn.rcvNxt then
+			conn.rcvNxt = seqAdd(conn.rcvNxt, dataLength)
+			conn.requestText ..= bufferToString(data)
+			const responded = processHttp(self, conn, srcMac, srcIp)
+			if not responded then
+				sendDuplicateAck(self, conn, srcMac, srcIp)
+			end
+		else
+			sendDuplicateAck(self, conn, srcMac, srcIp)
+		end
+	elseif band(flags, TCP_FIN) ~= 0 then
+		if seq == conn.rcvNxt then
+			conn.rcvNxt = seqAdd(conn.rcvNxt, 1)
+			sendTcp(
+				self,
+				srcMac,
+				srcIp,
+				conn.serverPort,
+				conn.guestPort,
+				conn.sndNxt,
+				conn.rcvNxt,
+				TCP_ACK,
+				TCP_WINDOW,
+				buffer.create(0)
+			)
+			if conn.state == "fin_wait" then
+				conn.state = "time_wait"
+			elseif conn.state == "established" then
+				sendTcp(
+					self,
+					srcMac,
+					srcIp,
+					conn.serverPort,
+					conn.guestPort,
+					conn.sndNxt,
+					conn.rcvNxt,
+					bor(TCP_ACK, TCP_FIN),
+					TCP_WINDOW,
+					buffer.create(0)
+				)
+				conn.sndNxt = seqAdd(conn.sndNxt, 1)
+				conn.state = "last_ack"
+			end
+		else
+			sendDuplicateAck(self, conn, srcMac, srcIp)
+		end
+	end
+end
+
 local function handleIpv4(self: Isp, frame: buffer)
 	if buffer.len(frame) < 34 then
 		return
@@ -450,6 +906,7 @@ local function handleIpv4(self: Isp, frame: buffer)
 	end
 	const protocol = buffer.readu8(frame, offset + 9)
 	const srcIp = readIp(frame, offset + 12)
+	const destIp = readIp(frame, offset + 16)
 	const srcMac = readMac(frame, 6)
 	const payload = buffer.create(totalLength - headerLength)
 	buffer.copy(payload, 0, frame, offset + headerLength, totalLength - headerLength)
@@ -469,7 +926,9 @@ local function handleIpv4(self: Isp, frame: buffer)
 			handleDns(self, srcMac, srcIp, srcPort, body)
 		end
 	elseif protocol == IP_TCP then
-		-- TCP is deliberately left to the next network pass.
+		if sameIp(destIp, self.ip) then
+			handleTcp(self, srcMac, srcIp, payload)
+		end
 	end
 end
 
