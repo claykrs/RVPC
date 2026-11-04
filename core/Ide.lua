@@ -244,16 +244,28 @@ local function capacitySectors(drive: Drive, blockSize: number): number
 	return math.floor(buffer.len(image) / blockSize)
 end
 
+local function finalizeIdentify(out: buffer)
+	-- Word 255 is the two's-complement checksum of words 0..254. Some OS
+	-- drivers (including Windows 9x) validate it before trusting the rest.
+	local sum = 0
+	for index = 0, 254 do
+		sum += buffer.readu16(out, index * 2)
+	end
+	putWord(out, 255, band(0x10000 - band(sum, 0xFFFF), 0xFFFF))
+end
+
 local function identify(drive: Drive): buffer
 	const out = buffer.create(512)
 	if drive.kind == "cdrom" then
 		putWord(out, 0, 0x85C0) -- ATAPI packet device
 		putWord(out, 1, 0)
 		putWord(out, 49, 0x0300) -- DMA + LBA supported
+		putWord(out, 53, 0x0002) -- words 54-58 (model) valid
 		putWord(out, 63, 0x0007) -- multiword DMA modes 0-2
 		putWord(out, 80, 0x0004) -- ATA/ATAPI-2
 		putWord(out, 82, 0x0100) -- DMA
 		putAtaString(out, 54, "RVPC VIRTUAL CD", 40)
+		finalizeIdentify(out)
 		return out
 	end
 	putWord(out, 0, 0x0040)
@@ -268,14 +280,19 @@ local function identify(drive: Drive): buffer
 	putWord(out, 3, heads) -- heads
 	putWord(out, 6, sectorsPerTrack) -- sectors/track
 	putWord(out, 49, 0x0300) -- DMA + LBA
+	putWord(out, 53, 0x0006) -- words 54-58 and 64-70 are valid
 	putWord(out, 60, band(total, 0xFFFF))
 	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
 	putWord(out, 63, 0x0007) -- multiword DMA modes 0-2
+	putWord(out, 64, 0x0003) -- advanced PIO modes 3 and 4
 	putWord(out, 65, 0x0078) -- 120 ns minimum multiword DMA cycle
 	putWord(out, 66, 0x0078)
+	putWord(out, 67, 0x0078) -- 120 ns minimum PIO cycle without flow control
+	putWord(out, 68, 0x0078)
 	putWord(out, 80, 0x0004) -- ATA-2
 	putWord(out, 82, 0x4100) -- DMA + LBA
 	putAtaString(out, 54, "RVPC VIRTUAL HDD", 40)
+	finalizeIdentify(out)
 	return out
 end
 
@@ -1027,16 +1044,22 @@ local function command(self: Ide, cmd: number)
 		const image = drive.image
 		const total = capacitySectors(drive, 512)
 		if not image or self.lba >= total or self.lba + count > total then
-			failCommand(self, 0x10)
-			return
-		end
-		const canDma = dmaReady(self, true)
-		if cmd ~= ATA_READ and (drive.kind ~= "hdd" or not canDma) then
 			failCommand(self, 0x04)
 			return
 		end
-		if canDma then
+		const isDma = cmd == ATA_READ_DMA or cmd == ATA_READ_DMA_EXT
+		if isDma then
+			-- BMIDE only applies to the DMA commands. A plain ATA READ must
+			-- stay PIO even if the bus-master engine happens to be armed.
+			if drive.kind ~= "hdd" or not dmaReady(self, true) then
+				failCommand(self, 0x04)
+				return
+			end
 			dmaRead(self, drive, self.lba, count)
+			return
+		end
+		if drive.kind ~= "hdd" then
+			failCommand(self, 0x04)
 			return
 		end
 		const data = buffer.create(count * 512)
@@ -1052,18 +1075,22 @@ local function command(self: Ide, cmd: number)
 		const image = drive.image
 		const total = capacitySectors(drive, 512)
 		if not image or self.lba >= total or self.lba + count > total then
-			failCommand(self, 0x10)
+			failCommand(self, 0x04)
 			return
 		end
-		if cmd == ATA_WRITE and not dmaReady(self, false) then
-			beginWrite(self, self.lba, count * 512)
-			self.irqPending = true
-			return
-		elseif dmaReady(self, false) then
+		const isDma = cmd == ATA_WRITE_DMA or cmd == ATA_WRITE_DMA_EXT
+		if isDma then
+			-- As above: a plain ATA WRITE is PIO and must not consume the
+			-- PRDT merely because the bus-master command register is armed.
+			if not dmaReady(self, false) then
+				failCommand(self, 0x04)
+				return
+			end
 			dmaWrite(self, drive, self.lba, count)
 			return
 		end
-		failCommand(self, 0x04)
+		beginWrite(self, self.lba, count * 512)
+		self.irqPending = true
 	elseif cmd == ATA_PACKET then
 		self.packetCount += 1
 		if drive.kind ~= "cdrom" then

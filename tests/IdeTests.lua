@@ -367,6 +367,12 @@ T("atapi_identify_and_read10", function(expect)
 	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY PACKET did not assert DRQ")
 	const id = readWords(ide, 256)
 	expect(id[1] == 0x85C0, string.format("ATAPI word0=%04X", id[1]))
+	local idSum = 0
+	for index = 1, 256 do
+		idSum += id[index]
+	end
+	expect(band(idSum, 0xFFFF) == 0, "ATAPI IDENTIFY checksum")
+	expect(band(id[54], 0x0002) ~= 0, "ATAPI word53 model valid")
 	-- READ(10): LBA 0, one 2048-byte block.
 	ide:out8(0x1F7, 0xA0)
 	submitPacket(ide, { 0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 })
@@ -816,6 +822,340 @@ T("atapi_bmdma_read", function(expect)
 	const got = m.mem:copyTo(0x60000, 2048)
 	expect(buffer.readu8(got, 0) == 0x46 and buffer.readu8(got, 3) == 0x45, "ATAPI DMA image")
 	expect(m.ide:takeIrq(), "ATAPI DMA IRQ missing")
+end)
+
+T("ata_identify_checksum_and_extended_words", function(expect)
+	const ide = Ide.new({ hdd = makeHdd() })
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xEC)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY did not assert DRQ")
+	const words = readWords(ide, 256)
+	local sum = 0
+	for index = 1, 256 do
+		sum += words[index]
+	end
+	expect(band(sum, 0xFFFF) == 0, "IDENTIFY checksum word 255")
+	expect(band(words[54], 0x0006) == 0x0006, "word53 extended words valid")
+	expect(band(words[65], 0x0003) == 0x0003, "word64 PIO modes 3/4")
+	expect(words[61] == 2048 and words[62] == 0, "1 MiB LBA capacity changed")
+end)
+
+T("ata_high_lba_pio_and_dirty_range", function(expect)
+	const hdd = buffer.create(4 * 1024 * 1024)
+	const ide = Ide.new({ hdd = hdd })
+	writeSectors(ide, 8191, 1, 0xBEE0)
+	expect(ide:takeIrq(), "high-LBA write IRQ")
+	local first, last = ide:dirtySectorRange()
+	expect(
+		first == 8191 and last == 8191,
+		("high-LBA dirty=%s..%s"):format(tostring(first), tostring(last))
+	)
+
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, band(8191, 0xFF))
+	ide:out8(0x1F4, band(rshift(8191, 8), 0xFF))
+	ide:out8(0x1F5, band(rshift(8191, 16), 0xFF))
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "high-LBA read did not assert DRQ")
+	const sector = readBytes(ide, 512)
+	expect(buffer.readu16(sector, 0) == 0xBEE0, "high-LBA first word")
+	expect(buffer.readu16(sector, 510) == band(0xBEE0 + 255, 0xFFFF), "high-LBA last word")
+	expect(band(ide:in8(0x1F7), 0x08) == 0, "high-LBA read left DRQ set")
+	expect(ide:takeIrq(), "high-LBA read IRQ")
+
+	ide:clearDiskDirty()
+	writeSectors(ide, 8000, 1, 0x1234)
+	ide:takeIrq()
+	writeSectors(ide, 8191, 1, 0x5678)
+	ide:takeIrq()
+	first, last = ide:dirtySectorRange()
+	expect(
+		first == 8000 and last == 8191,
+		("high-LBA union dirty=%s..%s"):format(tostring(first), tostring(last))
+	)
+end)
+
+T("ata_pio_multi_sector_boundaries", function(expect)
+	const hdd = buffer.create(1024 * 1024)
+	const ide = Ide.new({ hdd = hdd })
+
+	-- 130 sectors starting at LBA 127 crosses both the 64 KiB and 128 KiB
+	-- byte offsets of the image in one PIO transfer.
+	writeSectors(ide, 127, 130, 0x1000)
+	expect(ide:takeIrq(), "130-sector write IRQ")
+	local first, last = ide:dirtySectorRange()
+	expect(first == 127 and last == 256, "130-sector dirty range")
+
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 130)
+	ide:out8(0x1F3, 127)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "130-sector read did not assert DRQ")
+	const cross = readBytes(ide, 130 * 512)
+	local crossMismatches = 0
+	for index = 0, 130 * 256 - 1 do
+		if buffer.readu16(cross, index * 2) ~= band(0x1000 + index, 0xFFFF) then
+			crossMismatches += 1
+		end
+	end
+	expect(crossMismatches == 0, "130-sector data mismatches=" .. crossMismatches)
+	expect(band(ide:in8(0x1F7), 0x08) == 0, "130-sector read left DRQ set")
+	expect(ide:takeIrq(), "130-sector read IRQ")
+
+	-- Sector count 0 means 256 sectors (128 KiB) for ATA READ/WRITE.
+	writeSectors(ide, 512, 256, 0x2000)
+	expect(ide:takeIrq(), "count-0 write IRQ")
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 0)
+	ide:out8(0x1F3, band(512, 0xFF))
+	ide:out8(0x1F4, band(rshift(512, 8), 0xFF))
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "count-0 read did not assert DRQ")
+	const zero = readBytes(ide, 256 * 512)
+	local zeroMismatches = 0
+	for index = 0, 256 * 256 - 1 do
+		if buffer.readu16(zero, index * 2) ~= band(0x2000 + index, 0xFFFF) then
+			zeroMismatches += 1
+		end
+	end
+	expect(zeroMismatches == 0, "count-0 data mismatches=" .. zeroMismatches)
+	expect(band(ide:in8(0x1F7), 0x08) == 0, "count-0 read left DRQ set")
+	expect(ide:takeIrq(), "count-0 read IRQ")
+end)
+
+T("bmide_multi_prdt_crosses_boundaries", function(expect)
+	const hdd = buffer.create(1024 * 1024)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		hdd = hdd,
+	})
+	m.mem:setA20(true)
+	const io = m.cpu.io
+	const bm = 0xC000
+	const source = buffer.create(25 * 512)
+	for index = 0, buffer.len(source) - 1 do
+		buffer.writeu8(source, index, (index * 13 + 7) % 256)
+	end
+	buffer.copy(hdd, 1000 * 512, source, 0, buffer.len(source))
+	const entries = {
+		{ 0x1FF000, 0x2000 },
+		{ 0x20FF00, 0x200 },
+		{ 0x21F800, 0x1000 },
+	}
+	for index, entry in ipairs(entries) do
+		const addr = 0x40000 + (index - 1) * 8
+		m.mem:write32(addr, entry[1])
+		m.mem:write32(addr + 4, bor(if index == #entries then 0x80000000 else 0, entry[2]))
+	end
+	io.out32(bm + 4, 0x40000)
+	io.out8(bm + 2, 0x06)
+	io.out8(bm, 0x09)
+	sendAtaCommand(m, 0x1F0, 1000, 25, 0xC8)
+	expect(band(io.in8(0x1F7), 0x01) == 0, "multi-PRDT ATA error")
+	const bmStatus = io.in8(bm + 2)
+	expect(band(bmStatus, 0x04) ~= 0, "multi-PRDT BMIDE INT")
+	expect(band(bmStatus, 0x01) == 0, "multi-PRDT BMIDE still active")
+	expect(band(bmStatus, 0x02) == 0, "multi-PRDT BMIDE error")
+	const got = buffer.create(25 * 512)
+	local offset = 0
+	for _, entry in ipairs(entries) do
+		const piece = m.mem:copyTo(entry[1], entry[2])
+		buffer.copy(got, offset, piece, 0, entry[2])
+		offset += entry[2]
+	end
+	compareBytes(expect, "multi-PRDT data", got, 0, source, 0, buffer.len(source))
+	expect(m.ide:takeIrq(), "multi-PRDT BMIDE IRQ")
+end)
+
+T("bmide_high_lba_dirty_range", function(expect)
+	const hdd = buffer.create(4 * 1024 * 1024)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		hdd = hdd,
+	})
+	m.mem:setA20(true)
+	const io = m.cpu.io
+	const bm = 0xC000
+	const lba, sectors = 8000, 26
+	const data = buffer.create(sectors * 512)
+	for index = 0, buffer.len(data) - 1 do
+		buffer.writeu8(data, index, (index * 17 + 3) % 256)
+	end
+	const entries = {
+		{ 0x23F000, 0x2000 },
+		{ 0x24FE00, 0x400 },
+		{ 0x25F000, 0x1000 },
+	}
+	local offset = 0
+	for index, entry in ipairs(entries) do
+		const piece = buffer.create(entry[2])
+		buffer.copy(piece, 0, data, offset, entry[2])
+		m.mem:copyFrom(entry[1], piece)
+		const addr = 0x40000 + (index - 1) * 8
+		m.mem:write32(addr, entry[1])
+		m.mem:write32(addr + 4, bor(if index == #entries then 0x80000000 else 0, entry[2]))
+		offset += entry[2]
+	end
+	io.out32(bm + 4, 0x40000)
+	io.out8(bm + 2, 0x06)
+	io.out8(bm, 0x01)
+	sendAtaCommand(m, 0x1F0, lba, sectors, 0xCA)
+	expect(band(io.in8(0x1F7), 0x01) == 0, "high-LBA BMIDE write ATA error")
+	const bmStatus = io.in8(bm + 2)
+	expect(band(bmStatus, 0x04) ~= 0, "high-LBA BMIDE write INT")
+	expect(band(bmStatus, 0x01) == 0, "high-LBA BMIDE write still active")
+	const slice = buffer.create(sectors * 512)
+	buffer.copy(slice, 0, hdd, lba * 512, sectors * 512)
+	compareBytes(expect, "high-LBA BMIDE write data", slice, 0, data, 0, buffer.len(data))
+	const first, last = m.ide:dirtySectorRange()
+	expect(first == lba and last == lba + sectors - 1, "high-LBA BMIDE dirty range")
+	expect(m.ide:takeIrq(), "high-LBA BMIDE write IRQ")
+end)
+
+T("ata_out_of_range_no_wrap", function(expect)
+	const hdd = buffer.create(1024 * 1024)
+	const ide = Ide.new({ hdd = hdd })
+	local function expectFailure(lba, count, cmd, label)
+		ide:out8(0x1F6, bor(0xE0, band(rshift(lba, 24), 0x0F)))
+		ide:out8(0x1F2, band(count, 0xFF))
+		ide:out8(0x1F3, band(lba, 0xFF))
+		ide:out8(0x1F4, band(rshift(lba, 8), 0xFF))
+		ide:out8(0x1F5, band(rshift(lba, 16), 0xFF))
+		ide:out8(0x1F7, cmd)
+		const status = ide:in8(0x1F7)
+		expect(band(status, 0x01) ~= 0, label .. " did not set ERR")
+		expect(ide:in8(0x1F1) == 0x04, label .. " error register (ABRT)")
+		expect(band(status, 0x08) == 0, label .. " left DRQ set")
+		expect(ide:takeIrq(), label .. " did not raise IRQ")
+	end
+	expectFailure(2048, 1, 0x20, "read at total")
+	expectFailure(2047, 2, 0x30, "write crossing end")
+	expectFailure(0x0F000000, 1, 0x20, "LBA28 high nibble")
+	expect(not ide:diskDirty(), "failed writes marked the disk dirty")
+	const first, last = ide:dirtySectorRange()
+	expect(first == nil and last == nil, "failed writes left a dirty range")
+
+	ide:out8(0x1F6, 0xEF)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	expect(ide.lba == 0x0F000000, string.format("LBA28 high latch=%08X", ide.lba))
+	ide:out8(0x1F6, 0xE0)
+	expect(ide.lba == 0, string.format("LBA28 high clear=%08X", ide.lba))
+
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "valid read after failures did not assert DRQ")
+	readBytes(ide, 512)
+	expect(band(ide:in8(0x1F7), 0x01) == 0, "recovery read reported an error")
+	expect(ide:takeIrq(), "recovery read IRQ")
+end)
+
+T("ata_pio_ignores_armed_bmide", function(expect)
+	const hdd = buffer.create(1024 * 1024)
+	for index = 0, 1023 do
+		buffer.writeu8(hdd, index, index % 251)
+	end
+	const mem = Memory.new(16 * 1024 * 1024)
+	mem:setA20(true)
+	const ide = Ide.new({ hdd = hdd, mem = mem })
+	const guard = buffer.create(512)
+	for index = 0, 511 do
+		buffer.writeu8(guard, index, 0xCC)
+	end
+	mem:copyFrom(0x50000, guard)
+	mem:write32(0x40000, 0x50000)
+	mem:write32(0x40004, bor(0x80000000, 512))
+	ide:bmOut32(0xC004, 0x40000)
+	ide:bmOut8(0xC002, 0x06)
+	ide:bmOut8(0xC000, 0x09) -- start + disk-to-memory
+
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "PIO read with armed BMIDE did not assert DRQ")
+	const got = readBytes(ide, 512)
+	compareBytes(expect, "PIO read with armed BMIDE", got, 0, hdd, 0, 512)
+	compareBytes(
+		expect,
+		"PIO read did not touch PRDT buffer",
+		mem:copyTo(0x50000, 512),
+		0,
+		guard,
+		0,
+		512
+	)
+	expect(band(ide:bmIn8(0xC002), 0x04) == 0, "PIO read set BMIDE INT")
+	expect(ide:takeIrq(), "PIO read with armed BMIDE IRQ")
+
+	const source = buffer.create(512)
+	for index = 0, 511 do
+		buffer.writeu8(source, index, 0xCC)
+	end
+	mem:copyFrom(0x60000, source)
+	mem:write32(0x40000, 0x60000)
+	mem:write32(0x40004, bor(0x80000000, 512))
+	ide:bmOut8(0xC002, 0x06)
+	ide:bmOut8(0xC000, 0x01) -- start + memory-to-disk
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 1)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F6, 0xE0)
+	ide:out8(0x1F7, 0x30)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "PIO write with armed BMIDE did not assert DRQ")
+	const wrote = buffer.create(512)
+	for index = 0, 255 do
+		const word = band(0x5A00 + index, 0xFFFF)
+		ide:out16(0x1F0, word)
+		buffer.writeu16(wrote, index * 2, word)
+	end
+	compareBytes(expect, "PIO write with armed BMIDE", hdd, 512, wrote, 0, 512)
+	compareBytes(
+		expect,
+		"PIO write did not consume PRDT source",
+		mem:copyTo(0x60000, 512),
+		0,
+		source,
+		0,
+		512
+	)
+	expect(band(ide:bmIn8(0xC002), 0x04) == 0, "PIO write set BMIDE INT")
+	expect(ide:takeIrq(), "PIO write with armed BMIDE IRQ")
+end)
+
+T("ata_read_rejects_cdrom", function(expect)
+	const iso = makeIso()
+	const ide = Ide.new({ cdrom = iso })
+	selectDrive(ide, true)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 0)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x20)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "ATA READ to CD did not fail")
+	expect(ide:in8(0x1F1) == 0x04, "ATA READ to CD error register")
+	expect(ide:takeIrq(), "ATA READ to CD IRQ")
+	expect(buffer.readu8(iso, 0) == 0x46, "ATA READ mutated the CD image")
 end)
 
 if realIso then
