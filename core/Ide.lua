@@ -42,6 +42,15 @@ const ATA_DIAGNOSTIC = 0x90
 const ATA_INIT_PARAMS = 0x91
 const ATA_NOP = 0x00
 
+const SENSE_NOT_READY = 0x02
+const SENSE_ILLEGAL_REQUEST = 0x05
+const ASC_INVALID_OPCODE = 0x20
+const ASC_LBA_OUT_OF_RANGE = 0x21
+const ASC_INVALID_FIELD = 0x24
+const ASC_MEDIUM_NOT_PRESENT = 0x3A
+const ASC_MEDIA_REMOVAL_PREVENTED = 0x53
+const MAX_ATAPI_SECTORS = 2048
+
 export type Partition = {
 	index: number,
 	status: number,
@@ -87,6 +96,10 @@ export type Ide = typeof(setmetatable(
 		packetPos: number,
 		irqPending: boolean,
 		lastError: number,
+		senseKey: number,
+		senseAsc: number,
+		senseAscq: number,
+		mediaLocked: boolean,
 		commandCount: number,
 		lastCommand: number,
 		identifyCount: number,
@@ -124,10 +137,14 @@ function Ide.new(config: Config?): Ide
 	self.driveHead = 0
 	self.deviceControl = 0
 	self.transfer = nil
-	self.packet = buffer.create(12)
+	self.packet = buffer.create(16)
 	self.packetPos = 0
 	self.irqPending = false
 	self.lastError = 0
+	self.senseKey = 0
+	self.senseAsc = 0
+	self.senseAscq = 0
+	self.mediaLocked = false
 	self.commandCount = 0
 	self.lastCommand = 0
 	self.identifyCount = 0
@@ -146,16 +163,30 @@ function Ide.reset(self: Ide)
 	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
 	self.master.error = 0
 	self.slave.error = 0
+	self.senseKey = 0
+	self.senseAsc = 0
+	self.senseAscq = 0
+	self.mediaLocked = false
 end
 
 local function putWord(buf: buffer, index: number, value: number)
 	buffer.writeu16(buf, index * 2, band(value, 0xFFFF))
 end
 
-local function putAtaString(buf: buffer, byteOffset: number, text: string, length: number)
+local function putScsiString(buf: buffer, byteOffset: number, text: string, length: number)
 	for index = 0, length - 1 do
 		const byte = if index < #text then string.byte(text, index + 1) :: number else 32
 		buffer.writeu8(buf, byteOffset + index, byte)
+	end
+end
+
+-- ATA IDENTIFY stores the first character of each pair in the high byte of
+-- the word; SCSI INQUIRY uses plain byte order.
+local function putAtaString(buf: buffer, byteOffset: number, text: string, length: number)
+	for index = 0, length - 1 do
+		const byte = if index < #text then string.byte(text, index + 1) :: number else 32
+		const wordOffset = byteOffset + math.floor(index / 2) * 2
+		buffer.writeu8(buf, wordOffset + (if index % 2 == 0 then 1 else 0), byte)
 	end
 end
 
@@ -173,7 +204,7 @@ local function identify(drive: Drive): buffer
 		putWord(out, 0, 0x85C0) -- ATAPI packet device
 		putWord(out, 1, 0)
 		putWord(out, 49, 0x0200) -- LBA supported
-		putWord(out, 80, 0x0000)
+		putWord(out, 80, 0x0004) -- ATA/ATAPI-2
 		putWord(out, 82, 0x0000)
 		putAtaString(out, 54, "RVPC VIRTUAL CD", 40)
 		return out
@@ -199,10 +230,15 @@ local function finish(self: Ide, status: number)
 end
 
 local function beginRead(self: Ide, data: buffer)
+	const length = buffer.len(data)
+	if length == 0 then
+		finish(self, bor(ST_DRDY, ST_DSC))
+		return
+	end
 	self.transfer = {
 		buffer = data,
 		pos = 0,
-		length = buffer.len(data),
+		length = length,
 		write = false,
 		lba = self.lba,
 	}
@@ -253,79 +289,456 @@ local function putBE16(buf: buffer, offset: number, value: number)
 	buffer.writeu8(buf, offset + 1, band(value, 0xFF))
 end
 
-local function atapiPacket(self: Ide)
+local function failAtapi(self: Ide, senseKey: number, asc: number, ascq: number?)
+	self.senseKey = senseKey
+	self.senseAsc = asc
+	self.senseAscq = ascq or 0
+	failCommand(self, 0x04)
+end
+
+local function atapiReply(self: Ide, data: buffer, allocation: number)
+	const length = math.max(0, math.min(buffer.len(data), allocation))
+	if length < buffer.len(data) then
+		const sliced = buffer.create(length)
+		if length > 0 then
+			buffer.copy(sliced, 0, data, 0, length)
+		end
+		beginRead(self, sliced)
+	else
+		beginRead(self, data)
+	end
+	self.irqPending = true
+end
+
+local function atapiRange(self: Ide, lba: number, count: number): boolean
 	const drive = self.selected
-	if drive.kind ~= "cdrom" or not drive.image then
-		failCommand(self, 0x04)
+	if not drive.image then
+		failAtapi(self, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT)
+		return false
+	end
+	const total = capacitySectors(drive, 2048)
+	if lba < 0 or count > MAX_ATAPI_SECTORS or lba >= total or lba + count > total then
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE)
+		return false
+	end
+	return true
+end
+
+local function atapiRead(self: Ide, lba: number, count: number)
+	const drive = self.selected
+	const image = drive.image
+	if count == 0 then
+		finish(self, bor(ST_DRDY, ST_DSC))
 		return
 	end
+	if not image or not atapiRange(self, lba, count) then
+		return
+	end
+	const data = buffer.create(count * 2048)
+	buffer.copy(data, 0, image, lba * 2048, count * 2048)
+	beginRead(self, data)
+	self.irqPending = true
+end
+
+local function atapiVerify(self: Ide, lba: number, count: number)
+	if count == 0 or atapiRange(self, lba, count) then
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
+end
+
+local function msfParts(lba: number): (number, number, number)
+	const frames = lba + 150
+	return math.floor(frames / 75 / 60), math.floor(frames / 75) % 60, frames % 75
+end
+
+local function putMsf3(buf: buffer, offset: number, lba: number)
+	const minute, second, frame = msfParts(lba)
+	buffer.writeu8(buf, offset, minute)
+	buffer.writeu8(buf, offset + 1, second)
+	buffer.writeu8(buf, offset + 2, frame)
+end
+
+local function putTocEntry(
+	buf: buffer,
+	offset: number,
+	control: number,
+	track: number,
+	lba: number,
+	msf: boolean
+)
+	buffer.writeu8(buf, offset, 0)
+	buffer.writeu8(buf, offset + 1, control)
+	buffer.writeu8(buf, offset + 2, track)
+	buffer.writeu8(buf, offset + 3, 0)
+	if msf then
+		buffer.writeu8(buf, offset + 4, 0)
+		putMsf3(buf, offset + 5, lba)
+	else
+		putBE32(buf, offset + 4, lba)
+	end
+end
+
+local function putFullTocEntry(
+	buf: buffer,
+	offset: number,
+	point: number,
+	pmin: number,
+	psec: number,
+	pframe: number
+)
+	buffer.writeu8(buf, offset, 1) -- session number
+	buffer.writeu8(buf, offset + 1, 0x14) -- ADR=1, data track
+	buffer.writeu8(buf, offset + 2, 0) -- TNO
+	buffer.writeu8(buf, offset + 3, point)
+	-- min/sec/frame of the POINT itself are zero for a single session.
+	buffer.writeu8(buf, offset + 7, 0)
+	buffer.writeu8(buf, offset + 8, pmin)
+	buffer.writeu8(buf, offset + 9, psec)
+	buffer.writeu8(buf, offset + 10, pframe)
+end
+
+local function atapiReadToc(self: Ide, allocation: number)
+	const msf = band(buffer.readu8(self.packet, 1), 0x02) ~= 0
+	local format = band(buffer.readu8(self.packet, 2), 0x0F)
+	if format == 0 then
+		-- Legacy ATAPI put the format in the top two bits of byte 9.
+		format = rshift(buffer.readu8(self.packet, 9), 6)
+	end
+	const startTrack = buffer.readu8(self.packet, 6)
+	const total = capacitySectors(self.selected, 2048)
+	if format == 0 then
+		const tracks: { number } = {}
+		if startTrack <= 1 then
+			tracks[#tracks + 1] = 1
+		end
+		tracks[#tracks + 1] = 0xAA
+		const data = buffer.create(4 + 8 * #tracks)
+		putBE16(data, 0, 2 + 8 * #tracks)
+		buffer.writeu8(data, 2, 1)
+		buffer.writeu8(data, 3, 1)
+		for index, track in ipairs(tracks) do
+			putTocEntry(
+				data,
+				4 + (index - 1) * 8,
+				0x14,
+				track,
+				if track == 0xAA then total else 0,
+				msf
+			)
+		end
+		atapiReply(self, data, allocation)
+	elseif format == 1 then
+		const data = buffer.create(12)
+		putBE16(data, 0, 10)
+		buffer.writeu8(data, 2, 1) -- first complete session
+		buffer.writeu8(data, 3, 1) -- last complete session
+		buffer.writeu8(data, 5, 0x14) -- ADR=1, data track
+		buffer.writeu8(data, 6, 1) -- first track in last session
+		atapiReply(self, data, allocation)
+	elseif format == 2 then
+		const data = buffer.create(4 + 11 * 4)
+		putBE16(data, 0, 2 + 11 * 4)
+		buffer.writeu8(data, 2, 1)
+		buffer.writeu8(data, 3, 1)
+		putFullTocEntry(data, 4, 0xA0, 1, 0, 0)
+		putFullTocEntry(data, 15, 0xA1, 1, 0, 0)
+		const minute, second, frame = msfParts(total)
+		putFullTocEntry(data, 26, 0xA2, minute, second, frame)
+		putFullTocEntry(data, 37, 0x01, 0, 2, 0)
+		atapiReply(self, data, allocation)
+	else
+		-- PMA/ATIP are not populated; return a valid empty response.
+		const data = buffer.create(4)
+		putBE16(data, 0, 0)
+		atapiReply(self, data, allocation)
+	end
+end
+
+local function makeModePage(code: number, values: { number }): buffer
+	const data = buffer.create(2 + #values)
+	buffer.writeu8(data, 0, code)
+	buffer.writeu8(data, 1, #values)
+	for index, value in ipairs(values) do
+		buffer.writeu8(data, 1 + index, value)
+	end
+	return data
+end
+
+local function concatPages(pages: { buffer }): buffer
+	local total = 0
+	for _, page in ipairs(pages) do
+		total += buffer.len(page)
+	end
+	const data = buffer.create(total)
+	local offset = 0
+	for _, page in ipairs(pages) do
+		buffer.copy(data, offset, page, 0, buffer.len(page))
+		offset += buffer.len(page)
+	end
+	return data
+end
+
+local function modeSensePages(code: number): buffer?
+	if code == 0x3F then
+		return concatPages({
+			makeModePage(0x01, { 0x00, 0x05, 0x00, 0x00, 0x00, 0x00 }),
+			makeModePage(0x0E, {
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+			}),
+			makeModePage(0x2A, {
+				0x3B,
+				0x00,
+				0x71,
+				0x60,
+				0x29,
+				0x00,
+				0x02,
+				0xC0,
+				0x00,
+				0x02,
+				0x02,
+				0x00,
+				0x02,
+				0xC0,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+				0x00,
+			}),
+		})
+	elseif code == 0x01 then
+		return makeModePage(0x01, { 0x00, 0x05, 0x00, 0x00, 0x00, 0x00 })
+	elseif code == 0x0E then
+		return makeModePage(0x0E, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	elseif code == 0x2A then
+		return makeModePage(0x2A, {
+			0x3B,
+			0x00,
+			0x71,
+			0x60,
+			0x29,
+			0x00,
+			0x02,
+			0xC0,
+			0x00,
+			0x02,
+			0x02,
+			0x00,
+			0x02,
+			0xC0,
+			0x00,
+			0x00,
+			0x00,
+			0x00,
+			0x00,
+			0x00,
+		})
+	end
+	return nil
+end
+
+local function atapiModeSense(self: Ide, ten: boolean, allocation: number)
+	const action = rshift(buffer.readu8(self.packet, 2), 6)
+	if action ~= 0 then
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_FIELD)
+		return
+	end
+	const code = band(buffer.readu8(self.packet, 2), 0x3F)
+	const pages = modeSensePages(code)
+	if not pages then
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_FIELD)
+		return
+	end
+	const header = if ten then 8 else 4
+	const data = buffer.create(header + buffer.len(pages))
+	if ten then
+		putBE16(data, 0, buffer.len(data) - 2)
+	else
+		buffer.writeu8(data, 0, buffer.len(data) - 1)
+	end
+	buffer.copy(data, header, pages, 0, buffer.len(pages))
+	atapiReply(self, data, allocation)
+end
+
+local function atapiGetConfiguration(self: Ide, allocation: number)
+	const startFeature = readBE16(self.packet, 2)
+	if startFeature ~= 0 then
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_FIELD)
+		return
+	end
+	const data = buffer.create(16)
+	putBE32(data, 0, 12)
+	putBE16(data, 6, 0x0008) -- current profile: CD-ROM
+	putBE16(data, 8, 0x0000) -- profile list feature
+	buffer.writeu8(data, 10, 0x03) -- current + persistent
+	buffer.writeu8(data, 11, 4)
+	putBE16(data, 12, 0x0008)
+	buffer.writeu8(data, 14, 0x01) -- profile is current
+	atapiReply(self, data, allocation)
+end
+
+local function atapiInquiry(self: Ide, allocation: number)
+	if band(buffer.readu8(self.packet, 1), 0x01) ~= 0 then
+		const page = buffer.readu8(self.packet, 2)
+		if page == 0 then
+			const data = buffer.create(5)
+			buffer.writeu8(data, 0, 0x05)
+			buffer.writeu8(data, 3, 1)
+			atapiReply(self, data, allocation)
+		else
+			failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_FIELD)
+		end
+		return
+	end
+	const data = buffer.create(36)
+	buffer.writeu8(data, 0, 0x05) -- CD-ROM
+	buffer.writeu8(data, 1, 0x80) -- removable
+	buffer.writeu8(data, 3, 0x21) -- ATAPI-2
+	buffer.writeu8(data, 4, 31)
+	putScsiString(data, 8, "RVPC", 8)
+	putScsiString(data, 16, "VIRTUAL CD", 16)
+	putScsiString(data, 32, "1.0", 4)
+	atapiReply(self, data, allocation)
+end
+
+local function atapiReadHeader(self: Ide, allocation: number)
+	const lba = readBE32(self.packet, 2)
+	if not atapiRange(self, lba, 1) then
+		return
+	end
+	const data = buffer.create(8)
+	buffer.writeu8(data, 0, 0x01) -- CD-ROM mode 1
+	if band(buffer.readu8(self.packet, 1), 0x02) ~= 0 then
+		putMsf3(data, 5, lba)
+	else
+		putBE32(data, 4, lba)
+	end
+	atapiReply(self, data, allocation)
+end
+
+local function atapiPacket(self: Ide)
+	const drive = self.selected
+	if drive.kind ~= "cdrom" then
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_OPCODE)
+		return
+	end
+	const savedKey = self.senseKey
+	const savedAsc = self.senseAsc
+	const savedAscq = self.senseAscq
+	self.senseKey = 0
+	self.senseAsc = 0
+	self.senseAscq = 0
 	const op = buffer.readu8(self.packet, 0)
-	const image = drive.image
-	if op == 0x28 then -- READ(10)
-		const lba = readBE32(self.packet, 2)
-		local count = readBE16(self.packet, 7)
-		if count == 0 then
+	if op == 0x03 then -- REQUEST SENSE
+		const allocation = buffer.readu8(self.packet, 4)
+		const data = buffer.create(18)
+		buffer.writeu8(data, 0, 0xF0)
+		buffer.writeu8(data, 2, band(savedKey, 0x0F))
+		buffer.writeu8(data, 7, 10)
+		buffer.writeu8(data, 12, savedAsc)
+		buffer.writeu8(data, 13, savedAscq)
+		atapiReply(self, data, allocation)
+		return
+	end
+	if not drive.image then
+		failAtapi(self, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT)
+		return
+	end
+	if op == 0x00 or op == 0xBB then -- TEST UNIT READY / SET CD SPEED
+		finish(self, bor(ST_DRDY, ST_DSC))
+	elseif op == 0x12 then -- INQUIRY
+		atapiInquiry(self, buffer.readu8(self.packet, 4))
+	elseif op == 0x1A then -- MODE SENSE(6)
+		atapiModeSense(self, false, buffer.readu8(self.packet, 4))
+	elseif op == 0x5A then -- MODE SENSE(10)
+		atapiModeSense(self, true, readBE16(self.packet, 7))
+	elseif op == 0x1B then -- START STOP UNIT
+		const start = band(buffer.readu8(self.packet, 4), 0x01) ~= 0
+		const loej = band(buffer.readu8(self.packet, 4), 0x02) ~= 0
+		const powerCondition = band(buffer.readu8(self.packet, 4), 0xF0)
+		if powerCondition == 0 and loej and not start and self.mediaLocked then
+			failAtapi(self, SENSE_NOT_READY, ASC_MEDIA_REMOVAL_PREVENTED)
+		else
 			finish(self, bor(ST_DRDY, ST_DSC))
-			return
 		end
-		const total = capacitySectors(drive, 2048)
-		if lba >= total or lba + count > total then
-			failCommand(self, 0x21) -- LBA out of range
-			return
-		end
-		if count > 256 then
-			count = 256
-		end
-		const data = buffer.create(count * 2048)
-		buffer.copy(data, 0, image, lba * 2048, count * 2048)
-		beginRead(self, data)
-		self.irqPending = true
+	elseif op == 0x1E then -- PREVENT/ALLOW MEDIUM REMOVAL
+		self.mediaLocked = band(buffer.readu8(self.packet, 4), 0x01) ~= 0
+		finish(self, bor(ST_DRDY, ST_DSC))
 	elseif op == 0x25 then -- READ CAPACITY(10)
 		const total = capacitySectors(drive, 2048)
 		const data = buffer.create(8)
 		putBE32(data, 0, math.max(0, total - 1))
 		putBE32(data, 4, 2048)
-		beginRead(self, data)
-		self.irqPending = true
-	elseif op == 0x12 then -- INQUIRY
-		const data = buffer.create(36)
-		buffer.writeu8(data, 0, 0x05) -- CD-ROM
-		buffer.writeu8(data, 1, 0x80) -- removable
-		buffer.writeu8(data, 4, 31)
-		putAtaString(data, 8, "RVPC", 8)
-		putAtaString(data, 16, "VIRTUAL CD", 16)
-		putAtaString(data, 32, "1.0", 4)
-		beginRead(self, data)
-		self.irqPending = true
-	elseif op == 0x43 then -- READ TOC/PMA/ATIP (format 0)
-		const total = capacitySectors(drive, 2048)
-		const data = buffer.create(4 + 8 * 2)
-		putBE16(data, 0, 4 + 8 * 2)
-		buffer.writeu8(data, 2, 1) -- first track
-		buffer.writeu8(data, 3, 1) -- last track
-		-- Track 1 starts at LBA 0.
-		buffer.writeu8(data, 4 + 1, 0x14)
-		buffer.writeu8(data, 4 + 2, 1)
-		-- Leadout track 0xAA starts after the last data sector.
-		buffer.writeu8(data, 12 + 1, 0x14)
-		buffer.writeu8(data, 12 + 2, 0xAA)
-		putBE32(data, 12 + 4, total)
-		beginRead(self, data)
-		self.irqPending = true
-	elseif op == 0x1A then -- MODE SENSE(6), no block descriptors
-		const data = buffer.create(4)
-		buffer.writeu8(data, 0, 3)
-		beginRead(self, data)
-		self.irqPending = true
-	elseif op == 0x03 then -- REQUEST SENSE
-		const data = buffer.create(18)
-		beginRead(self, data)
-		self.irqPending = true
-	elseif op == 0x00 or op == 0x1B or op == 0x1E then
-		finish(self, bor(ST_DRDY, ST_DSC))
+		atapiReply(self, data, 8)
+	elseif op == 0x28 then -- READ(10)
+		atapiRead(self, readBE32(self.packet, 2), readBE16(self.packet, 7))
+	elseif op == 0xA8 then -- READ(12)
+		const count = bor(
+			lshift(buffer.readu8(self.packet, 6), 16),
+			lshift(buffer.readu8(self.packet, 7), 8),
+			buffer.readu8(self.packet, 8)
+		)
+		atapiRead(self, readBE32(self.packet, 2), count)
+	elseif op == 0x88 then -- READ(16)
+		const high = readBE32(self.packet, 2)
+		const low = readBE32(self.packet, 6)
+		const count = readBE32(self.packet, 10)
+		if high ~= 0 then
+			failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE)
+		else
+			atapiRead(self, low, count)
+		end
+	elseif op == 0x2F then -- VERIFY(10)
+		atapiVerify(self, readBE32(self.packet, 2), readBE16(self.packet, 7))
+	elseif op == 0x2B then -- SEEK(10)
+		const lba = readBE32(self.packet, 2)
+		if atapiRange(self, lba, 1) then
+			finish(self, bor(ST_DRDY, ST_DSC))
+		end
+	elseif op == 0x43 then -- READ TOC/PMA/ATIP
+		atapiReadToc(self, readBE16(self.packet, 7))
+	elseif op == 0x44 then -- READ HEADER
+		atapiReadHeader(self, readBE16(self.packet, 7))
+	elseif op == 0x46 then -- GET CONFIGURATION
+		atapiGetConfiguration(self, readBE16(self.packet, 7))
+	elseif op == 0x51 then -- READ DISC INFORMATION
+		const allocation = readBE16(self.packet, 7)
+		const data = buffer.create(34)
+		buffer.writeu8(data, 1, 32)
+		buffer.writeu8(data, 2, 0x0E)
+		buffer.writeu8(data, 3, 1)
+		buffer.writeu8(data, 4, 1)
+		buffer.writeu8(data, 5, 1)
+		buffer.writeu8(data, 6, 1)
+		buffer.writeu8(data, 7, 0x20)
+		atapiReply(self, data, allocation)
 	else
-		failCommand(self, 0x05) -- illegal request
+		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_OPCODE)
 	end
+end
+
+-- ATAPI PACKET normally carries 12-byte CDBs; READ(16) is the one command
+-- that needs the 16-byte packet form.
+local function packetReady(self: Ide): boolean
+	if self.packetPos >= 16 then
+		return true
+	end
+	return self.packetPos == 12 and buffer.readu8(self.packet, 0) ~= 0x88
 end
 
 local function command(self: Ide, cmd: number)
@@ -336,6 +749,7 @@ local function command(self: Ide, cmd: number)
 		failCommand(self, 0x04)
 		return
 	end
+	self.transfer = nil
 	drive.error = 0
 	self.lastError = 0
 	if cmd == ATA_IDENTIFY then
@@ -465,10 +879,14 @@ function Ide.out8(self: Ide, port: number, value: number)
 	if port == DATA then
 		if self.transfer and self.transfer.write then
 			writeDataByte(self, value)
-		elseif self.packetPos < 12 and band(self.selected.status, ST_DRQ) ~= 0 then
+		elseif
+			not self.transfer
+			and self.packetPos < 16
+			and band(self.selected.status, ST_DRQ) ~= 0
+		then
 			buffer.writeu8(self.packet, self.packetPos, value)
 			self.packetPos += 1
-			if self.packetPos == 12 then
+			if packetReady(self) then
 				atapiPacket(self)
 			end
 		end
@@ -487,7 +905,7 @@ function Ide.out8(self: Ide, port: number, value: number)
 		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
 		self.selected = if self.selectedIndex == 0 then self.master else self.slave
 		if band(value, 0x40) ~= 0 then
-			self.lba = bor(band(self.lba, 0xFF000000), lshift(band(value, 0x0F), 24))
+			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
 		end
 	elseif port == COMMAND then
 		command(self, value)
@@ -528,10 +946,14 @@ function Ide.out16(self: Ide, port: number, value: number)
 	if port == DATA then
 		if self.transfer and self.transfer.write then
 			writeDataWord(self, value)
-		elseif self.packetPos + 1 < 12 and band(self.selected.status, ST_DRQ) ~= 0 then
+		elseif
+			not self.transfer
+			and self.packetPos + 1 < 16
+			and band(self.selected.status, ST_DRQ) ~= 0
+		then
 			buffer.writeu16(self.packet, self.packetPos, band(value, 0xFFFF))
 			self.packetPos += 2
-			if self.packetPos >= 12 then
+			if packetReady(self) then
 				atapiPacket(self)
 			end
 		end
@@ -575,6 +997,18 @@ function Ide.parseMbr(image: buffer): { Partition }
 		end
 	end
 	return partitions
+end
+
+-- Return the active (status 0x80) primary partition, or nil when the MBR has
+-- no boot flag. SeaBIOS does its own MBR scan; this mirrors it for tests and
+-- the host disk UI.
+function Ide.findBootPartition(image: buffer): Partition?
+	for _, partition in ipairs(Ide.parseMbr(image)) do
+		if partition.status == 0x80 then
+			return partition
+		end
+	end
+	return nil
 end
 
 Ide.IRQ = IRQ
