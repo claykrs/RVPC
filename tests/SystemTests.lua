@@ -309,4 +309,102 @@ T("cmos_memory_and_shutdown", function(expect)
 	expect(cmos:in8(0x71) == 0x02, "status B")
 end)
 
+-- Hardware task switches: task A runs flat-32 at selector 8 with its TSS
+-- pre-loaded into TR (LTR ran earlier in a real guest). Task B's TSS holds a
+-- register image; the tests verify save/restore, back-link/NT nesting and the
+-- busy-bit bookkeeping in both directions.
+const NT_FLAG = 0x4000
+
+local function taskSwitchSetup(m)
+	flat32(m)
+	const cpu = m.cpu
+	-- Task A TSS at 0x4000 (selector 0x28, busy like LTR leaves it), task B
+	-- TSS at 0x5000 (selector 0x20, available).
+	writeDescriptor(m, 0x3028, 0x4000, 0x67, 0x8B, 0)
+	writeDescriptor(m, 0x3020, 0x5000, 0x67, 0x89, 0)
+	cpu.gdtr = { base = 0x3000, limit = 0x37 }
+	-- B's register image: resume at 0x2000 with EAX=0xBEEF, stack at 0x7000.
+	m.mem:write32(0x5000 + 0x1C, 0)
+	m.mem:write32(0x5000 + 0x20, 0x2000)
+	m.mem:write32(0x5000 + 0x24, 2)
+	m.mem:write32(0x5000 + 0x28, 0xBEEF)
+	m.mem:write32(0x5000 + 0x38, 0x7000)
+	m.mem:write32(0x5000 + 0x48, 0x10)
+	m.mem:write32(0x5000 + 0x4C, 8)
+	m.mem:write32(0x5000 + 0x50, 0x10)
+	m.mem:write32(0x5000 + 0x54, 0x10)
+	m.mem:write32(0x5000 + 0x58, 0)
+	m.mem:write32(0x5000 + 0x5C, 0)
+	cpu.tr = 0x28
+	cpu.trBase = 0x4000
+	cpu.trLimit = 0x67
+	cpu.tr32 = true
+	-- IDT with one task gate for INT 0x80 pointing at B's TSS.
+	cpu.idtr = { base = 0x6000, limit = 0x7FF }
+	writeDescriptor(m, 0x6400, 0, 0x20, 0x85, 0)
+	m.mem:write16(0x6400 + 2, 0x20)
+	putCode(m, 0x1000, {
+		0xB8,
+		0x11,
+		0x11,
+		0x00,
+		0x00, -- MOV EAX,0x1111
+	})
+	putCode(m, 0x2000, {
+		0xBB,
+		0x22,
+		0x22,
+		0x00,
+		0x00, -- MOV EBX,0x2222
+		0xF4, -- HLT
+	})
+	return cpu
+end
+
+T("task_gate_interrupt", function(expect)
+	const m = freshMachine()
+	const cpu = taskSwitchSetup(m)
+	putCode(m, 0x1005, { 0xCD, 0x80, 0xF4 }) -- INT 0x80; HLT
+	m:run(40)
+	expect(cpu:rr32(3) == 0x2222, string.format("EBX=%08X", cpu:rr32(3)))
+	expect(cpu:rr32(0) == 0xBEEF, string.format("EAX=%08X", cpu:rr32(0)))
+	expect(cpu.tr == 0x20, string.format("TR=%04X", cpu.tr))
+	expect(band(cpu.flags, NT_FLAG) ~= 0, "NT set in the new task")
+	expect(m.mem:read16(0x5000) == 0x28, string.format("back-link=%04X", m.mem:read16(0x5000)))
+	expect(m.mem:read32(0x4000 + 0x20) == 0x1007, "A saved EIP after INT")
+	expect(m.mem:read32(0x4000 + 0x28) == 0x1111, "A saved EAX")
+	expect(m.mem:read32(0x4000 + 0x4C) == 8, "A saved CS")
+	expect(m.mem:read8(0x3020 + 5) == 0x8B, "B marked busy")
+	expect(m.mem:read8(0x3028 + 5) == 0x8B, "A stays busy on a nested switch")
+end)
+
+T("task_switch_iret_backlink", function(expect)
+	const m = freshMachine()
+	const cpu = taskSwitchSetup(m)
+	putCode(m, 0x1005, { 0xCD, 0x80, 0xB9, 0x33, 0x33, 0x00, 0x00, 0xF4 }) -- INT 0x80; MOV ECX,0x3333; HLT
+	putCode(m, 0x2000, { 0xCF, 0xF4 }) -- IRET (task switch); HLT
+	m:run(60)
+	expect(cpu:rr32(1) == 0x3333, string.format("ECX=%08X", cpu:rr32(1)))
+	expect(cpu:rr32(0) == 0x1111, string.format("EAX=%08X", cpu:rr32(0)))
+	expect(cpu.tr == 0x28, string.format("TR=%04X", cpu.tr))
+	expect(cpu.ip == 0x100D, string.format("EIP=%04X", cpu.ip))
+	expect(m.mem:read8(0x3028 + 5) == 0x8B, "resumed task stays busy")
+	expect(m.mem:read8(0x3020 + 5) == 0x89, "returning task unbusies")
+end)
+
+T("task_switch_far_jmp", function(expect)
+	const m = freshMachine()
+	const cpu = taskSwitchSetup(m)
+	-- Far JMP to the TSS: no nesting, so no back-link, no NT, and A unbusies.
+	putCode(m, 0x1005, { 0xEA, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0xF4 })
+	m:run(40)
+	expect(cpu:rr32(3) == 0x2222, string.format("EBX=%08X", cpu:rr32(3)))
+	expect(cpu:rr32(0) == 0xBEEF, string.format("EAX=%08X", cpu:rr32(0)))
+	expect(cpu.tr == 0x20, string.format("TR=%04X", cpu.tr))
+	expect(band(cpu.flags, NT_FLAG) == 0, "no NT on a JMP switch")
+	expect(m.mem:read16(0x5000) == 0, "no back-link on a JMP switch")
+	expect(m.mem:read8(0x3020 + 5) == 0x8B, "B marked busy")
+	expect(m.mem:read8(0x3028 + 5) == 0x89, "A unbusies on a JMP switch")
+end)
+
 return TESTS
