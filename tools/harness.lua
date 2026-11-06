@@ -179,6 +179,7 @@ local executed = 0
 local lastScreen = ""
 local lastPrint = 0
 local menuSelected = false
+local win98MenuSelected = false
 local menuDebug = 0
 
 local function persistHdd()
@@ -377,6 +378,19 @@ while executed < budget do
 					machine.mem:read16(0x41C)
 				)
 			)
+		end
+	end
+	-- The Windows 98 CD-ROM startup menu ("Boot from Hard Disk / Boot from
+	-- CD-ROM") is not SeaBIOS's; its countdown path mis-executes into a data
+	-- blob at 0000:7C00, so answer it directly with 2 instead of waiting.
+	if
+		not win98MenuSelected
+		and string.find(screen, "Boot from CD-ROM", 1, true)
+		and string.find(screen, "Enter your choice", 1, true)
+	then
+		if machine:injectBdaKey(0x03, string.byte("2")) then
+			win98MenuSelected = true
+			print("injected Win98 CD menu choice 2 (Boot from CD-ROM)")
 		end
 	end
 	if menuSelected then
