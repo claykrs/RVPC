@@ -610,7 +610,9 @@ end
 
 export type Vga = typeof(setmetatable(
 	{} :: {
-		mem: Memory,
+		-- held as any like the other core devices: Memory's typeof-based type
+		-- does not surface its metatable methods for cross-module calls
+		mem: any,
 		modeNumber: number,
 		info: ModeInfo,
 		crtc: { number },
