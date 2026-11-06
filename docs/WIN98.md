@@ -116,10 +116,15 @@ Windows media is **not** committed. Supply it locally:
 
 ## Known blockers to clear
 
-- OTI-91x driver handshake (see Triage guide) - blocks SETUP entirely.
+- OTI-91x driver handshake (see Triage guide) - the INQUIRY completion path
+  works since `dc7f975` (PIC cascade survives a masked slave + ATAPI
+  interrupt-reason register); the driver still reports "No drives found"
+  afterwards, which is the current SETUP blocker.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
-- 80-bit x87 precision and hardware task gates remain incomplete.
+- 80-bit x87 precision remains incomplete. Hardware task gates landed
+  (`39b96de`): IDT task gates, far CALL/JMP to a TSS and IRET through the
+  back-link, so the guest's double-fault task gate works.
 - PS/2 mouse integration and audio/network drivers after first boot.
 
 ## Non-goals for the first 98 boot
