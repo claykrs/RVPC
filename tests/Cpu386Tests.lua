@@ -216,6 +216,102 @@ T("page_fault_write_protection_error_code", function(expect)
 	expect(m.mem:read32(0x4100) == 3, string.format("error code=%X", m.mem:read32(0x4100)))
 end)
 
+-- Paged fixture: PD at 0x2000. PDE0 is a 4 MiB identity page (code, stack, PD
+-- and PT all live below 4 MiB); PDE1 maps 0x400000 through page table 0x5000
+-- with PTE0 pointing at frame 0x900000. Paging on, WP off, CPL 0.
+local function pagedMachine()
+	const m = freshMachine()
+	flat32(m)
+	m.mem.a20 = true
+	m.mem:write32(0x2000, 0x00000083)
+	m.mem:write32(0x2004, 0x00005007)
+	m.mem:write32(0x5000, 0x00900007)
+	const cpu = m.cpu
+	cpu.cr3 = 0x2000
+	cpu.cr[3] = 0x2000
+	cpu.cr0 = bor(1, 0x80000000)
+	cpu.cr[0] = cpu.cr0
+	return m
+end
+
+T("tlb_store_to_page_table_frame_invalidates", function(expect)
+	const m = pagedMachine()
+	const cpu = m.cpu
+	m.mem:write32(0x900000, 0x11111111)
+	m.mem:write32(0xA00000, 0x22222222)
+	expect(cpu:read32(0x400000) == 0x11111111, "first walk missed PTE frame")
+	-- Rewrite PTE0 through the linear mapping of the page-table frame itself:
+	-- the store lands in a tracked PT frame and must drop the cached entry.
+	cpu:write32(0x5000, 0x00A00007)
+	expect(cpu:read32(0x400000) == 0x22222222, "stale TLB entry survived PT store")
+end)
+
+T("tlb_flush_on_cr3_reload_and_invlpg", function(expect)
+	const m = pagedMachine()
+	const cpu = m.cpu
+	m.mem:write32(0x900000, 0x11111111)
+	m.mem:write32(0xB00000, 0x22222222)
+	expect(cpu:read32(0x400000) == 0x11111111, "first walk")
+	-- A second directory maps 0x400000 to a different frame.
+	m.mem:write32(0x3000, 0x00000083)
+	m.mem:write32(0x3004, 0x00006007)
+	m.mem:write32(0x6000, 0x00B00007)
+	cpu.cr3 = 0x3000
+	cpu.cr[3] = 0x3000
+	cpu:flushTlb()
+	expect(cpu:read32(0x400000) == 0x22222222, "CR3 reload kept stale entries")
+	cpu.cr3 = 0x2000
+	cpu.cr[3] = 0x2000
+	cpu:flushTlb()
+	expect(cpu:read32(0x400000) == 0x11111111, "first directory again")
+	-- A physical PTE rewrite the TLB never saw, retired by INVLPG.
+	m.mem:write32(0x5000, 0x00B00007)
+	cpu:flushTlbPage(0x400000)
+	expect(cpu:read32(0x400000) == 0x22222222, "INVLPG did not drop the entry")
+end)
+
+T("tlb_hit_rechecks_protection_bits", function(expect)
+	const m = pagedMachine()
+	const cpu = m.cpu
+	-- #PF gate so fault delivery does not escalate to a triple fault reset.
+	installGate(m, 14, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, { 0xCF }) -- IRETD
+	m.mem:write32(0x5000, 0x00900001) -- present, supervisor-only, read-only
+	m.mem:write32(0x900000, 0x55555555)
+	expect(cpu:read32(0x400000) == 0x55555555, "supervisor read")
+	-- Ring 3 must fault on the cached entry with present+user error bits.
+	cpu.cs = 0x0B
+	local ok = pcall(function()
+		cpu:read32(0x400000)
+	end)
+	expect(not ok, "user read of supervisor page did not fault")
+	expect(cpu.pageFaults == 1, "pageFaults=" .. cpu.pageFaults)
+	expect(cpu.lastPageFault ~= nil and cpu.lastPageFault.errorCode == 5, "user fault error code")
+	-- Supervisor write with CR0.WP set faults on the same cached entry.
+	cpu.cs = 8
+	cpu.cr0 = bor(cpu.cr0, 0x10000)
+	cpu.cr[0] = cpu.cr0
+	local okWrite = pcall(function()
+		cpu:write32(0x400000, 0x1234)
+	end)
+	expect(not okWrite, "WP write to read-only page did not fault")
+	expect(cpu.pageFaults == 2, "pageFaults=" .. cpu.pageFaults)
+	expect(cpu.lastPageFault ~= nil and cpu.lastPageFault.errorCode == 3, "write fault error code")
+end)
+
+T("tlb_walk_sets_accessed_and_dirty_bits", function(expect)
+	const m = pagedMachine()
+	const cpu = m.cpu
+	cpu:read32(0x400000)
+	local pte = m.mem:read32(0x5000)
+	expect(band(pte, 0x20) ~= 0, "PTE accessed bit missing after read")
+	expect(band(pte, 0x40) == 0, "PTE dirty bit set by read")
+	cpu:write32(0x400004, 0xCAFEBABE)
+	expect(m.mem:read32(0x900004) == 0xCAFEBABE, "write missed cached frame")
+	pte = m.mem:read32(0x5000)
+	expect(band(pte, 0x60) == 0x60, string.format("PTE A/D bits=%X", pte))
+end)
+
 T("v86_interrupt_frame_and_iret", function(expect)
 	const m = freshMachine()
 	flat32(m)

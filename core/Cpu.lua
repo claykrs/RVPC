@@ -23,6 +23,19 @@ const CR0_TS = 0x00000008
 const CR0_WP = 0x00010000
 const CR0_PG = 0x80000000
 
+-- Paging TLB entry layout: bits 1-20 hold the frame (phys>>12 for 4 KiB pages,
+-- phys>>22 for 4 MiB pages), bit 0 records that the PTE dirty bit is already
+-- set, bit 21/22 cache the R/W and U/S AND of PDE and PTE, bit 23 marks 4 MiB
+-- entries, bit 24 the PDE PAT bit the reserved-bit fault checks, bits 25-31
+-- the epoch that turns a full flush into an increment.
+const TLB_D = 1
+const TLB_FRAME = lshift(0xFFFFF, 1)
+const TLB_FRAME_4M = lshift(0x3FF, 1)
+const TLB_RW = lshift(1, 21)
+const TLB_US = lshift(1, 22)
+const TLB_4M = lshift(1, 23)
+const TLB_PAT = lshift(1, 24)
+
 -- Unique sentinel used to unwind a faulting instruction after #PF delivery.
 -- Cpu.step only catches it when paging is enabled; every other error still
 -- propagates to the host as an unimplemented-hardware diagnostic.
@@ -109,6 +122,13 @@ export type Cpu = {
 	cr3: number,
 	cr: { number },
 	dr: { number },
+	-- Software paging TLB: one slot per linear page (2^20 entries), allocated
+	-- on the first paged walk. pfTrack remembers physical page-directory and
+	-- page-table frames so stores into them can invalidate what maps through.
+	tlb: { [number]: number }?,
+	tlbEpoch: number,
+	pfTrack: { [number]: number },
+	pfCount: number,
 	baseOperand32: boolean,
 	baseAddress32: boolean,
 	pageFaults: number,
@@ -184,6 +204,10 @@ export type Cpu = {
 		user: boolean,
 		fetch: boolean?
 	) -> number,
+	flushTlb: (self: Cpu) -> (),
+	flushTlbPage: (self: Cpu, addr: number) -> (),
+	trackPageFrame: (self: Cpu, frame: number, kind: number) -> (),
+	invalidatePageTableWrite: (self: Cpu, addr: number) -> (),
 	pageFault: (
 		self: Cpu,
 		addr: number,
@@ -326,6 +350,10 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.osegReg = nil
 	self.rep = nil
 	self.cr3 = 0
+	self.tlb = nil
+	self.tlbEpoch = 1
+	self.pfTrack = {}
+	self.pfCount = 0
 	self.pageFaults = 0
 	self.lastPageFault = nil
 	self.inPageFault = false
@@ -475,10 +503,78 @@ function Cpu.pageFault(
 	error(ABORT_INSTRUCTION, 0)
 end
 
--- 386 two-level paging. CR3 is a physical address; page-table entries are read
--- with the physical bus directly. 4 MiB pages require CR4.PSE, which this
--- 486-class core leaves disabled, but accepting a present 4 MiB PDE is useful
--- for guests that set it by hand.
+-- Full TLB flush. Bumping the epoch retires every cached entry at once; the
+-- 1M-slot table itself only clears when the 7-bit epoch wraps.
+function Cpu.flushTlb(self: Cpu)
+	local epoch = self.tlbEpoch + 1
+	if epoch > 127 then
+		epoch = 1
+		if self.tlb then
+			table.clear(self.tlb)
+		end
+	end
+	self.tlbEpoch = epoch
+end
+
+function Cpu.flushTlbPage(self: Cpu, addr: number)
+	local tlb = self.tlb
+	if tlb then
+		tlb[band(rshift(addr, 12), 0xFFFFF)] = 0
+	end
+end
+
+-- Remember which physical frames back page directories and page tables so
+-- stores into them can invalidate the entries that map through the changed
+-- slot. Frames outside RAM are skipped: stores there are open bus anyway.
+function Cpu.trackPageFrame(self: Cpu, frame: number, kind: number)
+	if frame >= self.mem.size then
+		return
+	end
+	const old = self.pfTrack[frame]
+	if old == nil then
+		self.pfTrack[frame] = kind
+		self.pfCount += 1
+	elseif band(old, kind) == 0 then
+		self.pfTrack[frame] = bor(old, kind)
+	end
+end
+
+-- A paged store landed inside a tracked page-directory/page-table frame. Drop
+-- entries that read the changed slot: one PDE slot covers a 4 MiB linear
+-- region, one PTE slot the same offset in every page table. The walker's own
+-- accessed/dirty writeback bypasses this path on purpose - A/D updates never
+-- change the mapping. Device/DMA writes to page tables are not tracked; no
+-- real guest programs page tables over DMA.
+function Cpu.invalidatePageTableWrite(self: Cpu, addr: number)
+	const frame = band(addr, 0xFFFFF000)
+	const kind = self.pfTrack[frame]
+	if kind == nil or self.tlb == nil then
+		return
+	end
+	local slot = rshift(addr - frame, 2)
+	const slotEnd = rshift(addr + 3 - frame, 2)
+	while slot <= slotEnd and slot < 1024 do
+		if band(kind, 1) ~= 0 then
+			const base = lshift(slot, 10)
+			for index = 0, 1023 do
+				self.tlb[base + index] = 0
+			end
+		end
+		if band(kind, 2) ~= 0 then
+			for dir = 0, 1023 do
+				self.tlb[bor(lshift(dir, 10), slot)] = 0
+			end
+		end
+		slot += 1
+	end
+end
+
+-- 386 two-level paging with a software TLB. CR3 is a physical address; the
+-- page-table walk only runs on a miss. Hits re-check U/S and R/W (and the 4 MiB
+-- reserved-bit condition) against the current access and CR0.WP, so every #PF
+-- carries the same error-code bits an uncached walk would produce. 4 MiB pages
+-- require CR4.PSE, which this 486-class core leaves disabled, but accepting a
+-- present 4 MiB PDE is useful for guests that set it by hand.
 function Cpu.translatePage(
 	self: Cpu,
 	addr: number,
@@ -488,6 +584,33 @@ function Cpu.translatePage(
 ): number
 	if not self:pagingEnabled() then
 		return addr
+	end
+	const vpn = rshift(addr, 12)
+	if self.tlb == nil then
+		self.tlb = table.create(0x100000) :: { [number]: number }
+	end
+	local tlb = self.tlb :: { [number]: number }
+	local entry = tlb[vpn]
+	if entry ~= nil and band(rshift(entry, 25), 0x7F) == self.tlbEpoch then
+		if write and band(entry, TLB_D) == 0 then
+			-- First write to this page since a read cached it: the PTE still
+			-- needs its dirty bit, and only the walk does that bookkeeping.
+			tlb[vpn] = 0
+		else
+			if user and band(entry, TLB_US) == 0 then
+				self:pageFault(addr, write, user, false, fetch or false, true)
+			end
+			if write and band(entry, TLB_RW) == 0 and (user or band(self.cr0, CR0_WP) ~= 0) then
+				self:pageFault(addr, write, user, false, fetch or false, true)
+			end
+			if band(entry, TLB_4M) ~= 0 then
+				if band(addr, 0x3FF000) ~= 0 and band(entry, TLB_PAT) ~= 0 then
+					self:pageFault(addr, write, user, true, fetch or false, true)
+				end
+				return lshift(band(entry, TLB_FRAME_4M), 21) + band(addr, 0x3FFFFF)
+			end
+			return lshift(band(entry, TLB_FRAME), 11) + band(addr, 0xFFF)
+		end
 	end
 	const dirBase = band(self.cr3, 0xFFFFF000)
 	const dirIndex = rshift(addr, 22)
@@ -504,10 +627,26 @@ function Cpu.translatePage(
 	if write and not writable and (user or band(self.cr0, CR0_WP) ~= 0) then
 		self:pageFault(addr, write, user, false, fetch or false, true)
 	end
+	local entryBits = 0
+	if userPage then
+		entryBits = TLB_US
+	end
+	if writable then
+		entryBits = bor(entryBits, TLB_RW)
+	end
 	if band(pde, 0x80) ~= 0 then -- 4 MiB page (PSE)
 		if band(addr, 0x3FF000) ~= 0 and band(pde, 0x40000000) ~= 0 then
 			self:pageFault(addr, write, user, true, fetch or false, true)
 		end
+		self:trackPageFrame(dirBase, 1)
+		tlb[vpn] = bor(
+			entryBits,
+			TLB_4M,
+			TLB_D,
+			if band(pde, 0x40000000) ~= 0 then TLB_PAT else 0,
+			rshift(band(pde, 0xFFC00000), 21),
+			lshift(self.tlbEpoch, 25)
+		)
 		return band(pde, 0xFFC00000) + band(addr, 0x3FFFFF)
 	end
 	const tableBase = band(pde, 0xFFFFF000)
@@ -522,12 +661,27 @@ function Cpu.translatePage(
 	if write and band(pte, 2) == 0 and (user or band(self.cr0, CR0_WP) ~= 0) then
 		self:pageFault(addr, write, user, false, fetch or false, true)
 	end
-	-- Accessed/dirty bookkeeping, as a real 486 does.
+	-- Accessed/dirty bookkeeping, as a real 486 does. The PDE accessed bit is
+	-- left alone, exactly as the old uncached walk did.
 	const touched = bor(pte, 0x20)
 	const withDirty = if write then bor(touched, 0x40) else touched
 	if withDirty ~= pte then
 		self.mem:write32(pteAddr, withDirty)
 	end
+	if band(pte, 4) == 0 then
+		entryBits = band(entryBits, bnot(TLB_US))
+	end
+	if band(pte, 2) == 0 then
+		entryBits = band(entryBits, bnot(TLB_RW))
+	end
+	self:trackPageFrame(dirBase, 1)
+	self:trackPageFrame(tableBase, 2)
+	tlb[vpn] = bor(
+		entryBits,
+		if band(withDirty, 0x40) ~= 0 then TLB_D else 0,
+		rshift(band(pte, 0xFFFFF000), 11),
+		lshift(self.tlbEpoch, 25)
+	)
 	return band(pte, 0xFFFFF000) + band(addr, 0xFFF)
 end
 
@@ -583,6 +737,9 @@ function Cpu.write8(self: Cpu, addr: number, value: number, supervisor: boolean?
 		return
 	end
 	self.mem:write8(phys, value)
+	if self.pfCount > 0 and self.pfTrack[band(phys, 0xFFFFF000)] ~= nil then
+		self:invalidatePageTableWrite(phys)
+	end
 end
 
 function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
@@ -596,6 +753,9 @@ function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean
 		return
 	end
 	self.mem:write16(phys, value)
+	if self.pfCount > 0 and self.pfTrack[band(phys, 0xFFFFF000)] ~= nil then
+		self:invalidatePageTableWrite(phys)
+	end
 end
 
 function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
@@ -609,6 +769,9 @@ function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean
 		return
 	end
 	self.mem:write32(phys, value)
+	if self.pfCount > 0 and self.pfTrack[band(phys, 0xFFFFF000)] ~= nil then
+		self:invalidatePageTableWrite(phys)
+	end
 end
 
 local function getSeg(cpu: any, reg: string): number
@@ -658,6 +821,10 @@ end
 function Cpu.reset(self: Cpu)
 	self.cr0 = 0
 	self.cr3 = 0
+	self.tlb = nil
+	self.tlbEpoch = 1
+	self.pfTrack = {}
+	self.pfCount = 0
 	self.cr = { 0, 0, 0, 0 }
 	self.dr = { 0, 0, 0, 0 }
 	self.inPageFault = false
@@ -3543,11 +3710,16 @@ local function movControl(cpu: any, op: number)
 		const value = if cpu.operand32 then cpu:rr32(e.rm) else cpu:rr(e.rm)
 		if op == 0x22 then
 			if e.reg == 0 then
+				local oldCr0 = cpu.cr0
 				cpu.cr0 = value
 				cpu.cr[0] = value
+				if band(oldCr0, CR0_PG) ~= band(value, CR0_PG) then
+					cpu:flushTlb()
+				end
 			elseif e.reg == 3 then
 				cpu.cr3 = value
 				cpu.cr[3] = value
+				cpu:flushTlb()
 			else
 				cpu.cr[e.reg] = value
 			end
@@ -3740,10 +3912,18 @@ H0F[0x01] = function(cpu: any)
 		end
 	elseif reg == 6 then
 		const value = cpu:readRM16(e)
-		cpu.cr0 = bor(band(cpu.cr0, 0xFFFF0000), band(value, 0xFFFF))
-		cpu.cr[0] = cpu.cr0
+		local nextCr0 = bor(band(cpu.cr0, 0xFFFF0000), band(value, 0xFFFF))
+		if band(cpu.cr0, CR0_PG) ~= band(nextCr0, CR0_PG) then
+			cpu:flushTlb()
+		end
+		cpu.cr0 = nextCr0
+		cpu.cr[0] = nextCr0
 	elseif reg == 7 then
-		-- INVLPG: this core has no TLB, so flushing is a no-op.
+		-- INVLPG drops one cached translation. The register form (mod==3) is
+		-- #UD on real hardware; keep the old lenient no-op for it.
+		if e.mod ~= 3 then
+			cpu:flushTlbPage(cpu:linear(e.seg :: string, e.off :: number, 1))
+		end
 	else
 		error("bad 0F 01 /" .. reg)
 	end
