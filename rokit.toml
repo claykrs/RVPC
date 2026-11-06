@@ -1,0 +1,5 @@
+﻿[tools]
+lune = "lune-org/lune@0.11.1"
+selene = "Kampfkarren/selene@0.32.0"
+stylua = "JohnnyMorganz/StyLua@2.6.0"
+luau = "luau-lang/luau@0.745"

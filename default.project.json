@@ -1,0 +1,24 @@
+{
+	"name": "Rvpc",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"Rvpc": {
+				"$path": "core"
+			},
+			"RvpcUi": {
+				"$path": "roblox/ui"
+			}
+		},
+		"StarterPlayer": {
+			"$className": "StarterPlayer",
+			"StarterPlayerScripts": {
+				"$className": "StarterPlayerScripts",
+				"RvpcClient": {
+					"$path": "roblox/client"
+				}
+			}
+		}
+	}
+}
