@@ -382,6 +382,26 @@ T("atapi_identify_and_read10", function(expect)
 	expect(buffer.readu8(data, 17) == 17, "ISO body")
 end)
 
+T("atapi_signature_and_device_reset", function(expect)
+	const ide = Ide.new({ hdd = makeHdd(), cdrom = makeIso() })
+	-- After reset the selected master reports the ATA signature.
+	expect(ide:in8(0x1F2) == 0x01, "master sector count")
+	expect(ide:in8(0x1F4) == 0x00, "master cylinder low")
+	expect(ide:in8(0x1F5) == 0x00, "master cylinder high")
+	-- The CD slave reports the ATAPI signature DOS drivers probe for.
+	selectDrive(ide, true)
+	expect(ide:in8(0x1F4) == 0x14, "ATAPI cylinder low")
+	expect(ide:in8(0x1F5) == 0xEB, "ATAPI cylinder high")
+	-- A task-file write hands the registers to the guest.
+	ide:out8(0x1F4, 0x77)
+	expect(ide:in8(0x1F4) == 0x77, "register write did not clear signature")
+	-- DEVICE RESET reloads the signature and stays error-free.
+	ide:out8(0x1F7, 0x08)
+	expect(band(ide:in8(0x1F7), 0x09) == 0, "DEVICE RESET left BSY or ERR set")
+	expect(ide:in8(0x1F4) == 0x14, "DEVICE RESET did not reload ATAPI cylinder low")
+	expect(ide:in8(0x1F5) == 0xEB, "DEVICE RESET did not reload ATAPI cylinder high")
+end)
+
 T("atapi_capacity_and_toc", function(expect)
 	const iso = makeIso()
 	const ide = Ide.new({ cdrom = iso })

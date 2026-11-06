@@ -38,6 +38,7 @@ const ATA_WRITE_DMA_EXT = 0x35
 const ATA_FLUSH = 0xE7
 const ATA_SET_FEATURES = 0xEF
 const ATA_IDENTIFY_PACKET = 0xA1
+const ATA_DEVICE_RESET = 0x08
 const ATA_PACKET = 0xA0
 const ATA_DIAGNOSTIC = 0x90
 const ATA_INIT_PARAMS = 0x91
@@ -67,6 +68,10 @@ export type Drive = {
 	status: number,
 	error: number,
 	model: string,
+	-- True while the task file still holds the power-on signature (ATAPI
+	-- 0x14/0xEB in the cylinder registers); DOS ATAPI drivers detect the CD
+	-- by reading it. Any register write or command hands the file to the guest.
+	sig: boolean,
 }
 
 export type Transfer = {
@@ -108,6 +113,8 @@ export type Ide = typeof(setmetatable(
 		transfer: Transfer?,
 		packet: buffer,
 		packetPos: number,
+		pktCdb: boolean,
+		pktData: boolean,
 		features: number,
 		atapiDma: boolean,
 		irqPending: boolean,
@@ -150,7 +157,24 @@ local function newDrive(kind: string, image: buffer?, present: boolean): Drive
 		status = if present then bor(ST_DRDY, ST_DSC) else 0,
 		error = 0,
 		model = if kind == "hdd" then "RVPC VIRTUAL HDD" else "RVPC VIRTUAL CD",
+		sig = true,
 	}
+end
+
+-- Task-file signature bytes a device reports after reset: sector count 0x01,
+-- sector number 0x01, cylinder low/high 0x14/0xEB for ATAPI, 0x00/0x00 for ATA.
+local function sigRegister(drive: Drive, offset: number): number
+	if drive.kind == "cdrom" then
+		if offset == 4 then
+			return 0x14
+		elseif offset == 5 then
+			return 0xEB
+		end
+	end
+	if offset == 2 or offset == 3 then
+		return 0x01
+	end
+	return 0x00
 end
 
 function Ide.new(config: Config?): Ide
@@ -175,6 +199,8 @@ function Ide.new(config: Config?): Ide
 	self.transfer = nil
 	self.packet = buffer.create(16)
 	self.packetPos = 0
+	self.pktCdb = false
+	self.pktData = false
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
@@ -198,6 +224,8 @@ function Ide.reset(self: Ide)
 	self.selectedIndex = 0
 	self.transfer = nil
 	self.packetPos = 0
+	self.pktCdb = false
+	self.pktData = false
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
@@ -206,6 +234,8 @@ function Ide.reset(self: Ide)
 	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
 	self.master.error = 0
 	self.slave.error = 0
+	self.master.sig = true
+	self.slave.sig = true
 	self.senseKey = 0
 	self.senseAsc = 0
 	self.senseAscq = 0
@@ -299,6 +329,8 @@ end
 local function finish(self: Ide, status: number)
 	self.selected.status = status
 	self.transfer = nil
+	self.pktCdb = false
+	self.pktData = false
 	self.irqPending = true
 end
 
@@ -524,6 +556,8 @@ local function failCommand(self: Ide, errorCode: number)
 	self.lastError = errorCode
 	self.selected.status = bor(ST_DRDY, ST_ERR)
 	self.transfer = nil
+	self.pktCdb = false
+	self.pktData = false
 	self.irqPending = true
 end
 
@@ -896,6 +930,8 @@ end
 
 local function atapiPacket(self: Ide)
 	const drive = self.selected
+	self.pktCdb = false
+	self.pktData = true
 	if drive.kind ~= "cdrom" then
 		failAtapi(self, SENSE_ILLEGAL_REQUEST, ASC_INVALID_OPCODE)
 		return
@@ -1022,6 +1058,7 @@ local function command(self: Ide, cmd: number)
 	self.transfer = nil
 	self.atapiDma = false
 	drive.error = 0
+	drive.sig = false
 	self.lastError = 0
 	if cmd == ATA_IDENTIFY then
 		self.identifyCount += 1
@@ -1098,6 +1135,8 @@ local function command(self: Ide, cmd: number)
 			return
 		end
 		self.packetPos = 0
+		self.pktCdb = true
+		self.pktData = false
 		self.atapiDma = band(self.features, 0x01) ~= 0 and dmaReady(self, true)
 		drive.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
 	elseif
@@ -1110,6 +1149,13 @@ local function command(self: Ide, cmd: number)
 	elseif cmd == ATA_DIAGNOSTIC then
 		self.master.error = 0
 		self.slave.error = 0
+		finish(self, bor(ST_DRDY, ST_DSC))
+	elseif cmd == ATA_DEVICE_RESET then
+		-- DEVICE RESET reloads the selected device's power-on signature into
+		-- the task file. ATAPI detection in DOS drivers reads 0x14/0xEB out of
+		-- the cylinder registers right after issuing it.
+		drive.sig = true
+		drive.error = 0
 		finish(self, bor(ST_DRDY, ST_DSC))
 	else
 		failCommand(self, 0x04)
@@ -1185,14 +1231,19 @@ function Ide.out8(self: Ide, port: number, value: number)
 		end
 	elseif offset == 1 then
 		self.features = value
+		self.selected.sig = false
 	elseif offset == 2 then
 		self.sectorCount = value
+		self.selected.sig = false
 	elseif offset == 3 then
 		self.lba = bor(band(self.lba, 0xFFFFF00), value)
+		self.selected.sig = false
 	elseif offset == 4 then
 		self.lba = bor(band(self.lba, 0xFFFF00FF), lshift(value, 8))
+		self.selected.sig = false
 	elseif offset == 5 then
 		self.lba = bor(band(self.lba, 0xFF00FFFF), lshift(value, 16))
+		self.selected.sig = false
 	elseif offset == 6 then
 		self.driveHead = value
 		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
@@ -1214,12 +1265,46 @@ function Ide.in8(self: Ide, port: number): number
 	elseif offset == 1 then
 		return self.selected.error
 	elseif offset == 2 then
+		if self.selected.sig then
+			return sigRegister(self.selected, 2)
+		end
+		-- During packet transfers the sector-count register is the interrupt
+		-- reason: REL bit 2, I/O bit 1, CoD bit 0. CDB delivery is CoD=1.
+		if self.pktCdb then
+			return 0x01
+		end
+		if self.pktData and self.transfer ~= nil then
+			return if self.transfer.write then 0x00 else 0x02
+		end
 		return self.sectorCount
 	elseif offset == 3 then
+		if self.selected.sig then
+			return sigRegister(self.selected, 3)
+		end
 		return band(self.lba, 0xFF)
 	elseif offset == 4 then
+		if self.selected.sig then
+			return sigRegister(self.selected, 4)
+		end
+		-- Packet phases report the byte count of the current burst in the
+		-- cylinder registers; the CDB burst is 12 bytes.
+		if self.pktCdb then
+			return 0x0C
+		end
+		if self.pktData and self.transfer ~= nil then
+			return band(self.transfer.length - self.transfer.pos, 0xFF)
+		end
 		return band(rshift(self.lba, 8), 0xFF)
 	elseif offset == 5 then
+		if self.selected.sig then
+			return sigRegister(self.selected, 5)
+		end
+		if self.pktCdb then
+			return 0x00
+		end
+		if self.pktData and self.transfer ~= nil then
+			return band(rshift(self.transfer.length - self.transfer.pos, 8), 0xFF)
+		end
 		return band(rshift(self.lba, 16), 0xFF)
 	elseif offset == 6 then
 		return self.driveHead
