@@ -775,6 +775,76 @@ T("ata_nien_suppresses_irq", function(expect)
 	expect(ide:takeIrq(), "IRQ did not appear after clearing nIEN")
 end)
 
+T("atapi_packet_phase_interrupt_reason", function(expect)
+	const ide = Ide.new({ hdd = makeHdd(), cdrom = makeIso() })
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA0)
+	-- CDB accept: CoD=1, I/O=0, byte count limit 12.
+	expect(ide:in8(0x1F2) == 0x01, "CDB accept phase")
+	expect(ide:in8(0x1F4) == 0x0C, "CDB accept byte count low")
+	submitPacket(ide, { 0x12, 0, 0, 0, 36, 0 })
+	-- Data ready: CoD=0, I/O=1.
+	expect(ide:in8(0x1F2) == 0x02, "data phase")
+	-- Draining the data completes the command; the interrupt reason must
+	-- then report CoD=1 with I/O=1 (the Win9x drivers require this).
+	readBytes(ide, 36)
+	expect(ide:in8(0x1F2) == 0x03, "completion phase")
+	expect(band(ide:in8(0x1F7), 0x09) == 0, "completion left BSY or ERR")
+	-- A non-data packet command completes straight into the completion phase.
+	sendPacket(ide, { 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide:in8(0x1F2) == 0x03, "non-data completion phase")
+	-- A rejected opcode reports the completion phase with ERR set.
+	sendPacket(ide, { 0xEE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide:in8(0x1F2) == 0x03, "failed packet completion phase")
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "bad opcode did not report ERR")
+	-- The next PACKET command restarts the phases.
+	sendPacket(ide, { 0x12, 0, 0, 0, 36, 0 })
+	expect(ide:in8(0x1F2) == 0x02, "data phase after resend")
+end)
+
+T("atapi_completion_irq_survives_slave_mask", function(expect)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Pic = Pic, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		cdrom = makeIso(),
+	})
+	const io = m.cpu.io
+	m.pic.master.imr = 0
+	m.pic.slave.imr = 0
+	selectDrive(m.ide, true)
+	io.out8(0x1F7, 0xA0)
+	submitPacket(m.ide, { 0x12, 0, 0, 0, 36, 0 })
+	expect(m.ide.irqPending, "INQUIRY data-ready IRQ missing")
+	m.cpu.halted = true
+	m.cpu.flags = bor(band(m.cpu.flags, 0xFFFF), 0x202)
+	m.cpu.ss = 0
+	m.cpu:setSP(0x7000)
+	m:run(1)
+	expect(m.irqCount == 1, ("data-ready irqCount=%d"):format(m.irqCount))
+	-- The driver's handler ends with a slave EOI followed by a master EOI.
+	io.out8(0xA0, 0x20)
+	io.out8(0x20, 0x20)
+	-- The OTI-91x driver masks IRQ14 around the data phase and unmasks it
+	-- only when it is ready to wait for completion. The request raised while
+	-- masked must not assert the master cascade, and it must surface once the
+	-- slave is unmasked instead of being dropped.
+	io.out8(0xA1, 0x40)
+	readPortBytes(io, 0x1F0, 36)
+	m.cpu.halted = true
+	m:run(1)
+	expect(band(m.pic.slave.irr, 0x40) ~= 0, "completion request lost while masked")
+	expect(band(m.pic.master.irr, 0x04) == 0, "cascade asserted for a masked slave request")
+	expect((m.cpu.intCounts[0x0A] or 0) == 0, "spurious cascade vector 0x0A dispatched")
+	io.out8(0xA1, 0x00)
+	m.cpu.halted = true
+	m.cpu.flags = bor(band(m.cpu.flags, 0xFFFF), 0x202)
+	m:run(1)
+	expect(m.irqCount == 2, ("completion irqCount=%d"):format(m.irqCount))
+	expect(band(m.pic.slave.isr, 0x40) ~= 0, "IRQ14 not in service")
+	expect(band(m.pic.master.isr, 0x04) ~= 0, "IRQ14 cascade not in service")
+	expect(io.in8(0x1F2) == 0x03, "completion phase register")
+end)
+
 T("piix3_bmdma_read_write", function(expect)
 	const hdd = makeHdd()
 	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Ide = Ide }, {

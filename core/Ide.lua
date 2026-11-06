@@ -115,6 +115,9 @@ export type Ide = typeof(setmetatable(
 		packetPos: number,
 		pktCdb: boolean,
 		pktData: boolean,
+		-- ATAPI interrupt-reason phase: 1 = CDB accept (CoD=1), 2 = data
+		-- transfer (I/O=1), 3 = command completed (CoD=1, I/O=1). 0 = idle.
+		packetPhase: number,
 		features: number,
 		atapiDma: boolean,
 		irqPending: boolean,
@@ -201,6 +204,7 @@ function Ide.new(config: Config?): Ide
 	self.packetPos = 0
 	self.pktCdb = false
 	self.pktData = false
+	self.packetPhase = 0
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
@@ -226,6 +230,7 @@ function Ide.reset(self: Ide)
 	self.packetPos = 0
 	self.pktCdb = false
 	self.pktData = false
+	self.packetPhase = 0
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
@@ -331,6 +336,9 @@ local function finish(self: Ide, status: number)
 	self.transfer = nil
 	self.pktCdb = false
 	self.pktData = false
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -517,6 +525,9 @@ function dmaFinish(self: Ide, ok: boolean)
 			bor(band(self.bmStatus, bit32.bnot(BM_STATUS_ACTIVE)), BM_STATUS_ERROR, BM_STATUS_INT)
 	end
 	self.transfer = nil
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -558,6 +569,9 @@ local function failCommand(self: Ide, errorCode: number)
 	self.transfer = nil
 	self.pktCdb = false
 	self.pktData = false
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -604,6 +618,9 @@ local function atapiReply(self: Ide, data: buffer, allocation: number)
 	else
 		beginRead(self, data)
 	end
+	if self.transfer ~= nil then
+		self.packetPhase = 2
+	end
 	self.irqPending = true
 end
 
@@ -634,6 +651,9 @@ local function atapiRead(self: Ide, lba: number, count: number)
 	const data = buffer.create(count * 2048)
 	buffer.copy(data, 0, image, lba * 2048, count * 2048)
 	beginRead(self, data)
+	if self.transfer ~= nil then
+		self.packetPhase = 2
+	end
 	self.irqPending = true
 end
 
@@ -1043,6 +1063,7 @@ end
 local function command(self: Ide, cmd: number)
 	self.commandCount += 1
 	self.lastCommand = cmd
+	self.packetPhase = 0
 	const drive = self.selected
 	if not drive.present then
 		-- No device on this position: report ABRT without asserting the shared
@@ -1137,6 +1158,7 @@ local function command(self: Ide, cmd: number)
 		self.packetPos = 0
 		self.pktCdb = true
 		self.pktData = false
+		self.packetPhase = 1
 		self.atapiDma = band(self.features, 0x01) ~= 0 and dmaReady(self, true)
 		drive.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
 	elseif
@@ -1269,12 +1291,16 @@ function Ide.in8(self: Ide, port: number): number
 			return sigRegister(self.selected, 2)
 		end
 		-- During packet transfers the sector-count register is the interrupt
-		-- reason: REL bit 2, I/O bit 1, CoD bit 0. CDB delivery is CoD=1.
+		-- reason: REL bit 2, I/O bit 1, CoD bit 0. CDB delivery is CoD=1,
+		-- data-to-host is I/O=1, and command completion is CoD=1 with I/O=1.
 		if self.pktCdb then
 			return 0x01
 		end
 		if self.pktData and self.transfer ~= nil then
 			return if self.transfer.write then 0x00 else 0x02
+		end
+		if self.packetPhase == 3 then
+			return 0x03
 		end
 		return self.sectorCount
 	elseif offset == 3 then

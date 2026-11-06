@@ -32,6 +32,7 @@ export type Pic = typeof(setmetatable(
 		in8: (self: Pic, port: number) -> number,
 		out8: (self: Pic, port: number, value: number) -> (),
 		raise: (self: Pic, irq: number) -> (),
+		syncCascade: (self: Pic) -> (),
 		acknowledge: (self: Pic) -> (number?, number?),
 		eoi: (self: Pic, irq: number?) -> (),
 		nextPending: (self: Pic) -> number?,
@@ -114,8 +115,17 @@ function Pic.raise(self: Pic, irq: number)
 	end
 	const slaveIrq = irq - 8
 	self.slave.irr = setBit(self.slave.irr, slaveIrq, true)
-	-- IRQ2 is the cascade input on the master.
-	self.master.irr = setBit(self.master.irr, 2, true)
+	self:syncCascade()
+end
+
+-- The master's IR2 input is wired to the slave's INT output, which is high
+-- exactly while the slave holds an unmasked request. Derive it instead of
+-- latching it at raise time: a request raised while the slave is masked must
+-- surface when the guest unmasks the slave (the Win9x ATAPI drivers mask
+-- IRQ14 around data phases and unmask afterwards).
+function Pic.syncCascade(self: Pic)
+	const request = band(self.slave.irr, bnot(self.slave.imr))
+	self.master.irr = setBit(self.master.irr, 2, request ~= 0)
 end
 
 function Pic.nextPending(self: Pic): number?
@@ -142,7 +152,9 @@ function Pic.acknowledge(self: Pic): (number?, number?)
 		if slaveIrq ~= nil then
 			self.slave.irr = setBit(self.slave.irr, slaveIrq, false)
 			self.slave.isr = setBit(self.slave.isr, slaveIrq, true)
-			self.master.irr = setBit(self.master.irr, 2, false)
+			-- The slave's INT output may stay high when another request is
+			-- already queued behind the one being acknowledged.
+			self:syncCascade()
 			self.master.isr = setBit(self.master.isr, 2, true)
 			return self.slave.vectorBase + slaveIrq, 8 + slaveIrq
 		end
@@ -161,6 +173,7 @@ function Pic.eoi(self: Pic, irq: number?)
 			if self.slave.isr == 0 then
 				self.master.isr = setBit(self.master.isr, 2, false)
 			end
+			self:syncCascade()
 		else
 			self.master.isr = setBit(self.master.isr, irq, false)
 		end
@@ -178,6 +191,7 @@ function Pic.eoi(self: Pic, irq: number?)
 			self.slave.isr = setBit(self.slave.isr, slaveBit, false)
 		end
 	end
+	self:syncCascade()
 end
 
 -- A non-specific EOI written to the slave command port clears the slave, not
@@ -191,6 +205,7 @@ local function eoiSlave(self: Pic)
 	if self.slave.isr == 0 then
 		self.master.isr = setBit(self.master.isr, 2, false)
 	end
+	self:syncCascade()
 end
 
 local function writeChip(self: Pic, chip: Chip, port: number, value: number)
@@ -202,6 +217,7 @@ local function writeChip(self: Pic, chip: Chip, port: number, value: number)
 			chip.level = band(value, 0x08) ~= 0
 			chip.irr = 0
 			chip.isr = 0
+			self:syncCascade()
 			return
 		end
 		if band(value, 0x08) ~= 0 then
@@ -237,6 +253,7 @@ local function writeChip(self: Pic, chip: Chip, port: number, value: number)
 		return
 	end
 	chip.imr = band(value, 0xFF)
+	self:syncCascade()
 end
 
 function Pic.out8(self: Pic, port: number, value: number)
