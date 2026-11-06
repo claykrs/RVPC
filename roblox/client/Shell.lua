@@ -192,6 +192,11 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 	local statusTime = 0
 	local textTime = 0
 	local fps = 0
+	local machineMsTotal = 0
+	local pollMsTotal = 0
+	local pollCount = 0
+	local stepsMark = 0
+	local maxFrameMs = 0
 	local running = true
 
 	local function statusText(): string
@@ -239,8 +244,13 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		if not running then
 			return
 		end
+		if dt * 1000 > maxFrameMs then
+			maxFrameMs = dt * 1000
+		end
 		const ok, err = pcall(function()
 			input:Step()
+			local machineMs = 0
+			local pollMs = 0
 			if machine then
 				const started = os.clock()
 				const budget = cfg.timeBudget or 0.006
@@ -255,6 +265,7 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 						break
 					end
 				until frameSteps >= maxSteps or os.clock() - started >= budget
+				machineMs = (os.clock() - started) * 1000
 			end
 			-- Text-mode writes land in plain B8000 RAM, not the VGA aperture, so
 			-- the core cannot see them dirty. Repaint text mode at 20 Hz; the
@@ -271,12 +282,28 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 				textTime = 0
 			end
 			if view then
+				const pollStart = os.clock()
 				view:Poll(forceText)
+				pollMs = (os.clock() - pollStart) * 1000
 			end
+			-- perf telemetry for live tuning (read from the Studio property panel)
+			machineMsTotal += machineMs
+			pollMsTotal += pollMs
+			pollCount += 1
 			frames += 1
 			statusTime += dt
 			if statusTime >= 0.5 then
 				fps = frames / statusTime
+				gui:SetAttribute("RvpcFps", math.floor(fps))
+				gui:SetAttribute("RvpcMachineMs", math.floor(machineMsTotal / frames * 10) / 10)
+				gui:SetAttribute("RvpcPollMs", math.floor(pollMsTotal / frames * 100) / 100)
+				gui:SetAttribute("RvpcStepsPerS", math.floor((steps - stepsMark) / statusTime))
+				gui:SetAttribute("RvpcMaxFrameMs", math.floor(maxFrameMs * 10) / 10)
+				maxFrameMs = 0
+				machineMsTotal = 0
+				pollMsTotal = 0
+				pollCount = 0
+				stepsMark = steps
 				frames = 0
 				statusTime = 0
 				refreshStatus()

@@ -2231,6 +2231,20 @@ function Vga.snapshotRegionRGBA(
 	return self.rgba
 end
 
+-- Cheap change detector for the visible text plane (80x25 cells = 4000 bytes
+-- at the CRTC start). Text-mode writes land in B8000 RAM outside the dirty
+-- tracking, so presenters poll this every frame and only snapshot/upload when
+-- the plane (or its start address) actually moved.
+function Vga.textChecksum(self: Vga): number
+	const start = band(self:displayStartBytes(), 0x7FFF)
+	const plane = self.mem:copyTo(TEXT_BASE + start, 4096)
+	local hash = 0
+	for i = 0, 4095 do
+		hash = band(hash * 31 + buffer.readu8(plane, i), 0xFFFFFFFF)
+	end
+	return band(hash + start, 0xFFFFFFFF)
+end
+
 function Vga.snapshot(self: Vga): Snapshot
 	return {
 		width = self.widthPx,

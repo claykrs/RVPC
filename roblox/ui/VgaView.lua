@@ -237,6 +237,24 @@ function VgaView.new(vga: any, parent: Instance, options: Options?): VgaView
 			end
 			return
 		end
+		if vga:isTextMode() then
+			-- Text writes are invisible to dirty tracking, so a plain force
+			-- would repaint the whole 1 MiB frame at a fixed rate whether or
+			-- not anything changed. Poll the visible-plane checksum every
+			-- frame instead: the presenter updates the moment the guest
+			-- writes text and stays idle while it does not.
+			local okSum, sum = pcall(function()
+				return vga:textChecksum()
+			end)
+			if okSum then
+				if sum == self._lastTextSum then
+					return
+				end
+				self._lastTextSum = sum
+				self.Sink:poll(true)
+				return
+			end
+		end
 		self.Sink:poll(force)
 	end
 
