@@ -23,8 +23,8 @@ SeaBIOS boots the Win98 SE CD (El Torito, 1.44M floppy emulation) to the
 answered, the CD's DOS startup image loads: the Windows 98 Startup Menu
 appears with its 29 s countdown, the OTI-91X ATAPI CD driver and the AIC-6260
 ASPI manager load, and the config.sys boot loop restarts when the CD driver
-gives up. SETUP never starts yet; the exact blocker is the OTI-91x IRQ
-handshake described in HANDOFF.md "Current frontier".
+gives up. SETUP never starts yet; the exact blocker is the OTI-91X IDE probe
+at `028E:6C48`, described in HANDOFF.md "Current frontier".
 
 Everything below it is green:
 
@@ -79,14 +79,14 @@ Windows media is **not** committed. Supply it locally:
   loaded at `0000:7C00`. Fixed by the harness `Boot from CD-ROM` injection.
 - **"No drives found, aborting installation":** the OTI-91X driver rejected
   the CD. This is the current blocker. Reproduce with
-  `lune run tools/probe_win98_boot.lua 12` (millions of steps), which logs
-  IDE port traffic from the OTI banner on, snapshots the driver's IRQ
-  ownership (`CS:[68A4]`), its IRQ-received flag (`CS:[68A3]`), the IVT
-  76h target and the PIC state inside the wait loop (`028E:82A9-84A7`).
-  Observed at the stall: INQUIRY data fully transferred (18 words), completion
-  IRQ raised by the IDE, `IF=1`, slave PIC `irr=isr=00`, `imr=0x8E` (IRQ14
-  unmasked), `CS:[68A3]=1`, `CS:[68A4]=1`, IVT 76h = `028E:8560` - the driver
-  waits anyway until its 75-tick timeout.
+  `lune run tools/probe_win98_boot.lua 12` (millions of steps), or use the
+  newer `tools/probe_oti_print.lua`, which logs the relocated `lcall 0,0x6050`
+  (resident shim `028E:6050` -> `028E:6C48`), the per-device port table at
+  `028E:636C`, and the probe's error-register dispatch. The OTI device code is
+  at segment `0B5B`; `028E:6C48` is the resident IDE probe. At the stall the
+  slave CD reports `error=0 status=0x50` and the ATAPI signature `EB/14`;
+  the probe takes its AH=4 failure path from `6D0C/6D23`. The success path is
+  `6CE5` (CF=0).
 - **Warm reset loop:** the startup menu reboots the machine after the CD
   driver fails; each cycle looks like the menu appearing again. This is
   guest-side control flow, not an emulator crash.
@@ -116,15 +116,13 @@ Windows media is **not** committed. Supply it locally:
 
 ## Known blockers to clear
 
-- OTI-91x driver handshake (see Triage guide) - the INQUIRY completion path
-  works since `dc7f975` (PIC cascade survives a masked slave + ATAPI
-  interrupt-reason register); the driver still reports "No drives found"
-  afterwards, which is the current SETUP blocker.
+- OTI-91X IDE probe (see Triage guide): the INQUIRY path works, but the
+  resident probe at `028E:6C48` still takes its failure branch and the driver
+  prints "No drives found". Exact branch instrumentation is the next step.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
-- 80-bit x87 precision remains incomplete. Hardware task gates landed
-  (`39b96de`): IDT task gates, far CALL/JMP to a TSS and IRET through the
-  back-link, so the guest's double-fault task gate works.
+- 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
+  only if SETUP/VMM trips them.
 - PS/2 mouse integration and audio/network drivers after first boot.
 
 ## Non-goals for the first 98 boot
