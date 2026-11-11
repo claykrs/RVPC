@@ -223,9 +223,10 @@ function Ide.new(config: Config?): Ide
 	return self
 end
 
-function Ide.reset(self: Ide)
-	self.selected = self.master
-	self.selectedIndex = 0
+-- ATA SRST (device control bit 2) resets both devices on the channel. The
+-- host's drive-select register and the nIEN bit are not part of the device
+-- reset, so the selected drive and deviceControl are preserved by this helper.
+local function softReset(self: Ide)
 	self.transfer = nil
 	self.packetPos = 0
 	self.pktCdb = false
@@ -234,7 +235,6 @@ function Ide.reset(self: Ide)
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
-	self.deviceControl = 0
 	self.master.status = if self.master.present then bor(ST_DRDY, ST_DSC) else 0
 	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
 	self.master.error = 0
@@ -245,6 +245,13 @@ function Ide.reset(self: Ide)
 	self.senseAsc = 0
 	self.senseAscq = 0
 	self.mediaLocked = false
+end
+
+function Ide.reset(self: Ide)
+	self.selected = self.master
+	self.selectedIndex = 0
+	self.deviceControl = 0
+	softReset(self)
 	self.bmCmd = 0
 	self.bmStatus = BM_STATUS_DMA_CAP
 	self.bmPrdt = 0
@@ -1186,6 +1193,8 @@ local function command(self: Ide, cmd: number)
 		drive.sig = true
 		drive.error = 0
 		finish(self, bor(ST_DRDY, ST_DSC))
+		-- DEVICE RESET asserts INTRQ when the device is ready again.
+		self.irqPending = true
 	else
 		failCommand(self, 0x04)
 	end
@@ -1283,6 +1292,12 @@ function Ide.out8(self: Ide, port: number, value: number)
 	elseif offset == 7 then
 		command(self, value)
 	elseif port == self.altBase then
+		-- SRST is level-sensitive but the device reset occurs on the 0->1
+		-- transition. Clear any stale ERR/DRQ and reload both signatures;
+		-- the host's selected drive and nIEN bit survive the reset.
+		if band(value, 0x04) ~= 0 and band(self.deviceControl, 0x04) == 0 then
+			softReset(self)
+		end
 		self.deviceControl = value
 	end
 end

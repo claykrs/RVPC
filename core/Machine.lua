@@ -120,6 +120,9 @@ export type Machine = typeof(setmetatable(
 		lastOutPort: number,
 		lastOutValue: number,
 		irqCount: number,
+		int19Count: number,
+		atResetVector: boolean,
+		booted: boolean,
 		debugLog: { string },
 		run: (self: Machine, maxSteps: number?) -> number,
 		reset: (self: Machine) -> (),
@@ -507,6 +510,9 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.lastOutPort = 0
 	self.lastOutValue = 0
 	self.irqCount = 0
+	self.int19Count = 0
+	self.atResetVector = false
+	self.booted = false
 	self.debugLog = {}
 
 	local function pciAddressByte(index: number): number
@@ -985,6 +991,15 @@ function Machine.deliverInterrupt(self: Machine): boolean
 	return true
 end
 
+local function resetIdeChannels(self: Machine)
+	if self.ide then
+		self.ide:reset()
+	end
+	if self.ide2 then
+		self.ide2:reset()
+	end
+end
+
 function Machine.run(self: Machine, maxSteps: number?): number
 	local steps = 0
 	local idle = 0
@@ -1076,6 +1091,23 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				cpu:step()
 			end
 			idle = 0
+		end
+		-- A guest warm boot can re-enter the BIOS via INT 19h or the reset
+		-- vector without asserting IDE SRST. Reset the channels so a stale
+		-- OAKCDROM probe error cannot hide the HDD from the next boot's
+		-- SeaBIOS drive scan.
+		const int19 = cpu.intCounts[0x19] or 0
+		if int19 > self.int19Count then
+			self.int19Count = int19
+			resetIdeChannels(self)
+		end
+		const atResetVector = cpu.cs == 0xF000 and cpu.ip == 0xFFF0
+		if self.booted and atResetVector and not self.atResetVector then
+			resetIdeChannels(self)
+		end
+		self.atResetVector = atResetVector
+		if not self.booted and not atResetVector then
+			self.booted = true
 		end
 		steps += 1
 	end

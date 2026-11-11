@@ -7,6 +7,7 @@ const Ide = require("../core/Ide")
 const Memory = require("../core/Memory")
 const Cpu = require("../core/Cpu")
 const Pic = require("../core/Pic")
+const Cmos = require("../core/Cmos")
 const Machine = require("../core/Machine")
 
 const TESTS = {}
@@ -400,6 +401,53 @@ T("atapi_signature_and_device_reset", function(expect)
 	expect(band(ide:in8(0x1F7), 0x09) == 0, "DEVICE RESET left BSY or ERR set")
 	expect(ide:in8(0x1F4) == 0x14, "DEVICE RESET did not reload ATAPI cylinder low")
 	expect(ide:in8(0x1F5) == 0xEB, "DEVICE RESET did not reload ATAPI cylinder high")
+	expect(ide:takeIrq(), "DEVICE RESET did not assert IRQ")
+end)
+
+T("ata_srst_clears_stale_error_and_reloads_signature", function(expect)
+	const ide = Ide.new({ hdd = makeHdd(), cdrom = makeIso() })
+	-- What OAKCDROM does to an ATA master while looking for an ATAPI device:
+	-- IDENTIFY PACKET aborts and leaves ERR/ABRT behind.
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xA1)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "A1 on ATA did not report ERR")
+	expect(ide.master.error == 0x04, "A1 on ATA did not report ABRT")
+	-- Put the channel in a transfer/IRQ state on the CD.
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA0)
+	submitPacket(ide, { 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide.irqPending, "CD packet did not latch IRQ")
+	-- Assert SRST with nIEN set. Both signatures must reload, the transfer and
+	-- IRQ must clear, and the host's drive select/nIEN must survive.
+	ide:out8(0x3F6, 0x06)
+	expect(ide.master.status == 0x50 and ide.master.error == 0, "SRST left ATA master in error")
+	expect(ide.slave.status == 0x50 and ide.slave.error == 0, "SRST left ATAPI slave in error")
+	expect(ide.transfer == nil, "SRST left a transfer armed")
+	expect(not ide.irqPending, "SRST left IRQ pending")
+	expect(ide.selectedIndex == 1, "SRST changed the host's selected drive")
+	expect(band(ide.deviceControl, 0x02) ~= 0, "SRST cleared nIEN")
+	expect(ide:in8(0x1F2) == 0x01, "SRST did not reload sector count")
+	expect(ide:in8(0x1F4) == 0x14 and ide:in8(0x1F5) == 0xEB, "SRST did not reload ATAPI signature")
+	selectDrive(ide, false)
+	expect(ide:in8(0x1F4) == 0x00 and ide:in8(0x1F5) == 0x00, "SRST did not reload ATA signature")
+	-- The falling edge must not reset a drive that has a real error.
+	ide.master.error = 0x04
+	ide.master.status = 0x41
+	ide:out8(0x3F6, 0x02)
+	expect(ide.master.error == 0x04, "SRST falling edge reset the drive")
+end)
+
+T("ata_identify_recovers_after_atapi_probe", function(expect)
+	const ide = Ide.new({ hdd = makeHdd() })
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xA0)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "PACKET on ATA did not fail")
+	-- A normal ATA IDENTIFY must clear the stale ABRT and return data.
+	ide:out8(0x1F7, 0xEC)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY after PACKET probe did not assert DRQ")
+	expect(ide:in8(0x1F1) == 0x00, "IDENTIFY kept stale error")
+	const words = readWords(ide, 256)
+	expect(words[1] == 0x0040, string.format("IDENTIFY word0=%04X", words[1]))
 end)
 
 T("atapi_capacity_and_toc", function(expect)
@@ -1361,5 +1409,34 @@ if realIso then
 		expect(be32(toc, 16) == totalSectors, "real ISO leadout LBA=" .. be32(toc, 16))
 	end)
 end
+
+T("machine_int19_resets_ide_channels", function(expect)
+	const m = Machine.new({
+		Memory = Memory,
+		Cpu = Cpu,
+		Pic = Pic,
+		Cmos = Cmos,
+		Ide = Ide,
+	}, {
+		memorySize = 1024 * 1024,
+		hdd = buffer.create(32 * 1024 * 1024),
+	})
+	const ide = m.ide
+	ide.master.error = 0x04
+	ide.master.status = 0x41
+	ide.slave.error = 0x04
+	ide.slave.status = 0x41
+	const cpu = m.cpu
+	cpu:loadSeg("cs", 0x600)
+	cpu.ip = 0x100
+	cpu.halted = false
+	m.mem:write8(0x6100, 0xCD)
+	m.mem:write8(0x6101, 0x19)
+	m.mem:write8(0x6102, 0xF4)
+	m:run(8)
+	expect(ide.master.error == 0, ("master error=%02X"):format(ide.master.error))
+	expect(band(ide.master.status, 0x40) ~= 0, "master not ready after INT 19")
+	expect(ide.slave.status == 0, "absent slave should stay not-ready")
+end)
 
 return TESTS
