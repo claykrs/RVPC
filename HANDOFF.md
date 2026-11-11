@@ -96,11 +96,15 @@ that workload; the win shows once VMM runs - see `docs/WIN98.md`).
   Formatting drive C; the current blocker is the guest temp-directory/CAB
   copy.
 - **VGA cursor** (`7c1dff9`): CRTC cursor location/shape, blink phase and
-  attribute blink rendered in RGBA snapshots.
+  attribute blink rendered in RGBA snapshots; the Roblox presenter advances
+  the phase (`238794f`).
+- **RTC** (`41c1608`, `cd1b14a`): periodic/status C IRQ8 for INT 15h/AH=86h,
+  then full wall-clock/date/alarm registers with BCD/binary and 12/24-hour
+  modes, settable time and leap-year rollover.
 - **Tools** (`beac165`, `3b5dae9`): local IDE-only Win98 boot-image builder and
   a Roblox model build that tolerates a missing fixtures tree.
 
-**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1736 assertions.
+**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1791 assertions.
 
 ## Definition of done
 

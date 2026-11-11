@@ -68,8 +68,9 @@ its LiveCD `D:\>` prompt.
 M2 hardware is in place: PIIX3 PCI/IDE with BMIDE and a secondary channel,
 8237 DMA and SB16, VBE/DISPI SVGA plus a hardware-accurate mode 12h planar
 path with a text cursor/blink, NE2000 with DHCP/DNS/TCP/HTTP, PS/2 keyboard
-and mouse, x87 with context switching and `#MF`, and 512 MiB IDE validation.
-`lune run tools/check.lua` passes 1736 assertions.
+and mouse, x87 with context switching and `#MF`, a full MC146818 RTC
+clock/date/alarm model, and 512 MiB IDE validation.
+`lune run tools/check.lua` passes 1791 assertions.
 
 The Windows 98 SE path now runs real Setup: SeaBIOS boots the staged CD, the
 OTI-91X driver detects the ATAPI CD, the RTC periodic IRQ8 model unblocks the
