@@ -309,6 +309,35 @@ T("cmos_memory_and_shutdown", function(expect)
 	expect(cmos:in8(0x71) == 0x02, "status B")
 end)
 
+T("rtc_periodic_irq8_status_c", function(expect)
+	const m = freshMachine()
+	const io = m.cpu.io
+	-- SeaBIOS programs status A=0x26 (1024 Hz periodic) and then enables
+	-- PIE in status B when INT 15h/AH=86h arms a user timer.
+	io.out8(0x70, 0x0A)
+	io.out8(0x71, 0x26)
+	io.out8(0x70, 0x0B)
+	io.out8(0x71, 0x42) -- 24-hour + periodic interrupt enable
+	io.out8(0x70, 0x0B)
+	expect(io.in8(0x71) == 0x42, "status B readback")
+	io.out8(0x70, 0x0C)
+	expect(io.in8(0x71) == 0x00, "status C initially clear")
+	-- IF=0 so the IRQ stays pending in the PIC and is observable.
+	putCode(m, 0x1000, { 0x90, 0xEB, 0xFD }) -- NOP; JMP $
+	m.cpu.cs = 0
+	m.cpu.segBase.cs = 0
+	m.cpu.segSel.cs = 0
+	m.cpu.segLimit.cs = 0xFFFF
+	m.cpu.segFlags.cs = 0
+	m.cpu.ip = 0x1000
+	m.cpu.flags = 2
+	m:run(1300)
+	expect(band(m.pic.slave.irr, 1) ~= 0, "RTC periodic did not set slave IRQ0")
+	io.out8(0x70, 0x0C)
+	expect(band(io.in8(0x71), 0x40) ~= 0, "status C PF not set")
+	expect(io.in8(0x71) == 0x00, "status C did not clear on read")
+end)
+
 -- Hardware task switches: task A runs flat-32 at selector 8 with its TSS
 -- pre-loaded into TR (LTR ran earlier in a real guest). Task B's TSS holds a
 -- register image; the tests verify save/restore, back-link/NT nesting and the
