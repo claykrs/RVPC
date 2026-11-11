@@ -280,6 +280,20 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 			then
 				forceText = true
 				textTime = 0
+				-- FreeDOS floppy-edition install support: when the guest asks
+				-- for a package diskette, swap the image into drive A. The
+				-- boot factory exposes the embedded set as machine.floppyDisks.
+				local disks = machine.floppyDisks
+				if disks and machine.fdc then
+					local screen = machine:outputText()
+					local label = string.match(screen, "diskette %S+ %((.-)%) in A")
+					local image = label and disks[label]
+					local drive = machine.fdc.drives[1]
+					if image and drive and drive.image ~= image then
+						drive.image = image
+						drive.mediaChanged = true
+					end
+				end
 			end
 			if view then
 				const pollStart = os.clock()
