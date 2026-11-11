@@ -20,12 +20,6 @@ const CMOS_DATA = 0x71
 const PORT_A20 = 0x92
 const PCI_ADDRESS = 0xCF8
 const PCI_DATA = 0xCFC
--- The MC146818 periodic interrupt runs from the 32.768 kHz RTC divider. The
--- PIT input is 1.193182 MHz; one emulated guest step advances one PIT count.
-const PIT_INPUT_HZ = 1193182
-const RTC_INPUT_HZ = 32768
-const RTC_PIE = 0x40
-const RTC_PF = 0x40
 -- The ISP side must not share the guest NIC's default MAC (52:54:00:12:34:56).
 const DEFAULT_ISP_MAC = "52:54:00:12:34:57"
 
@@ -81,37 +75,6 @@ export type Config = {
 	audioSink: ((samples: buffer) -> ())?,
 }
 
-type RtcState = {
-	regA: number,
-	regB: number,
-	regC: number,
-	phase: number,
-	period: number,
-}
-
-local function rtcPeriod(regA: number): number
-	const rate = band(regA, 0x0F)
-	if rate == 0 then
-		return 0
-	end
-	const frequency = rshift(RTC_INPUT_HZ, rate - 1)
-	if frequency == 0 then
-		return 0
-	end
-	return math.max(1, math.floor(PIT_INPUT_HZ / frequency + 0.5))
-end
-
-local function newRtcState(): RtcState
-	const regA = 0x26
-	return {
-		regA = regA,
-		regB = 0x02,
-		regC = 0,
-		phase = 0,
-		period = rtcPeriod(regA),
-	}
-end
-
 export type Machine = typeof(setmetatable(
 	{} :: {
 		mem: any,
@@ -120,7 +83,7 @@ export type Machine = typeof(setmetatable(
 		pic: any?,
 		pit: any?,
 		cmos: any?,
-		rtcState: RtcState,
+		rtcState: any?,
 		fwcfg: any?,
 		ide: any?,
 		ide2: any?,
@@ -425,9 +388,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		if cfg.floppy1 and cfg.floppy1.image then
 			floppyType = bor(floppyType, 0x04) -- drive B: 1.44M
 		end
-		self.cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
+		const cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
+		self.cmos = cmos
+		self.rtcState = cmos.rtc
 	end
-	self.rtcState = newRtcState()
 	if deps.FwCfg then
 		self.fwcfg = deps.FwCfg.new(self.mem.size, cfg.vgaRom)
 	end
@@ -632,17 +596,6 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return self.cmos:in8(port)
 			end
 			if self.cmos and port == CMOS_DATA then
-				const index = self.cmos.index
-				const rtc = self.rtcState
-				if index == 0x0A then
-					return rtc.regA
-				elseif index == 0x0B then
-					return rtc.regB
-				elseif index == 0x0C then
-					const flags = rtc.regC
-					rtc.regC = 0
-					return flags
-				end
 				return self.cmos:in8(port)
 			end
 			if port == PORT_A20 then
@@ -835,25 +788,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return
 			end
 			if self.cmos and port == CMOS_DATA then
-				const index = self.cmos.index
-				self.cmos:out8(port, value)
-				const rtc = self.rtcState
-				if index == 0x0A then
-					rtc.regA = band(value, 0xFF)
-					rtc.period = rtcPeriod(rtc.regA)
-					if rtc.period == 0 then
-						rtc.phase = 0
-					end
-				elseif index == 0x0B then
-					const wasPie = band(rtc.regB, RTC_PIE) ~= 0
-					rtc.regB = band(value, 0xFF)
-					const pie = band(rtc.regB, RTC_PIE) ~= 0
-					if pie ~= wasPie then
-						rtc.phase = 0
-					end
-					if not pie then
-						rtc.phase = 0
-					end
+				if self.cmos:out8(port, value) and self.pic then
+					-- Enabling an interrupt whose status C flag is already set
+					-- raises IRQ8 immediately, as on the real RTC.
+					self.pic:raise(8)
 				end
 				return
 			end
@@ -1026,7 +964,6 @@ function Machine.reset(self: Machine)
 	end
 	self.sb16Clock = 0
 	self.ppi = 0
-	self.rtcState = newRtcState()
 	self.exitCode = nil
 end
 
@@ -1061,21 +998,18 @@ function Machine.run(self: Machine, maxSteps: number?): number
 	const ne2000 = self.ne2000
 	const sb16 = self.sb16
 	const fdc = self.fdc
-	const rtc = self.rtcState
+	const cmos = self.cmos
 	while steps < budget and not self.exitCode do
 		if pit then
 			if pit:advance(1) and pic then
 				pic:raise(0)
 			end
 		end
-		-- MC146818 periodic interrupt (IRQ8). SeaBIOS INT 15h/AH=86h arms
-		-- the RTC user timer and waits for this interrupt to tick down the
-		-- timeout; without it an ASPI AH=86 delay waits forever.
-		if rtc and pic and rtc.period > 0 and band(rtc.regB, RTC_PIE) ~= 0 then
-			rtc.phase += 1
-			if rtc.phase >= rtc.period then
-				rtc.phase -= rtc.period
-				rtc.regC = bor(rtc.regC, RTC_PF)
+		-- MC146818 clock and interrupt engine. The periodic tick is what
+		-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise IRQ8
+		-- through the same status C/IRQF path.
+		if cmos then
+			if cmos:advance(1) and pic then
 				pic:raise(8)
 			end
 		end
