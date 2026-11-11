@@ -31,21 +31,19 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current frontier
 
-1. **Win98 Setup disk configuration -> partition/format -> CAB copy.** The
-   IDE-only boot image (`tools/win98_ide_media.py` -> local
-   `media/win98se-ide.iso`) removes the unneeded AIC/BT/flashpt SCSI drivers.
-   With it, OTI reports one CD, MSCDEX assigns `D:`, FINDCD/OEMSETUP start,
-   and Setup reaches Welcome plus "Configure unallocated disk space" at 16M
-   steps. No protected-mode fault yet. Next: inject ENTER at the disk prompt,
-   answer the partition/format/large-disk questions, and drive the file copy.
-   The generated ISO and 512 MiB HDD stay gitignored.
-2. **Unpatched image: AIC ASPI `INT 15h/AH=86h` chain.** The stock boot image
-   loads the AIC/BT SCSI drivers; their 3-second `INT 15h/AH=86h` wait chains
-   `0248:0240 -> 0248:028E -> 0070:03F6 -> FFFF:01D0` and never returns.
-   IRQ0/BDA tick continue and IVT 08/1A are BIOS. Optional compatibility
-   fix for the stock image; the IDE-only path is the current install route.
-3. **ACPI HAL decision.** Win98 falls back to Standard PC (SMBIOS 2.4 + APM
-   1.2 present). Only add ACPI if SETUP later refuses without it.
+1. **Win98 Setup formatting -> CAB copy -> reboot.** The RTC periodic IRQ8
+   model (`41c1608`) fixed the stock image's ASPI `INT 15h/AH=86h` wait; both
+   `media/win98se.iso` and the IDE-only `media/win98se-ide.iso` now reach
+   Setup's **Formatting drive C** screen (~26-32M steps). The 512 MiB
+   `media/win98-hdd.img` already contains a bootable FAT16 partition starting
+   at LBA 63 and a zero-byte `WININST0.400` temp file; a backup exists at
+   `media/win98-hdd-backup.img`. Next: let the format finish, follow the CAB
+   copy/reboot, and capture the first protected-mode fault or product-key
+   prompt. Keep media gitignored and back up the HDD before destructive runs.
+2. **RTC wall-clock/date and ACPI.** The periodic interrupt/status C path is
+   in; update/alarm interrupts and wall-clock progression are not. Win98 uses
+   Standard PC (SMBIOS 2.4 + APM 1.2); add ACPI only if SETUP later refuses
+   without it.
 
 A paging TLB landed (commit `3957100`): epoch-flushed 1M-entry table with
 per-entry U/S + R/W recheck, CR3/INVLPG invalidation, and page-table write

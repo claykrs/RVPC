@@ -23,23 +23,13 @@ SeaBIOS boots the Win98 SE CD (El Torito, 1.44M floppy emulation) to the
 answered, the CD's DOS startup image loads and the OTI-91X ATAPI CD driver
 reports `Number of drives : 1`.
 
-The **unpatched** boot image then loads the AIC/BT SCSI ASPI managers; their
-`INT 15h/AH=86h` wait chains through the guest XMS/UMB code and never
-returns, so the machine stops after "PCI bus scan complete." The local
-IDE-only image `media/win98se-ide.iso` (built by
-`tools/win98_ide_media.py`, original ISO untouched) removes those unnecessary
-SCSI drivers. With it, MSCDEX assigns `D:`, FINDCD locates the CD, OEMSETUP
-starts, and Setup reaches **Welcome** and the **disk-configuration** screen:
-
-```text
-Setup needs to configure the unallocated space on your
-hard disk to prepare it for use with Windows.
-    Configure unallocated disk space (recommended).
-    Exit Setup.
-```
-
-No CPU fault or page fault has occurred through 22M steps. The next step is
-to answer/skip this prompt and drive partition/format/file-copy.
+The **stock** image now also works: the RTC periodic IRQ8 model (`41c1608`)
+lets SeaBIOS's `INT 15h/AH=86h` waits expire, so the AIC ASPI drivers finish
+and MSCDEX/OEMSETUP start. Both the stock ISO and the IDE-only
+`media/win98se-ide.iso` reach **Windows 98 Setup** and the **Formatting drive
+C** screen. The 512 MiB HDD currently has a bootable FAT16 partition at LBA
+63 and a zero-byte `WININST0.400`; a backup is kept separately. No CPU/page
+fault has occurred.
 
 Everything below it is green:
 
@@ -97,13 +87,14 @@ Windows media is **not** committed. Supply it locally:
   `1F5/1F4`; the aborted command now preserves the CD's `EB/14` signature, so
   the driver prints `Number of drives : 1`. The resident probe is at
   `028E:6C48`; the decisive check is the signature at `028E:7D5A-7D6D`.
-- **"PCI bus scan complete." then a halt at `F000:B757` (unpatched ISO):** the
-  AIC ASPI managers' `INT 15h/AH=86h` delay chains through the guest XMS/UMB
-  code and never returns. IRQ0 and the BDA tick continue, the IVT 08/1A
-  handlers are still BIOS, and Enter via KBC/BDA does not reach the menu
-  because the ASPI driver is still inside the wait. Use the IDE-only image
-  (`tools/win98_ide_media.py` -> `media/win98se-ide.iso`) to skip the
-  unnecessary SCSI drivers, or fix the guest `INT 15h/AH=86h` chain.
+- **"PCI bus scan complete." then a halt at `F000:B757`:** fixed in
+  `41c1608`. SeaBIOS's `INT 15h/AH=86h` uses the MC146818 periodic interrupt;
+  the CMOS now exposes status A/B/C, sets PF and raises IRQ8 while PIE is
+  enabled. The stock ISO proceeds to MSCDEX/Setup.
+- **Formatting drive C:** both the stock and IDE-only images reach Setup's
+  formatting screen. The 512 MiB HDD gets a FAT16 partition at LBA 63 and a
+  zero-byte `WININST0.400`; let the format finish and follow the CAB copy.
+  This is the current active path.
 - **IDE-only image reaches Setup:** MSCDEX prints `Drive D: = Driver OEMCD001
   unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome and "Configure
   unallocated disk space". Press ENTER and continue with partition/format.
@@ -138,10 +129,11 @@ Windows media is **not** committed. Supply it locally:
 
 ## Known blockers to clear
 
-- OTI-91X IDE detection is fixed (`ed95334`); the unpatched image's AIC ASPI
-  `INT 15h/AH=86h` chain still hangs, but the IDE-only image bypasses it.
-- The IDE-only image reaches Setup's disk-configuration prompt; partition,
-  format and CAB copy are the next interactive steps.
+- OTI-91X IDE detection is fixed (`ed95334`); the stock ASPI wait is fixed by
+  the RTC periodic IRQ8 model (`41c1608`), and both stock and IDE-only images
+  reach Setup formatting.
+- The 512 MiB HDD is partitioned/formatted; format completion and CAB copy
+  are the next steps.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
