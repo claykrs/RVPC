@@ -33,31 +33,17 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 The exact next three actions, in order:
 
-1. **Installer boot: OTI-91X ATAPI probe.** The Win98 CD startup menu and the
-   DOS-side startup menu both run. The Oak OTI-91X driver loads from the boot
-   floppy's `CONFIG.SYS` and prints its banner, then "No drives found".
-   New trace evidence (probe `tools/probe_oti_print.lua`):
-
-   - the DOS device-driver code is at segment `0B5B` (not `028E`);
-   - the driver's `lcall 0,0x6050` is relocated to a resident shim at
-     `028E:6050`, which jumps to the IDE probe at `028E:6C48`;
-   - the AH=0x23 probe returns AX=0x002D (failure). The probe reads the IDE
-     **error register** at the selected device and dispatches: 0x10 takes the
-     success path at `028E:6CE5` (CF=0), 0x00/0x04 take failure paths
-     `6D0C`/`6D23` (AH=4, CF=1);
-   - at the stall the slave CD has `error=00 status=50`, the master HDD has
-     `error=04 status=41`; the ATAPI signature read of `1F5/1F4` is
-     `EB/14` and DEVICE RESET returns `50`.
-   - the per-device port table lives at `028E:636C` (base/error/count/LBA/
-     drive-head/status/control), but the final dump shows it cleared to a
-     pattern after the failure.
-
-   Next: instrument `028E:6C48/6D26/6D34/6D92/6E8E/6EF4/6F05/6D0C/6CE5`
-   live, log AX/BX/CX/DX plus `1F1/1F4/1F5/1F7` at each branch, and identify the
-   exact check that rejects the slave CD. `tools/probe_win98_boot.lua` is the
-   baseline; `tools/probe_oti_print.lua` has the new ring/INT/segment logging.
-   The `/P:<port>,<irq>,<unit>` CONFIG.SYS switch is a possible media-side
-   workaround while the real cause is fixed.
+1. **Installer boot: post-ASPI / MSCDEX handoff.** The OTI-91X driver now
+   accepts the emulated ATAPI CD (`Number of drives : 1`, commit `ed95334`),
+   and the AIC ASPI managers complete their PCI scan after the PPI port-0x61
+   refresh bit was modeled (`e3bc272`). The machine then halts at
+   `F000:B757` (BIOS INT 16/HLT) with the screen ending at
+   "PCI bus scan complete."; MSCDEX/FINDCD/OEMSETUP have not produced output.
+   Injecting Enter through the KBC or the BDA does not advance the screen.
+   Next: identify which program is waiting (IVT 16/08/1A, BDA keyboard
+   head/tail, PIC IMR, PIT channel 0 mode/reload), and get MSCDEX + FINDCD +
+   `WIN98\OEMSETUP.EXE` running. An IDE-only `CONFIG.SYS` (drop the AIC/BT
+   drivers) is the parallel media-side test.
 2. **TSS/task gates and 80-bit x87.** Hardware task switching landed in
    `39b96de` (IDT task gates, far CALL/JMP to a TSS, IRET back-link). The
    double-fault task gate works; x87 is now full 80-bit (`9e81135`). Recheck

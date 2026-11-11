@@ -21,10 +21,11 @@
 SeaBIOS boots the Win98 SE CD (El Torito, 1.44M floppy emulation) to the
 "Microsoft Windows 98 CD-ROM Startup Menu". With `2` (Boot from CD-ROM)
 answered, the CD's DOS startup image loads: the Windows 98 Startup Menu
-appears with its 29 s countdown, the OTI-91X ATAPI CD driver and the AIC-6260
-ASPI manager load, and the config.sys boot loop restarts when the CD driver
-gives up. SETUP never starts yet; the exact blocker is the OTI-91X IDE probe
-at `028E:6C48`, described in HANDOFF.md "Current frontier".
+appears with its 29 s countdown, the OTI-91X ATAPI CD driver reports
+`Number of drives : 1`, and the AIC-6260 ASPI managers complete their PCI
+scan. SETUP still does not start: the machine halts at `F000:B757` after
+"PCI bus scan complete." before MSCDEX/FINDCD/OEMSETUP produce output. The
+exact handoff is the current blocker in HANDOFF.md "Current frontier".
 
 Everything below it is green:
 
@@ -77,16 +78,17 @@ Windows media is **not** committed. Supply it locally:
 - **Menu shows and counts down, then a `bad FF /7` fault:** the harness did
   not answer the menu; the countdown path executes into the AIC ASPI data blob
   loaded at `0000:7C00`. Fixed by the harness `Boot from CD-ROM` injection.
-- **"No drives found, aborting installation":** the OTI-91X driver rejected
-  the CD. This is the current blocker. Reproduce with
-  `lune run tools/probe_win98_boot.lua 12` (millions of steps), or use the
-  newer `tools/probe_oti_print.lua`, which logs the relocated `lcall 0,0x6050`
-  (resident shim `028E:6050` -> `028E:6C48`), the per-device port table at
-  `028E:636C`, and the probe's error-register dispatch. The OTI device code is
-  at segment `0B5B`; `028E:6C48` is the resident IDE probe. At the stall the
-  slave CD reports `error=0 status=0x50` and the ATAPI signature `EB/14`;
-  the probe takes its AH=4 failure path from `6D0C/6D23`. The success path is
-  `6CE5` (CF=0).
+- **"No drives found, aborting installation":** fixed in `ed95334`. The OTI
+  driver issues IDENTIFY DEVICE, then checks the ATAPI signature in
+  `1F5/1F4`; the aborted command now preserves the CD's `EB/14` signature, so
+  the driver prints `Number of drives : 1`. The resident probe is at
+  `028E:6C48`; the decisive check is the signature at `028E:7D5A-7D6D`.
+- **"PCI bus scan complete." then a halt at `F000:B757`:** the AIC ASPI
+  managers have finished; the next handoff (MSCDEX/FINDCD/OEMSETUP) is not
+  producing output. The CPU is in the BIOS INT 16/HLT wait; Enter via KBC and
+  BDA does not advance the screen. Inspect IVT 16/08/1A, BDA keyboard
+  head/tail, PIC IMR and PIT channel 0 mode/reload at the halt. An IDE-only
+  CONFIG.SYS is the parallel media-side test.
 - **Warm reset loop:** the startup menu reboots the machine after the CD
   driver fails; each cycle looks like the menu appearing again. This is
   guest-side control flow, not an emulator crash.
@@ -116,9 +118,8 @@ Windows media is **not** committed. Supply it locally:
 
 ## Known blockers to clear
 
-- OTI-91X IDE probe (see Triage guide): the INQUIRY path works, but the
-  resident probe at `028E:6C48` still takes its failure branch and the driver
-  prints "No drives found". Exact branch instrumentation is the next step.
+- OTI-91X IDE detection is fixed (`ed95334`); the next blocker is the
+  post-ASPI MSCDEX/FINDCD handoff (see Triage guide).
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
