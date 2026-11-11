@@ -1085,6 +1085,13 @@ local function command(self: Ide, cmd: number)
 		self.identifyCount += 1
 		if drive.kind ~= "hdd" then
 			failCommand(self, 0x04)
+			-- ATAPI devices keep the reset signature (0x14/0xEB in the
+			-- cylinder registers) after an aborted IDENTIFY DEVICE. DOS
+			-- ATAPI probes use ABRT + this signature pair to distinguish a
+			-- CD-ROM from an ATA disk.
+			if drive.kind == "cdrom" then
+				drive.sig = true
+			end
 			return
 		end
 		beginRead(self, identify(drive))

@@ -1248,6 +1248,35 @@ T("ata_read_rejects_cdrom", function(expect)
 	expect(buffer.readu8(iso, 0) == 0x46, "ATA READ mutated the CD image")
 end)
 
+T("ata_identify_device_on_atapi_preserves_signature", function(expect)
+	const ide = Ide.new({ cdrom = makeIso() })
+	selectDrive(ide, true)
+	-- Stale task-file values left by the preceding DEVICE RESET probe.
+	ide:out8(0x1F4, 0x24)
+	ide:out8(0x1F5, 0x00)
+	ide:out8(0x1F7, 0xEC) -- IDENTIFY DEVICE, must abort on the ATAPI device
+	const status = ide:in8(0x1F7)
+	expect(band(status, 0x01) ~= 0, "ATAPI IDENTIFY DEVICE did not set ERR")
+	expect(band(status, 0x40) ~= 0, "ATAPI IDENTIFY DEVICE did not stay DRDY")
+	expect(ide:in8(0x1F1) == 0x04, "ATAPI IDENTIFY DEVICE error is not ABRT")
+	expect(ide:in8(0x1F4) == 0x14, "1F4 did not return ATAPI signature low")
+	expect(ide:in8(0x1F5) == 0xEB, "1F5 did not return ATAPI signature high")
+	expect(ide.slave.sig, "ATAPI signature state was not preserved")
+	expect(ide:takeIrq(), "ATAPI IDENTIFY DEVICE IRQ")
+
+	-- A normal task-file write must clear the signature again.
+	ide:out8(0x1F5, 0x00)
+	expect(ide:in8(0x1F5) == 0x00, "task-file write did not clear the signature")
+
+	-- The next ATAPI command must still identify normally.
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA1)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY PACKET after probe did not assert DRQ")
+	const id = readWords(ide, 256)
+	expect(id[1] == 0x85C0, string.format("ATAPI IDENTIFY PACKET word0=%04X", id[1]))
+	expect(ide:takeIrq(), "ATAPI IDENTIFY PACKET IRQ")
+end)
+
 if realIso then
 	T("atapi_real_iso_eltorito", function(expect)
 		const totalSectors = math.floor(buffer.len(realIso) / 2048)
