@@ -31,23 +31,19 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current frontier
 
-The exact next three actions, in order:
-
-1. **Installer boot: post-ASPI / MSCDEX handoff.** The OTI-91X driver now
-   accepts the emulated ATAPI CD (`Number of drives : 1`, commit `ed95334`),
-   and the AIC ASPI managers complete their PCI scan after the PPI port-0x61
-   refresh bit was modeled (`e3bc272`). The machine then halts at
-   `F000:B757` (BIOS INT 16/HLT) with the screen ending at
-   "PCI bus scan complete."; MSCDEX/FINDCD/OEMSETUP have not produced output.
-   Injecting Enter through the KBC or the BDA does not advance the screen.
-   Next: identify which program is waiting (IVT 16/08/1A, BDA keyboard
-   head/tail, PIC IMR, PIT channel 0 mode/reload), and get MSCDEX + FINDCD +
-   `WIN98\OEMSETUP.EXE` running. An IDE-only `CONFIG.SYS` (drop the AIC/BT
-   drivers) is the parallel media-side test.
-2. **TSS/task gates and 80-bit x87.** Hardware task switching landed in
-   `39b96de` (IDT task gates, far CALL/JMP to a TSS, IRET back-link). The
-   double-fault task gate works; x87 is now full 80-bit (`9e81135`). Recheck
-   only if SETUP or VMM trips them.
+1. **Win98 Setup disk configuration -> partition/format -> CAB copy.** The
+   IDE-only boot image (`tools/win98_ide_media.py` -> local
+   `media/win98se-ide.iso`) removes the unneeded AIC/BT/flashpt SCSI drivers.
+   With it, OTI reports one CD, MSCDEX assigns `D:`, FINDCD/OEMSETUP start,
+   and Setup reaches Welcome plus "Configure unallocated disk space" at 16M
+   steps. No protected-mode fault yet. Next: inject ENTER at the disk prompt,
+   answer the partition/format/large-disk questions, and drive the file copy.
+   The generated ISO and 512 MiB HDD stay gitignored.
+2. **Unpatched image: AIC ASPI `INT 15h/AH=86h` chain.** The stock boot image
+   loads the AIC/BT SCSI drivers; their 3-second `INT 15h/AH=86h` wait chains
+   `0248:0240 -> 0248:028E -> 0070:03F6 -> FFFF:01D0` and never returns.
+   IRQ0/BDA tick continue and IVT 08/1A are BIOS. Optional compatibility
+   fix for the stock image; the IDE-only path is the current install route.
 3. **ACPI HAL decision.** Win98 falls back to Standard PC (SMBIOS 2.4 + APM
    1.2 present). Only add ACPI if SETUP later refuses without it.
 

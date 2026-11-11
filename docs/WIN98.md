@@ -20,12 +20,26 @@
 
 SeaBIOS boots the Win98 SE CD (El Torito, 1.44M floppy emulation) to the
 "Microsoft Windows 98 CD-ROM Startup Menu". With `2` (Boot from CD-ROM)
-answered, the CD's DOS startup image loads: the Windows 98 Startup Menu
-appears with its 29 s countdown, the OTI-91X ATAPI CD driver reports
-`Number of drives : 1`, and the AIC-6260 ASPI managers complete their PCI
-scan. SETUP still does not start: the machine halts at `F000:B757` after
-"PCI bus scan complete." before MSCDEX/FINDCD/OEMSETUP produce output. The
-exact handoff is the current blocker in HANDOFF.md "Current frontier".
+answered, the CD's DOS startup image loads and the OTI-91X ATAPI CD driver
+reports `Number of drives : 1`.
+
+The **unpatched** boot image then loads the AIC/BT SCSI ASPI managers; their
+`INT 15h/AH=86h` wait chains through the guest XMS/UMB code and never
+returns, so the machine stops after "PCI bus scan complete." The local
+IDE-only image `media/win98se-ide.iso` (built by
+`tools/win98_ide_media.py`, original ISO untouched) removes those unnecessary
+SCSI drivers. With it, MSCDEX assigns `D:`, FINDCD locates the CD, OEMSETUP
+starts, and Setup reaches **Welcome** and the **disk-configuration** screen:
+
+```text
+Setup needs to configure the unallocated space on your
+hard disk to prepare it for use with Windows.
+    Configure unallocated disk space (recommended).
+    Exit Setup.
+```
+
+No CPU fault or page fault has occurred through 22M steps. The next step is
+to answer/skip this prompt and drive partition/format/file-copy.
 
 Everything below it is green:
 
@@ -83,12 +97,17 @@ Windows media is **not** committed. Supply it locally:
   `1F5/1F4`; the aborted command now preserves the CD's `EB/14` signature, so
   the driver prints `Number of drives : 1`. The resident probe is at
   `028E:6C48`; the decisive check is the signature at `028E:7D5A-7D6D`.
-- **"PCI bus scan complete." then a halt at `F000:B757`:** the AIC ASPI
-  managers have finished; the next handoff (MSCDEX/FINDCD/OEMSETUP) is not
-  producing output. The CPU is in the BIOS INT 16/HLT wait; Enter via KBC and
-  BDA does not advance the screen. Inspect IVT 16/08/1A, BDA keyboard
-  head/tail, PIC IMR and PIT channel 0 mode/reload at the halt. An IDE-only
-  CONFIG.SYS is the parallel media-side test.
+- **"PCI bus scan complete." then a halt at `F000:B757` (unpatched ISO):** the
+  AIC ASPI managers' `INT 15h/AH=86h` delay chains through the guest XMS/UMB
+  code and never returns. IRQ0 and the BDA tick continue, the IVT 08/1A
+  handlers are still BIOS, and Enter via KBC/BDA does not reach the menu
+  because the ASPI driver is still inside the wait. Use the IDE-only image
+  (`tools/win98_ide_media.py` -> `media/win98se-ide.iso`) to skip the
+  unnecessary SCSI drivers, or fix the guest `INT 15h/AH=86h` chain.
+- **IDE-only image reaches Setup:** MSCDEX prints `Drive D: = Driver OEMCD001
+  unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome and "Configure
+  unallocated disk space". Press ENTER and continue with partition/format.
+  No protected-mode fault has been observed yet.
 - **Warm reset loop:** the startup menu reboots the machine after the CD
   driver fails; each cycle looks like the menu appearing again. This is
   guest-side control flow, not an emulator crash.
@@ -111,15 +130,18 @@ Windows media is **not** committed. Supply it locally:
 ## Install flow
 
 1. SeaBIOS boots the 98 SE CD; the Microsoft menu is answered with 2.
-2. Setup loads a RAM disk / real-mode drivers (OTI-91x CD, AIC ASPI).
+2. The IDE-only boot image loads HIMEM + OAKCDROM, MSCDEX assigns D:, and
+   OEMSETUP starts. (The stock image's AIC/BT ASPI drivers are skipped.)
 3. Partition and format the virtual HDD (FAT16/32).
 4. Copy CAB files, reboot into the GUI setup.
 5. First boot to the desktop; install VGA/mouse/sound/network drivers.
 
 ## Known blockers to clear
 
-- OTI-91X IDE detection is fixed (`ed95334`); the next blocker is the
-  post-ASPI MSCDEX/FINDCD handoff (see Triage guide).
+- OTI-91X IDE detection is fixed (`ed95334`); the unpatched image's AIC ASPI
+  `INT 15h/AH=86h` chain still hangs, but the IDE-only image bypasses it.
+- The IDE-only image reaches Setup's disk-configuration prompt; partition,
+  format and CAB copy are the next interactive steps.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
