@@ -31,19 +31,24 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current frontier
 
-1. **Win98 Setup formatting -> CAB copy -> reboot.** The RTC periodic IRQ8
-   model (`41c1608`) fixed the stock image's ASPI `INT 15h/AH=86h` wait; both
-   `media/win98se.iso` and the IDE-only `media/win98se-ide.iso` now reach
-   Setup's **Formatting drive C** screen (~26-32M steps). The 512 MiB
-   `media/win98-hdd.img` already contains a bootable FAT16 partition starting
-   at LBA 63 and a zero-byte `WININST0.400` temp file; a backup exists at
-   `media/win98-hdd-backup.img`. Next: let the format finish, follow the CAB
-   copy/reboot, and capture the first protected-mode fault or product-key
-   prompt. Keep media gitignored and back up the HDD before destructive runs.
-2. **RTC wall-clock/date and ACPI.** The periodic interrupt/status C path is
-   in; update/alarm interrupts and wall-clock progression are not. Win98 uses
-   Standard PC (SMBIOS 2.4 + APM 1.2); add ACPI only if SETUP later refuses
-   without it.
+1. **Win98 Setup CAB copy.** Formatting completes. The temp-directory and
+   FAT16 path succeed: Setup creates `C:\WININST0.400\COMM.DRV`, writes and
+   closes it, then the guest CAB decompressor/overlay fails at `FF39:4358`
+   immediately after the close and prints "Setup is unable to write to the
+   temporary directory". IDE/PIO (0 word mismatches), INT 13, ATAPI, FAT16 and
+   HIMEM/UMB are ruled out; the temp directory had only ~11 entries and the
+   FAT had ~65k free clusters. The overlay at `FF39:5A54` is no longer
+   resident when the handler runs. Next: trace the CAB decompressor/overlay
+   code and CPU state before `FF39:4358`; use a separate HDD copy or a
+   pre-cleanup checkpoint. Keep media gitignored.
+2. **Cold-boot HDD after partition restart.** On a blank HDD, after the
+   partition/restart prompt, the OAKCDROM ATAPI probe leaves the ATA master at
+   `status=0x41 error=0x04`; SeaBIOS `INT 13 AH=08 DL=80` returns
+   `AH=01/CF=1`, and Setup reports "Your computer does not have a hard disk."
+   Fix the IDE reset/error/status semantics so the HDD is visible to BIOS
+   after the ATAPI probe. This is separate from the CAB-overlay failure.
+3. **ACPI HAL decision.** Win98 falls back to Standard PC (SMBIOS 2.4 + APM
+   1.2 present). Only add ACPI if SETUP later refuses without it.
 
 A paging TLB landed (commit `3957100`): epoch-flushed 1M-entry table with
 per-entry U/S + R/W recheck, CR3/INVLPG invalidation, and page-table write

@@ -26,10 +26,14 @@ reports `Number of drives : 1`.
 The **stock** image now also works: the RTC periodic IRQ8 model (`41c1608`)
 lets SeaBIOS's `INT 15h/AH=86h` waits expire, so the AIC ASPI drivers finish
 and MSCDEX/OEMSETUP start. Both the stock ISO and the IDE-only
-`media/win98se-ide.iso` reach **Windows 98 Setup** and the **Formatting drive
-C** screen. The 512 MiB HDD currently has a bootable FAT16 partition at LBA
-63 and a zero-byte `WININST0.400`; a backup is kept separately. No CPU/page
-fault has occurred.
+`media/win98se-ide.iso` reach **Windows 98 Setup**, complete formatting, and
+start the CAB copy. The copy creates and writes
+`C:\WININST0.400\COMM.DRV`, closes it successfully, then the guest CAB
+decompressor/overlay fails at `FF39:4358` and Setup prints "Setup is unable to
+write to the temporary directory". IDE/PIO, INT 13, ATAPI, FAT16 and
+HIMEM/UMB are ruled out. A separate cold-boot issue remains: on a blank HDD,
+after the partition restart, OAKCDROM's probe leaves the ATA master in ERR and
+SeaBIOS INT 13 AH=08 cannot see the disk.
 
 Everything below it is green:
 
@@ -91,13 +95,15 @@ Windows media is **not** committed. Supply it locally:
   `41c1608`. SeaBIOS's `INT 15h/AH=86h` uses the MC146818 periodic interrupt;
   the CMOS now exposes status A/B/C, sets PF and raises IRQ8 while PIE is
   enabled. The stock ISO proceeds to MSCDEX/Setup.
-- **Formatting drive C:** both the stock and IDE-only images reach Setup's
-  formatting screen. The 512 MiB HDD gets a FAT16 partition at LBA 63 and a
-  zero-byte `WININST0.400`; let the format finish and follow the CAB copy.
-  This is the current active path.
+- **Formatting/CAB copy:** formatting completes and the CAB copy writes files
+  through `COMM.DRV`; the next step fails inside the guest CAB
+  decompressor/overlay at `FF39:4358`, not in IDE/FAT16/HIMEM. This is the
+  active Setup blocker.
+- **Cold boot after partition restart:** OAKCDROM leaves the ATA master in
+  ERR (`status=0x41 error=0x04`) and SeaBIOS INT 13 AH=08 returns AH=01, so
+  Setup says no hard disk. Fix IDE reset/error/status semantics separately.
 - **IDE-only image reaches Setup:** MSCDEX prints `Drive D: = Driver OEMCD001
-  unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome and "Configure
-  unallocated disk space". Press ENTER and continue with partition/format.
+  unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome/disk configuration.
   No protected-mode fault has been observed yet.
 - **Warm reset loop:** the startup menu reboots the machine after the CD
   driver fails; each cycle looks like the menu appearing again. This is
@@ -132,8 +138,10 @@ Windows media is **not** committed. Supply it locally:
 - OTI-91X IDE detection is fixed (`ed95334`); the stock ASPI wait is fixed by
   the RTC periodic IRQ8 model (`41c1608`), and both stock and IDE-only images
   reach Setup formatting.
-- The 512 MiB HDD is partitioned/formatted; format completion and CAB copy
-  are the next steps.
+- The 512 MiB HDD is partitioned/formatted; the CAB copy reaches `COMM.DRV`
+  and then fails in the guest decompressor/overlay.
+- The cold-boot HDD/INT 13 AH=08 path needs fixing before a post-partition
+  reboot can see the disk.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
