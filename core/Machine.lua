@@ -114,6 +114,7 @@ export type Machine = typeof(setmetatable(
 		elcrMaster: number,
 		elcrSlave: number,
 		sb16Clock: number,
+		ppi: number,
 		lastInPort: number,
 		lastOutPort: number,
 		lastOutValue: number,
@@ -497,6 +498,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.elcrMaster = 0
 	self.elcrSlave = 0
 	self.sb16Clock = 0
+	self.ppi = 0
 	self.hostConfig = {}
 	self.lastInPort = 0
 	self.lastOutPort = 0
@@ -592,6 +594,17 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			end
 			if port == PORT_A20 then
 				return if self.mem.a20 then 0x02 else 0x00
+			end
+			if port == 0x61 then
+				-- PPI port B: bits 0/1 are the speaker gate/data latch; bit 4
+				-- is the refresh toggle and bit 5 the timer-2 output. The AIC
+				-- ASPI delay loop only needs bit 4 to keep changing.
+				local tsc = self.cpu and self.cpu.tsc or 0
+				return bor(
+					band(self.ppi, 0x03),
+					if band(rshift(tsc, 4), 1) ~= 0 then 0x10 else 0,
+					if band(rshift(tsc, 5), 1) ~= 0 then 0x20 else 0
+				)
 			end
 			if port >= PCI_ADDRESS and port <= PCI_ADDRESS + 3 then
 				return pciAddressByte(port - PCI_ADDRESS)
@@ -774,6 +787,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				end
 				return
 			end
+			if port == 0x61 then
+				self.ppi = band(value, 0x03)
+				return
+			end
 			if port >= PCI_ADDRESS and port <= PCI_ADDRESS + 3 then
 				return
 			end
@@ -931,6 +948,7 @@ function Machine.reset(self: Machine)
 		self.sb16:resetDsp()
 	end
 	self.sb16Clock = 0
+	self.ppi = 0
 	self.exitCode = nil
 end
 

@@ -127,4 +127,16 @@ T("isa_ide_and_status", function(expect)
 	expect(read32(m, 1, 1, 0x20) == 0x0000C001, "IDE BAR4 default")
 end)
 
+T("ppi_refresh_and_speaker_latch", function(expect)
+	const m = fresh()
+	m.cpu.tsc = 0
+	const low = m.cpu.io.in8(0x61)
+	m.cpu.tsc = 16
+	const high = m.cpu.io.in8(0x61)
+	expect(band(low, 0x10) ~= band(high, 0x10), "refresh bit did not toggle")
+	m.cpu.io.out8(0x61, 0x03)
+	const latched = m.cpu.io.in8(0x61)
+	expect(band(latched, 0x03) == 0x03, "speaker latch not readable")
+end)
+
 return TESTS
