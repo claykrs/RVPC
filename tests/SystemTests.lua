@@ -407,4 +407,30 @@ T("task_switch_far_jmp", function(expect)
 	expect(m.mem:read8(0x3028 + 5) == 0x89, "A unbusies on a JMP switch")
 end)
 
+T("ppi_timer2_output_drives_bit5", function(expect)
+	const m = freshMachine()
+	const pit = m.pit
+	pit:out8(0x43, 0xB0) -- channel 2, LSB/MSB, mode 0, binary
+	pit:out8(0x42, 0x00)
+	pit:out8(0x42, 0x08) -- divisor 0x0800
+	expect(band(m.cpu.io.in8(0x61), 0x20) == 0, "PPI bit5 high before terminal count")
+	pit:advance(0x7FF)
+	expect(band(m.cpu.io.in8(0x61), 0x20) == 0, "PPI bit5 high one count early")
+	pit:advance(1)
+	expect(band(m.cpu.io.in8(0x61), 0x20) ~= 0, "PPI bit5 did not follow PIT2 terminal count")
+	pit:advance(0x800)
+	expect(band(m.cpu.io.in8(0x61), 0x20) ~= 0, "mode 0 output did not stay high")
+end)
+
+T("halted_cpu_advances_tsc", function(expect)
+	const m = freshMachine()
+	m.cpu.flags = 2 -- IF=0: no interrupt delivery while we measure idle time
+	m.cpu.halted = true
+	const before = m.cpu.tsc
+	const steps = m:run(100_000)
+	expect(steps == 100_000, string.format("steps=%d", steps))
+	expect(m.cpu.tsc - before >= 100_000, string.format("tsc=%d before=%d", m.cpu.tsc, before))
+	expect(m.cpu.halted, "idle CPU unexpectedly woke without an interrupt")
+end)
+
 return TESTS

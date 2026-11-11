@@ -598,12 +598,13 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if port == 0x61 then
 				-- PPI port B: bits 0/1 are the speaker gate/data latch; bit 4
 				-- is the refresh toggle and bit 5 the timer-2 output. The AIC
-				-- ASPI delay loop only needs bit 4 to keep changing.
+				-- ASPI delay loop only needs bit 4 to keep changing; the BIOS
+				-- TSC calibration waits on bit 5, so it must follow PIT 2.
 				local tsc = self.cpu and self.cpu.tsc or 0
 				return bor(
 					band(self.ppi, 0x03),
 					if band(rshift(tsc, 4), 1) ~= 0 then 0x10 else 0,
-					if band(rshift(tsc, 5), 1) ~= 0 then 0x20 else 0
+					if self.pit and self.pit.channels[3].output then 0x20 else 0
 				)
 			end
 			if port >= PCI_ADDRESS and port <= PCI_ADDRESS + 3 then
@@ -1023,6 +1024,13 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			end
 		end
 		if cpu.halted then
+			-- The TSC is a free-running counter. BIOS timer waits (notably
+			-- INT 15h/AH=86h) use it to measure elapsed time; if it only
+			-- advanced on retired instructions, a halted CPU would make those
+			-- waits effectively infinite.
+			if cpu.tsc then
+				cpu.tsc += 1
+			end
 			if not self:deliverInterrupt() then
 				idle += 1
 				-- A halted CPU waits for the next timer tick; give a full 8254
