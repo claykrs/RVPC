@@ -88,8 +88,19 @@ that workload; the win shows once VMM runs - see `docs/WIN98.md`).
   registers, cleared by task-file writes and commands); packet-phase interrupt
   reason (CoD/I/O) in the sector-count register and burst byte count in the
   cylinder registers. This is what gets the OTI-91x probe as far as INQUIRY.
+- **Win98 Setup**: `ed95334` preserves the ATAPI signature after an aborted
+  IDENTIFY DEVICE, so the OTI-91X driver reports `Number of drives : 1`;
+  `e3bc272` models the PPI refresh bit so the AIC ASPI delay loop completes;
+  `41c1608` models the MC146818 periodic IRQ8/status C so the stock image's
+  INT 15h/AH=86h waits expire. Both stock and IDE-only images reach Setup's
+  Formatting drive C; the current blocker is the guest temp-directory/CAB
+  copy.
+- **VGA cursor** (`7c1dff9`): CRTC cursor location/shape, blink phase and
+  attribute blink rendered in RGBA snapshots.
+- **Tools** (`beac165`, `3b5dae9`): local IDE-only Win98 boot-image builder and
+  a Roblox model build that tolerates a missing fixtures tree.
 
-**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1644 assertions.
+**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1736 assertions.
 
 ## Definition of done
 

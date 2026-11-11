@@ -67,14 +67,21 @@ its LiveCD `D:\>` prompt.
 
 M2 hardware is in place: PIIX3 PCI/IDE with BMIDE and a secondary channel,
 8237 DMA and SB16, VBE/DISPI SVGA plus a hardware-accurate mode 12h planar
-path, NE2000 with DHCP/DNS/TCP/HTTP, PS/2 keyboard and mouse, x87 with context
-switching and `#MF`, and 512 MiB IDE validation. `lune run tools/check.lua`
-passes 1618 assertions, and the 24M-step FreeDOS boot now takes about 33 s.
-Windows 98 SE media is not included; stage `media/win98se.iso` and a 512 MiB
-`media/win98-hdd.img` locally, then run `lune run tools/harness.lua 300`.
+path with a text cursor/blink, NE2000 with DHCP/DNS/TCP/HTTP, PS/2 keyboard
+and mouse, x87 with context switching and `#MF`, and 512 MiB IDE validation.
+`lune run tools/check.lua` passes 1736 assertions.
+
+The Windows 98 SE path now runs real Setup: SeaBIOS boots the staged CD, the
+OTI-91X driver detects the ATAPI CD, the RTC periodic IRQ8 model unblocks the
+ASPI waits, and Setup reaches **Formatting drive C**. The remaining install
+blocker is the guest temp-directory/CAB copy. The stock `media/win98se.iso`
+works; `tools/win98_ide_media.py` builds a local IDE-only
+`media/win98se-ide.iso` that skips the unnecessary SCSI drivers. Media is
+never committed. See `docs/WIN98.md` for the current run and next steps.
 
 The Roblox client shell, EditableImage VGA presenter and set-1 keyboard/mouse
-input bridge are in the tree. See `HANDOFF.md`, `docs/M1-REPORT.md`,
+input bridge are in the tree; `lune run tools/build_rbxmx.lua` writes the
+importable `Rvpc.rbxmx`. See `HANDOFF.md`, `docs/M1-REPORT.md`,
 `docs/M2-REPORT.md`, `docs/ARCHITECTURE.md` and `docs/WIN98.md`.
 
 ## License

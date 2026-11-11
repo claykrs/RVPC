@@ -237,6 +237,11 @@ function VgaView.new(vga: any, parent: Instance, options: Options?): VgaView
 			end
 			return
 		end
+		-- Advance the text cursor/attribute blink once per presented frame.
+		-- Snapshots themselves stay phase-stable; the presenter owns the clock.
+		if self.Sink.vga.tickBlink then
+			pcall(self.Sink.vga.tickBlink, self.Sink.vga)
+		end
 		if vga:isTextMode() then
 			-- Text writes are invisible to dirty tracking, so a plain force
 			-- would repaint the whole 1 MiB frame at a fixed rate whether or
