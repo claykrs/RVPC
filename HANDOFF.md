@@ -31,16 +31,16 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current frontier
 
-1. **Win98 Setup CAB copy.** Formatting completes. The temp-directory and
-   FAT16 path succeed: Setup creates `C:\WININST0.400\COMM.DRV`, writes and
-   closes it, then the guest CAB decompressor/overlay fails at `FF39:4358`
-   immediately after the close and prints "Setup is unable to write to the
-   temporary directory". IDE/PIO (0 word mismatches), INT 13, ATAPI, FAT16 and
-   HIMEM/UMB are ruled out; the temp directory had only ~11 entries and the
-   FAT had ~65k free clusters. The overlay at `FF39:5A54` is no longer
-   resident when the handler runs. Next: trace the CAB decompressor/overlay
-   code and CPU state before `FF39:4358`; use a separate HDD copy or a
-   pre-cleanup checkpoint. Keep media gitignored.
+1. **Win98 Setup CAB/file write.** Formatting completes and the temp
+   directory/FAT16/IDE/PIO/INT 13/ATAPI/HIMEM paths are healthy. The `FF39`
+   segment is resident IO.SYS, not a freed overlay; no CPU fault or
+   self-modifying-code issue was found. The last DOS closes succeed. At the
+   failure screen `GDI.EXE` is zero-length, and the DOS kernel completion path
+   shows `AX=0x071C` (1820) for the 9280-byte write request. Next: trace the
+   exact `COMM.DRV`/`GDI.EXE` `INT 21 AH=40` requested-vs-returned counts and
+   the corresponding ATA sector writes; determine whether DOS/IDE returns a
+   short count or the guest CAB decompressor mishandles a partial write.
+   Keep media gitignored and use a separate HDD copy.
 2. **Cold boot fixed (`c5be06b`).** `Ide.softReset`/SRST clears the stale
    OAKCDROM probe ERR and reloads both signatures; `Machine` resets the IDE
    channels on an INT 19 boot attempt or a return to `F000:FFF0`. A fresh

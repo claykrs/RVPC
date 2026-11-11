@@ -29,11 +29,11 @@ and MSCDEX/OEMSETUP start. Both the stock ISO and the IDE-only
 `media/win98se-ide.iso` reach **Windows 98 Setup**, complete formatting, and
 start the CAB copy. The copy creates and writes
 `C:\WININST0.400\COMM.DRV`, closes it successfully, then the guest CAB
-decompressor/overlay fails at `FF39:4358` and Setup prints "Setup is unable to
-write to the temporary directory". IDE/PIO, INT 13, ATAPI, FAT16 and
-HIMEM/UMB are ruled out. The cold-boot HDD path is fixed (`c5be06b`): after
-the partition restart, SeaBIOS reports one hard disk and Setup reaches
-Welcome/disk configuration on a blank HDD.
+decompressor/file-write completion fails and Setup prints "Setup is unable to
+write to the temporary directory". `FF39` is resident IO.SYS, not an overlay;
+no CPU fault is present. At failure `GDI.EXE` is zero-length, and the DOS
+completion path shows `AX=0x071C` (1820) for a 9280-byte write request.
+IDE/PIO, INT 13, ATAPI, FAT16 and HIMEM/UMB are otherwise healthy.
 
 Everything below it is green:
 
@@ -96,8 +96,9 @@ Windows media is **not** committed. Supply it locally:
   the CMOS now exposes status A/B/C, sets PF and raises IRQ8 while PIE is
   enabled. The stock ISO proceeds to MSCDEX/Setup.
 - **Formatting/CAB copy:** formatting completes and the CAB copy writes files
-  through `COMM.DRV`; the next step fails inside the guest CAB
-  decompressor/overlay at `FF39:4358`, not in IDE/FAT16/HIMEM. This is the
+  through `COMM.DRV`; the next step fails in the guest CAB/file-write
+  completion path, leaving `GDI.EXE` zero-length and a short `AH=40`
+  completion count. `FF39` is resident IO.SYS, not an overlay. This is the
   active Setup blocker.
 - **Cold boot after partition restart:** fixed in `c5be06b`. `Ide.softReset`/
   SRST clears the stale OAKCDROM probe ERR and reloads signatures; Machine
@@ -140,7 +141,7 @@ Windows media is **not** committed. Supply it locally:
   the RTC periodic IRQ8 model (`41c1608`), and both stock and IDE-only images
   reach Setup formatting.
 - The 512 MiB HDD is partitioned/formatted; the CAB copy reaches `COMM.DRV`
-  and then fails in the guest decompressor/overlay.
+  and then fails in the guest CAB/file-write completion path.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
