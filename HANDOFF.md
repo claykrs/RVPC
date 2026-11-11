@@ -41,12 +41,11 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
    resident when the handler runs. Next: trace the CAB decompressor/overlay
    code and CPU state before `FF39:4358`; use a separate HDD copy or a
    pre-cleanup checkpoint. Keep media gitignored.
-2. **Cold-boot HDD after partition restart.** On a blank HDD, after the
-   partition/restart prompt, the OAKCDROM ATAPI probe leaves the ATA master at
-   `status=0x41 error=0x04`; SeaBIOS `INT 13 AH=08 DL=80` returns
-   `AH=01/CF=1`, and Setup reports "Your computer does not have a hard disk."
-   Fix the IDE reset/error/status semantics so the HDD is visible to BIOS
-   after the ATAPI probe. This is separate from the CAB-overlay failure.
+2. **Cold boot fixed (`c5be06b`).** `Ide.softReset`/SRST clears the stale
+   OAKCDROM probe ERR and reloads both signatures; `Machine` resets the IDE
+   channels on an INT 19 boot attempt or a return to `F000:FFF0`. A fresh
+   blank HDD now reports `BDA 0x475=1` and reaches Setup Welcome/disk
+   configuration. No further action unless a later reboot path bypasses both.
 3. **ACPI HAL decision.** Win98 falls back to Standard PC (SMBIOS 2.4 + APM
    1.2 present). Only add ACPI if SETUP later refuses without it.
 
@@ -106,10 +105,13 @@ that workload; the win shows once VMM runs - see `docs/WIN98.md`).
 - **RTC** (`41c1608`, `cd1b14a`): periodic/status C IRQ8 for INT 15h/AH=86h,
   then full wall-clock/date/alarm registers with BCD/binary and 12/24-hour
   modes, settable time and leap-year rollover.
+- **IDE warm boot** (`c5be06b`): SRST/softReset clears stale ATAPI-probe
+  errors and Machine resets the IDE channels on INT 19/reset-vector entry;
+  a blank HDD now reports one disk to SeaBIOS after the partition restart.
 - **Tools** (`beac165`, `3b5dae9`): local IDE-only Win98 boot-image builder and
   a Roblox model build that tolerates a missing fixtures tree.
 
-**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1791 assertions.
+**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1812 assertions.
 
 ## Definition of done
 

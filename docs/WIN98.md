@@ -31,9 +31,9 @@ start the CAB copy. The copy creates and writes
 `C:\WININST0.400\COMM.DRV`, closes it successfully, then the guest CAB
 decompressor/overlay fails at `FF39:4358` and Setup prints "Setup is unable to
 write to the temporary directory". IDE/PIO, INT 13, ATAPI, FAT16 and
-HIMEM/UMB are ruled out. A separate cold-boot issue remains: on a blank HDD,
-after the partition restart, OAKCDROM's probe leaves the ATA master in ERR and
-SeaBIOS INT 13 AH=08 cannot see the disk.
+HIMEM/UMB are ruled out. The cold-boot HDD path is fixed (`c5be06b`): after
+the partition restart, SeaBIOS reports one hard disk and Setup reaches
+Welcome/disk configuration on a blank HDD.
 
 Everything below it is green:
 
@@ -99,9 +99,10 @@ Windows media is **not** committed. Supply it locally:
   through `COMM.DRV`; the next step fails inside the guest CAB
   decompressor/overlay at `FF39:4358`, not in IDE/FAT16/HIMEM. This is the
   active Setup blocker.
-- **Cold boot after partition restart:** OAKCDROM leaves the ATA master in
-  ERR (`status=0x41 error=0x04`) and SeaBIOS INT 13 AH=08 returns AH=01, so
-  Setup says no hard disk. Fix IDE reset/error/status semantics separately.
+- **Cold boot after partition restart:** fixed in `c5be06b`. `Ide.softReset`/
+  SRST clears the stale OAKCDROM probe ERR and reloads signatures; Machine
+  resets both IDE channels on an INT 19 attempt or a return to `F000:FFF0`.
+  A fresh blank HDD now reports `BDA 0x475=1` and reaches Setup Welcome.
 - **IDE-only image reaches Setup:** MSCDEX prints `Drive D: = Driver OEMCD001
   unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome/disk configuration.
   No protected-mode fault has been observed yet.
@@ -140,8 +141,6 @@ Windows media is **not** committed. Supply it locally:
   reach Setup formatting.
 - The 512 MiB HDD is partitioned/formatted; the CAB copy reaches `COMM.DRV`
   and then fails in the guest decompressor/overlay.
-- The cold-boot HDD/INT 13 AH=08 path needs fixing before a post-partition
-  reboot can see the disk.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
