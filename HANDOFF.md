@@ -2,6 +2,32 @@
 
 Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
+## Pre-installed FreeDOS image (M2.5) — current frontier
+
+A headless driver (`tools/_hinstall.lua`) drives the whole FreeDOS install in
+the Lune harness: the settle-repress key pattern (keys pressed right after a
+prompt paints are eaten by the installer's keyboard purge — press, settle
+~12M steps, re-press) walks language → FDI → proceed/format prompts →
+partition Success → reboot → format → sys-transfer. Dumping C: at
+"Set active boot partition" (media/fd13-c.img, 1 MiB payload, 64K-alignable)
+yields an image whose MBR→VBS→kernel chain boots: the FreeDOS 2043 kernel
+banner prints from the dumped disk.
+
+Current hang: after the banner the kernel reads CONFIG.SYS through its own
+disk code, loads COMMAND.COM to segment 0FF7, then executes `0F 10` (SSE
+MOVUPS, unimplemented) at 0FF7:F7AF. DOS-era binaries do not emit SSE, so
+this is most likely a decoder desync (an earlier instruction decoded with the
+wrong length steers execution into data) or a missing two-byte opcode. The
+core has only 43 H0F handlers — expanding two-byte-opcode coverage and
+validating 32-bit decoder lengths is the next workstream (same class as the
+Win98 GUI needs). CONFIG.SYS/AUTOEXEC.BAT are pre-written into the test image
+(media/_test_hdd.img) to isolate this from the missing config phase.
+
+Also landed this round: the OTI "No drives found" root cause (ab997de) —
+empty IDE device positions now float the ISA bus (0xFF reads, lost writes,
+no phantom ATAPI signatures), matching real hardware; Win98 SETUP passes CD
+detection and reaches the CAB-copy blocker.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
