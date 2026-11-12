@@ -127,6 +127,9 @@ return function(Rvpc, RvpcUi)
 		-- Blank 32 MiB primary-master disk so the FreeDOS installer can
 		-- partition; generated at boot, nothing embedded.
 		hdd = buffer.create(32 * 1024 * 1024),
+		-- drive A must exist in CMOS from boot or INT 13h reads on it fail;
+		-- load the first package diskette, the shell swaps later ones
+		floppy = { image = floppyDisks.x86DSK01 },
 	})
 	-- no floppy at boot (the CD boot must win); the shell swaps these into
 	-- drive A when the guest asks for a package diskette
@@ -193,8 +196,8 @@ def main():
 	for start in range(0, len(floppy_chunks), per):
 		group = floppy_chunks[start:start + per]
 		code = PRELUDE + "\n" + 'local fix = upsert(RS, "RvpcFixtures", "Folder")\n'
-		for name, _mod, chunk in group:
-			module_name = f"BootFloppy{name}{j:02d}"
+		for name, mod_name, chunk in group:
+			module_name = f"BootFloppy{mod_name}"
 			code += "local m = upsert(fix, " + json.dumps(module_name) + ", " + '"ModuleScript"' + ")\n"
 			code += "m.Source = RET .. Q .. " + json.dumps(chunk) + " .. Q\n"
 		code += f'return "floppy {start}..{start + len(group)} ok"'
