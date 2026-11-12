@@ -1,91 +1,106 @@
-# RVPC - a real PC in Roblox, targeting Windows 98 SE
+# RVPC
 
-RVPC is a from-scratch successor to the original Windows 3.0 emulator. It is a **full-system x86 PC
-emulator** written in Luau, intended to run inside Roblox on the client.
+[![CI](https://github.com/claykrs/RVPC/actions/workflows/ci.yml/badge.svg)](https://github.com/claykrs/RVPC/actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Language](https://img.shields.io/badge/language-Luau-orange)
+![Code style](https://img.shields.io/badge/style-StyLua-purple)
 
-**RVPC/98** is the Windows 98 SE machine profile. The product is a virtual PC,
-not a DOS compatibility layer.
+**A 486-class PC emulator written in Luau, running inside Roblox Studio — targeting Windows 98 SE.**
 
-The target is a **486/Pentium-class PC** with:
+RVPC is a full-system emulator, not a DOS compatibility layer: a real
+[SeaBIOS](https://www.seabios.org/) firmware image boots on a cycle-driven
+486 core with IDE/ATAPI storage, VGA graphics, a PIC/PIT/CMOS chipset, PS/2
+input and an 80-bit x87 FPU. Today it installs **FreeDOS 1.3** from CD onto a
+persistent virtual hard disk. The target is a **Windows 98 SE** install and
+desktop.
 
-- 386/486 real, protected and V86 modes, paging, TSS
-- 32–64 MB RAM
-- SeaBIOS firmware
-- IDE/ATAPI CD-ROM and hard disk
-- VGA/SVGA, PS/2 keyboard and mouse
-- Sound Blaster, serial, parallel
-- NE2000 Ethernet with a host-side virtual ISP
-
-That machine is meant to **boot and install Windows 98 SE from a CD onto a
-virtual hard disk**, then run the desktop, applications and a real TCP/IP
-stack. Windows is a guest OS, not a reimplementation.
-
-The emulator is environment-pure in `core/`: no `require`, `game`, filesystem,
-`print` or Roblox APIs. Host services (video, input, disk, network, audio) are
-injected through `Machine.new`.
-
-## Build
-
-Windows 98 SE media is **not** committed. The release page will provide a
-ready-to-run demo image and the emulator model; the source repo stays free of
-Microsoft binaries.
-
-Firmware is staged locally under `roms/` (gitignored):
-
-```powershell
-New-Item -ItemType Directory -Force roms
-Invoke-WebRequest `
-  https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/bios-256k.bin `
-  -OutFile roms/bios-256k.bin
-Invoke-WebRequest `
-  https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/vgabios-stdvga.bin `
-  -OutFile roms/vgabios-stdvga.bin
 ```
-
-The SeaBIOS image is the 256 KiB QEMU build (`rel-1.17.0` in the current
-bring-up); `vgabios-stdvga.bin` supplies the INT 10h text console. Both are
-firmware blobs, not Microsoft media.
-
-```powershell
-lune run tools/check.lua
-lune run tools/harness.lua
-lune run tools/harness.lua 40   # step budget in millions
+SeaBIOS ──▶ boot menu ──▶ CD / floppy / HDD ──▶ FreeDOS 1.3 ──▶ Windows 98 SE (in progress)
 ```
 
 ## Status
 
-M0 is green: the machine boots real SeaBIOS, initializes PIC/PIT/CMOS/A20/PCI/
-fw_cfg, runs SeaVGABIOS in text mode 3, and reaches the no-bootable-device
-screen.
+| Subsystem | State |
+| --- | --- |
+| 486 core: real/protected/V86 modes, paging, TLB, task gates | ✅ working |
+| SeaBIOS boot (MBR, El Torito CD, floppy, warm reset) | ✅ working |
+| IDE/ATAPI (PIO, Busmaster DMA, packet commands, signatures) | ✅ working |
+| VGA (text + cursor, planar mode 12h, mode 13h, VBE/DISPI SVGA) | ✅ working |
+| 80-bit x87 FPU (190/190 precision-control vectors) | ✅ working |
+| Chipset: PIC×2, PIT, MC146818 RTC (clock/alarm/periodic IRQ8), 8237 DMA, PIIX3 PCI | ✅ working |
+| NE2000 Ethernet + host virtual ISP (DHCP/DNS/TCP/HTTP) | ✅ working |
+| FreeDOS 1.3 CD install onto the virtual HDD (diskette auto-swap) | ✅ working |
+| Windows 98 SE SETUP | 🚧 blocker: CD-driver registration — see the [triage guide](docs/WIN98.md) |
+| PS/2 mouse integration, SB16 audio in-guest | 🔜 planned |
 
-M1 boot is reached: the primary IDE channel exposes an ATA HDD and ATAPI
-CD-ROM. SeaBIOS enters `boot_cdrom`, boots the staged FreeDOS 1.3 floppy-
-emulation ISO through its language menu and reaches the **FreeCom 0.85a**
-shell (`tools/harness.lua`). The same firmware also boots the raw floppy image
-through the 82077 FDC and the FD13LIVE no-emulation ISOLINUX image through to
-its LiveCD `D:\>` prompt.
+CI runs the full gate (StyLua, Selene, strict `luau-analyze`, **1800+
+assertions**) on every push.
 
-M2 hardware is in place: PIIX3 PCI/IDE with BMIDE and a secondary channel,
-8237 DMA and SB16, VBE/DISPI SVGA plus a hardware-accurate mode 12h planar
-path with a text cursor/blink, NE2000 with DHCP/DNS/TCP/HTTP, PS/2 keyboard
-and mouse, x87 with context switching and `#MF`, a full MC146818 RTC
-clock/date/alarm model, and 512 MiB IDE validation.
-`lune run tools/check.lua` passes 1812 assertions.
+## Quick start
 
-The Windows 98 SE path now runs real Setup: SeaBIOS boots the staged CD, the
-OTI-91X driver detects the ATAPI CD, the RTC periodic IRQ8 model unblocks the
-ASPI waits, and Setup reaches **Formatting drive C**. The remaining install
-blocker is the guest temp-directory/CAB copy. The stock `media/win98se.iso`
-works; `tools/win98_ide_media.py` builds a local IDE-only
-`media/win98se-ide.iso` that skips the unnecessary SCSI drivers. Media is
-never committed. See `docs/WIN98.md` for the current run and next steps.
+**In Roblox Studio**
 
-The Roblox client shell, EditableImage VGA presenter and set-1 keyboard/mouse
-input bridge are in the tree; `lune run tools/build_rbxmx.lua` writes the
-importable `Rvpc.rbxmx`. See `HANDOFF.md`, `docs/M1-REPORT.md`,
-`docs/M2-REPORT.md`, `docs/ARCHITECTURE.md` and `docs/WIN98.md`.
+```sh
+lune run tools/build_rbxmx.lua     # writes the importable Rvpc.rbxmx
+```
+
+Import `Rvpc.rbxmx` into a place and press Play. The shell presents the VGA
+frame through an `EditableImage` with integer scaling and bridges set-1
+keyboard/mouse input.
+
+**Headless (Lune)**
+
+```sh
+lune run tools/check.lua           # the CI gate
+lune run tools/harness.lua         # boot SeaBIOS headless and watch the screen
+lune run tools/harness.lua 40      # step budget in millions
+```
+
+## Firmware and media (not committed)
+
+The emulator is a real PC: it needs real firmware and OS media, which stay
+out of git. Stage them locally:
+
+**Firmware** (QEMU builds — free):
+
+```powershell
+New-Item -ItemType Directory -Force roms
+Invoke-WebRequest https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/bios-256k.bin -OutFile roms/bios-256k.bin
+Invoke-WebRequest https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/vgabios-stdvga.bin -OutFile roms/vgabios-stdvga.bin
+```
+
+**Guest media** under `media/`:
+
+| File | Used for |
+| --- | --- |
+| `freedos-boot.iso` | FreeDOS 1.3 boot/install CD |
+| `x86BOOT.img`, `x86DSK01–05.img` | FreeDOS floppy set (auto-swapped during install) |
+| `win98se.iso` | Windows 98 SE — also attached to the [releases page](../../releases), provided there by the repository author for testing |
+| `win98-hdd.img` | created automatically for the persistent C: |
+
+## Architecture
+
+```
+core/     Machine, Cpu(486), Memory, Vga, Ide, Pic, Pit, Cmos, Kbc,
+          Fpu(80-bit), Dma, Fdc, Sb16, Ne2000, Isp, Uart, Lpt, Xms
+roblox/   Studio shell: EditableImage presenter, input bridge, perf HUD
+tests/    20+ suites, 1800+ assertions, run by CI on every push
+tools/    build/deploy/probe tooling (Lune + MCP bridge into Studio)
+```
+
+The core is environment-pure (`--!strict`; no `require`, `game`, filesystem
+or Roblox APIs) — the same machine runs headless under Lune and interactively
+in Studio. Host services (video, input, disks, network, audio) are injected
+through `Machine.new`.
+
+## Docs
+
+- [`docs/WIN98.md`](docs/WIN98.md) — Windows 98 staging plan, current blockers, triage guide
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — machine design
+- [`HANDOFF.md`](HANDOFF.md) — engineering log: what was fixed and why, with evidence
 
 ## License
 
-MIT for the emulator source. Microsoft Windows and SeaBIOS media are not
-included; supply your own copies where required.
+MIT for the emulator source — see [LICENSE](LICENSE). SeaBIOS/VGA BIOS
+firmware and guest OS media are not included; supply your own copies where
+required.
