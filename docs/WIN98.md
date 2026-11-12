@@ -86,11 +86,22 @@ Windows media is **not** committed. Supply it locally:
 - **Menu shows and counts down, then a `bad FF /7` fault:** the harness did
   not answer the menu; the countdown path executes into the AIC ASPI data blob
   loaded at `0000:7C00`. Fixed by the harness `Boot from CD-ROM` injection.
-- **"No drives found, aborting installation":** fixed in `ed95334`. The OTI
-  driver issues IDENTIFY DEVICE, then checks the ATAPI signature in
-  `1F5/1F4`; the aborted command now preserves the CD's `EB/14` signature, so
-  the driver prints `Number of drives : 1`. The resident probe is at
-  `028E:6C48`; the decisive check is the signature at `028E:7D5A-7D6D`.
+- **"No drives found, aborting installation":** two emulator bugs, both
+  fixed. (1, `ed95334`) The driver's ATA/ATAPI discrimination (resident
+  subcommand `AH=23h`, seg0:7D29) issues IDENTIFY DEVICE and requires
+  `ABRT` with the ATAPI signature `EB/14` left in `1F5/1F4`; the aborted
+  command now preserves it. (2) The registration loop (init segment
+  `0B5B/0B5F:0780`, 8 drive slots, drive count at `cs:03F0`) runs every
+  empty channel through the same detect: its `AH=0` handler (seg0:6ECF)
+  polls status for `50` or the `EB/14` signature, and the slot also has to
+  pass a write-55/read-55 scratch test on `1F4`. With no drive attached the
+  task file must float `0xFF` - the old model answered `0x00` before the
+  first command and `DRDY|ERR/ABRT` after, and the empty secondary slave
+  (kind cdrom, signature still armed) answered the `EB/14` signature like a
+  live CD, so the driver probed phantom ATAPI devices on the empty channels
+  and could miss the count. Empty positions now float the bus on every read
+  and swallow every task-file write, so only the real CD is detected and
+  the probe finishes several million steps sooner.
 - **"PCI bus scan complete." then a halt at `F000:B757`:** fixed in
   `41c1608`. SeaBIOS's `INT 15h/AH=86h` uses the MC146818 periodic interrupt;
   the CMOS now exposes status A/B/C, sets PF and raises IRQ8 while PIE is
@@ -137,9 +148,10 @@ Windows media is **not** committed. Supply it locally:
 
 ## Known blockers to clear
 
-- OTI-91X IDE detection is fixed (`ed95334`); the stock ASPI wait is fixed by
-  the RTC periodic IRQ8 model (`41c1608`), and both stock and IDE-only images
-  reach Setup formatting.
+- OTI-91X IDE detection is fixed (`ed95334` signature, empty-channel bus
+  float after it); the stock ASPI wait is fixed by the RTC periodic IRQ8
+  model (`41c1608`), and both stock and IDE-only images reach Setup
+  formatting.
 - The 512 MiB HDD is partitioned/formatted; the CAB copy reaches `COMM.DRV`
   and then fails in the guest CAB/file-write completion path.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are

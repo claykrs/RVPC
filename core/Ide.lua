@@ -1073,12 +1073,9 @@ local function command(self: Ide, cmd: number)
 	self.packetPhase = 0
 	const drive = self.selected
 	if not drive.present then
-		-- No device on this position: report ABRT without asserting the shared
-		-- channel IRQ. SeaBIOS probes both secondary positions and must not
-		-- leave a stale IRQ15 pending for Windows.
-		drive.error = 0x04
-		self.lastError = 0x04
-		drive.status = bor(ST_DRDY, ST_ERR)
+		-- Unreachable through Ide.out8 (empty positions swallow command
+		-- writes), but keep the position inert if a command ever lands here:
+		-- no device means no status change, no error register and no IRQ.
 		self.transfer = nil
 		self.irqPending = false
 		return
@@ -1253,6 +1250,33 @@ end
 function Ide.out8(self: Ide, port: number, value: number)
 	value = band(value, 0xFF)
 	const offset = port - self.base
+	if port == self.altBase then
+		-- SRST is level-sensitive but the device reset occurs on the 0->1
+		-- transition. Clear any stale ERR/DRQ and reload both signatures;
+		-- the host's selected drive and nIEN bit survive the reset.
+		if band(value, 0x04) ~= 0 and band(self.deviceControl, 0x04) == 0 then
+			softReset(self)
+		end
+		self.deviceControl = value
+		return
+	end
+	if offset == 6 then
+		self.driveHead = value
+		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
+		self.selected = if self.selectedIndex == 0 then self.master else self.slave
+		if band(value, 0x40) ~= 0 then
+			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
+		end
+		return
+	end
+	-- The remaining task-file registers live in the selected device. With no
+	-- device at that position the writes are lost on the floating bus: nothing
+	-- latches, no signature is disturbed, no command runs and no IRQ is
+	-- raised. Answering as a live controller that rejects commands makes
+	-- drivers probe phantom devices on empty channels.
+	if not self.selected.present then
+		return
+	end
 	if offset == 0 then
 		if self.transfer and self.transfer.write then
 			writeDataByte(self, value)
@@ -1282,27 +1306,20 @@ function Ide.out8(self: Ide, port: number, value: number)
 	elseif offset == 5 then
 		self.lba = bor(band(self.lba, 0xFF00FFFF), lshift(value, 16))
 		self.selected.sig = false
-	elseif offset == 6 then
-		self.driveHead = value
-		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
-		self.selected = if self.selectedIndex == 0 then self.master else self.slave
-		if band(value, 0x40) ~= 0 then
-			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
-		end
 	elseif offset == 7 then
 		command(self, value)
-	elseif port == self.altBase then
-		-- SRST is level-sensitive but the device reset occurs on the 0->1
-		-- transition. Clear any stale ERR/DRQ and reload both signatures;
-		-- the host's selected drive and nIEN bit survive the reset.
-		if band(value, 0x04) ~= 0 and band(self.deviceControl, 0x04) == 0 then
-			softReset(self)
-		end
-		self.deviceControl = value
 	end
 end
 
 function Ide.in8(self: Ide, port: number): number
+	-- An unpopulated device position leaves the task file floating: the whole
+	-- register file (status, error, interrupt reason, signatures, data) reads
+	-- as 0xFF, the way an empty ISA/PCI IDE bus does. Drivers treat any 0xFF
+	-- status as "nothing here" and skip the position; answering with a live
+	-- controller's 0x00/0x41 makes them probe phantom devices.
+	if not self.selected.present then
+		return 0xFF
+	end
 	const offset = port - self.base
 	if offset == 0 then
 		return readDataByte(self)

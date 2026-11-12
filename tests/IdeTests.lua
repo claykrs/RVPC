@@ -1439,4 +1439,100 @@ T("machine_int19_resets_ide_channels", function(expect)
 	expect(ide.slave.status == 0, "absent slave should stay not-ready")
 end)
 
+-- An unpopulated device position must float the ISA/PCI bus: every task-file
+-- read returns 0xFF and writes are lost. The OTI-91X boot driver's detect loop
+-- (seg0:6ECF) treats status 0xFF as "no device" (ERR bit set -> flip -> fail
+-- the slot) and its scratch test (seg0:9548) needs IN 55 after OUT 55; a
+-- channel that answers 0x00/0x41 or latches registers makes it probe phantom
+-- ATAPI devices on the empty secondary/tertiary/quaternary channels.
+T("ide_empty_position_reads_float_ff", function(expect)
+	const ide = Ide.new({})
+	for _, slave in ipairs({ false, true }) do
+		selectDrive(ide, slave)
+		const ports = { 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7, 0x3F6 }
+		for _, port in ipairs(ports) do
+			expect(
+				ide:in8(port) == 0xFF,
+				("%s read %03X = %02X, want FF"):format(
+					slave and "slave" or "master",
+					port,
+					ide:in8(port)
+				)
+			)
+		end
+		expect(ide:in16(0x1F0) == 0xFFFF, "data word should float")
+	end
+end)
+
+T("ide_empty_position_writes_are_lost", function(expect)
+	const ide = Ide.new({})
+	selectDrive(ide, true)
+	ide:out8(0x1F2, 0x55)
+	ide:out8(0x1F4, 0x55) -- the driver's scratch-register test
+	ide:out8(0x1F5, 0x55)
+	expect(ide:in8(0x1F2) == 0xFF, "count register did not float")
+	expect(ide:in8(0x1F4) == 0xFF, "scratch test: wrote 55, want FF back")
+	expect(ide:in8(0x1F5) == 0xFF, "cyl-high did not float")
+	-- Commands execute nowhere: no status change, no error register, no IRQ.
+	ide:out8(0x1F7, 0xEC) -- IDENTIFY DEVICE
+	expect(ide:in8(0x1F7) == 0xFF, "IDENTIFY on empty position changed status")
+	expect(ide:in8(0x1F1) == 0xFF, "error register did not float")
+	expect(not ide.irqPending, "empty position raised IRQ14")
+	ide:out8(0x1F7, 0x08) -- DEVICE RESET
+	expect(ide:in8(0x1F7) == 0xFF, "DEVICE RESET on empty position changed status")
+	expect(not ide.irqPending, "DEVICE RESET on empty position raised IRQ14")
+	ide:out8(0x1F7, 0xA0) -- PACKET
+	expect(not ide.irqPending, "PACKET on empty position raised IRQ14")
+end)
+
+T("ide_empty_position_hides_atapi_signature", function(expect)
+	const ide = Ide.new({})
+	selectDrive(ide, true)
+	-- SRST is channel-level and still runs, but with no device the task file
+	-- keeps floating instead of reloading a signature.
+	ide:out8(0x3F6, 0x04)
+	ide:out8(0x3F6, 0x00)
+	expect(ide:in8(0x1F5) == 0xFF, "cyl-high should float, not report 0xEB")
+	expect(ide:in8(0x1F4) == 0xFF, "cyl-low should float, not report 0x14")
+	expect(ide:in8(0x1F7) == 0xFF, "status should float after SRST")
+end)
+
+T("ide_present_cd_signature_survives", function(expect)
+	const ide = Ide.new({ cdrom = makeIso() })
+	selectDrive(ide, true)
+	ide:out8(0x3F6, 0x04)
+	ide:out8(0x3F6, 0x00)
+	expect(ide:in8(0x1F5) == 0xEB, "ATAPI signature cyl-high")
+	expect(ide:in8(0x1F4) == 0x14, "ATAPI signature cyl-low")
+	-- The scratch registers of a live device still latch.
+	ide:out8(0x1F4, 0x55)
+	expect(ide:in8(0x1F4) == 0x55, "live device scratch test")
+end)
+
+T("machine_secondary_channel_is_empty_bus", function(expect)
+	const m = Machine.new({
+		Memory = Memory,
+		Cpu = Cpu,
+		Pic = Pic,
+		Cmos = Cmos,
+		Ide = Ide,
+	}, {
+		memorySize = 1024 * 1024,
+		hdd = buffer.create(32 * 1024 * 1024),
+	})
+	const io = m.cpu.io
+	-- Both secondary positions are empty: the driver probing 0x170 must see
+	-- the floating bus, including with the slave selected.
+	io.out8(0x176, 0xF0)
+	expect(io.in8(0x177) == 0xFF, "secondary slave status should float")
+	expect(io.in8(0x174) == 0xFF, "secondary slave cyl-low should float")
+	expect(io.in8(0x376) == 0xFF, "secondary alt status should float")
+	io.out8(0x177, 0xEC)
+	expect(io.in8(0x177) == 0xFF, "secondary IDENTIFY must not answer")
+	expect(not m.ide2.irqPending, "secondary probe must not raise IRQ15")
+	-- The primary slave (the CD) keeps its live response.
+	io.out8(0x1F6, 0xF0)
+	expect(band(io.in8(0x1F7), 0x40) ~= 0, "primary slave CD not ready")
+end)
+
 return TESTS
