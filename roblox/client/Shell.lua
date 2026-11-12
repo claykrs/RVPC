@@ -168,6 +168,17 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		integerScaleY = 0.56,
 		background = Color3.new(0, 0, 0),
 	})
+	-- headless-driving hook: client-side Luau (execute_luau on the Client
+	-- datamodel) reaches the machine through the shell attribute
+	local shellGui = Instance.new("ScreenGui")
+	shellGui.Name = "RvpcShellGui"
+	shellGui.Parent = (cfg.container :: any)
+		or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+	shellGui:SetAttribute("HasMachine", true)
+	if machine then
+		shellGui:SetAttribute("MachineReady", true)
+	end
+
 	if okView then
 		view.Frame.AnchorPoint = Vector2.new(0.5, 0.5)
 		view.Frame.Position = UDim2.fromScale(0.5, 0.47)
@@ -192,6 +203,7 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 	local frames = 0
 	local statusTime = 0
 	local textTime = 0
+	local screenTime = 0
 	local fps = 0
 	local machineMsTotal = 0
 	local pollMsTotal = 0
@@ -281,6 +293,15 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 			then
 				forceText = true
 				textTime = 0
+				-- publish the guest's top screen lines for external drivers
+				local text = machine:outputText()
+				local first = string.match(text, "[^\n]+") or ""
+				background:SetAttribute("ScreenLine", first)
+				screenTime += dt
+				if screenTime >= 2 then
+					screenTime = 0
+					background:SetAttribute("ScreenText", string.sub(text, 1, 1200))
+				end
 				-- FreeDOS floppy-edition install support: when the guest asks
 				-- for a package diskette, swap the image into drive A. The
 				-- boot factory exposes the embedded set as machine.floppyDisks.
