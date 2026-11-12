@@ -20,8 +20,19 @@ local Lpt = require("../core/Lpt")
 local Machine = require("../core/Machine")
 
 local m = Machine.new({
-	Memory = Memory, Cpu = Cpu, Vga = Vga, Pic = Pic, Pit = Pit, Cmos = Cmos,
-	FwCfg = FwCfg, Ide = Ide, Kbc = Kbc, Fpu = Fpu, Xms = Xms, Uart = Uart, Lpt = Lpt,
+	Memory = Memory,
+	Cpu = Cpu,
+	Vga = Vga,
+	Pic = Pic,
+	Pit = Pit,
+	Cmos = Cmos,
+	FwCfg = FwCfg,
+	Ide = Ide,
+	Kbc = Kbc,
+	Fpu = Fpu,
+	Xms = Xms,
+	Uart = Uart,
+	Lpt = Lpt,
 }, {
 	memorySize = 32 * 1024 * 1024,
 	cpu = { cpuLevel = "486" },
@@ -61,7 +72,7 @@ end
 
 -- press a key, then re-press after settles until the screen text changes
 local function answerKey(code, sig)
-	for attempt = 1, 4 do
+	for _ = 1, 4 do
 		press(code)
 		pumpUntil(12_000_000, nil)
 		if flat(m:outputText()) ~= sig then

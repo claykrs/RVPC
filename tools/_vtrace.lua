@@ -15,8 +15,19 @@ local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
 local Machine = require("../core/Machine")
 local m = Machine.new({
-	Memory = Memory, Cpu = Cpu, Vga = Vga, Pic = Pic, Pit = Pit, Cmos = Cmos,
-	FwCfg = FwCfg, Ide = Ide, Kbc = Kbc, Fpu = Fpu, Xms = Xms, Uart = Uart, Lpt = Lpt,
+	Memory = Memory,
+	Cpu = Cpu,
+	Vga = Vga,
+	Pic = Pic,
+	Pit = Pit,
+	Cmos = Cmos,
+	FwCfg = FwCfg,
+	Ide = Ide,
+	Kbc = Kbc,
+	Fpu = Fpu,
+	Xms = Xms,
+	Uart = Uart,
+	Lpt = Lpt,
 }, {
 	memorySize = 32 * 1024 * 1024,
 	cpu = { cpuLevel = "486" },
@@ -69,11 +80,18 @@ while done < 55_000_000 do
 		break
 	end
 	if done % 2_000_000 < 20 then
-		local d = m.ide.master
-		samples[#samples + 1] = string.format("t=%dM pic m:irr=%02X isr=%02X imr=%02X s:irr=%02X isr=%02X imr=%02X pitPeriod=%s irq0=%s",
-			done // 1_000_000, m.pic.master.irr, m.pic.master.isr, m.pic.master.imr,
-			m.pic.slave.irr, m.pic.slave.isr, m.pic.slave.imr,
-			tostring(m.pit and m.pit.period or "?"), tostring(m.pit and m.pit.irqPending or "?"))
+		samples[#samples + 1] = string.format(
+			"t=%dM pic m:irr=%02X isr=%02X imr=%02X s:irr=%02X isr=%02X imr=%02X pitPeriod=%s irq0=%s",
+			done // 1_000_000,
+			m.pic.master.irr,
+			m.pic.master.isr,
+			m.pic.master.imr,
+			m.pic.slave.irr,
+			m.pic.slave.isr,
+			m.pic.slave.imr,
+			tostring(m.pit and m.pit.period or "?"),
+			tostring(m.pit and m.pit.irqPending or "?")
+		)
 	end
 end
 for _, s in samples do
