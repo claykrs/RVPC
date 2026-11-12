@@ -221,6 +221,13 @@ T("ata_identify_and_read", function(expect)
 	expect(buffer.readu8(sector, 15) == 0xAF, "sector tail")
 end)
 
+-- Advance the write-commit delay until the device reports ready.
+local function settleWrite(ide)
+	for _ = 1, 400 do
+		ide:advance()
+	end
+end
+
 T("ata_write_and_flush", function(expect)
 	const hdd = makeHdd()
 	const ide = Ide.new({ hdd = hdd })
@@ -235,8 +242,80 @@ T("ata_write_and_flush", function(expect)
 	end
 	expect(buffer.readu16(hdd, 100 * 512) == 0x5A00, "first word")
 	expect(buffer.readu16(hdd, 100 * 512 + 510) == 0x5AFF, "last word")
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "device not busy during write commit")
+	settleWrite(ide)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "not ready after write commit")
 	ide:out8(0x1F7, 0xE7)
 	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "not ready after flush")
+end)
+
+T("ata_write_commit_busy_then_ready", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	-- The DRQ-ready interrupt fires at command issue; the host consumes it.
+	expect(ide:takeIrq(), "write DRQ-ready IRQ missing")
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	-- The device holds BSY and raises no interrupt while committing.
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "commit did not assert BSY")
+	expect(not ide:takeIrq(), "commit IRQ fired before the commit period ended")
+	for _ = 1, 100 do
+		ide:advance()
+	end
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "commit period ended too early")
+	-- The completion is signalled exactly once, with the interrupt.
+	settleWrite(ide)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "commit did not end ready")
+	expect(ide:takeIrq(), "commit completion IRQ missing")
+	expect(not ide:takeIrq(), "commit completion IRQ latched twice")
+end)
+
+T("ata_write_commit_interruptible_by_command", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	ide:advance()
+	-- A guest issuing a command during the commit period first gets the
+	-- pending completion, then the command runs.
+	ide:out8(0x1F7, 0xE7)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "flush did not report ready")
+	expect(ide:takeIrq(), "pending commit IRQ missing after flush")
+end)
+
+T("ata_write_commit_cancelled_by_srst", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	ide:advance()
+	-- SRST cancels the pending completion without signalling it.
+	ide:out8(0x3F6, 0x06)
+	expect(ide.writeDoneCycles == 0, "SRST left the commit pending")
+	ide:out8(0x3F6, 0x02)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "SRST did not clear busy")
+	expect(not ide:takeIrq(), "cancelled commit raised an interrupt")
 end)
 
 local function writeSectors(ide, lba, count, firstWord)
@@ -1278,6 +1357,7 @@ T("ata_pio_ignores_armed_bmide", function(expect)
 		512
 	)
 	expect(band(ide:bmIn8(0xC002), 0x04) == 0, "PIO write set BMIDE INT")
+	settleWrite(ide)
 	expect(ide:takeIrq(), "PIO write with armed BMIDE IRQ")
 end)
 

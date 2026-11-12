@@ -5,25 +5,69 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 ## Win98 SETUP phase-2 temp-write error — triage state
 
 With the staged 512 MB `media/win98-hdd.img` and `tools/probe_win98_cab.lua
-media/win98se-ide.iso 350 media/win98-hdd.img`, SETUP now gets through CD
-detection, Welcome, formatting, and the full phase-1 CAB copy (63M→137M
-steps — the OTI bus-float fix unblocked all of it). The failure reproduces
-at 137M, at the **phase-2 boundary**: SETUP reboots into its staged
-WININST DOS on C:, copies the next batch from CD to the temp dir, and prints
-"Setup is unable to write to the temporary directory".
+media/win98se-ide.iso 350 media/win98-hdd.img`, SETUP gets through CD
+detection, Welcome, formatting, and the phase-1 file copy (63M→137M steps),
+then prints "Setup is unable to write to the temporary directory". The
+"RebootPrompt" marker at 137M is a false match: the error screen itself says
+"press any key to restart your system" — **there is no reboot; the failure
+is at the end of the first copy**, in the same DOS session.
 
-Capture at the error (probe_win98_cab.lua): cs=1B9F (phase-2 DOS), real
-mode, int21=11805, int13=629. IDE state: selected=slave (CD, head byte B0),
-496 packet commands issued (phase-1 CAB reads + phase-2 CD reads), C: dirty
-range 0..1921 sectors (phase-1 writes all landed). So C: writes work; the
-error surfaces during the phase-2 CD→C: copy — most likely an ATAPI read
-failure (PIO packet path, ~496 commands in) that SETUP reports as a write
-failure, or a phase-2 reboot/leftover state issue (the warm-reset IDE reset
-from c5be06b runs right before the failing phase).
+Per-command instrumentation landed in `tools/probe_win98_phase2.lua`
+(gitignored): a per-command IDE ring (opcode, CDB, status, error, interrupt
+reason, byte counts) with a short-write freeze dump, INT 13h entry/exit and
+INT 21h file-op watches with caller CS:IP, a memory scan + write watch over
+the DOS kernel's FAT/dir cache buffers, device-control and IRQ14 delivery
+logs with per-step timestamps, and a FAT/directory sector op history decoded
+from the drive image.
 
-Next diagnostic: log ATAPI packet command results (status/error byte per
-packet) plus int13 AH codes through the failure — a hook on Ide.in8/out8 in
-a probe variant, dumping the last N results at the error PC 1B9F:17D6.
+Findings at the failure (deterministic: int13=629, int21=11805, packet=496
+every run):
+
+- **The IDE/ATA/ATAPI layer is fully green.** The last 64 commands (ATA PIO
+  writes op=30, ATAPI READ(10) op=28, TEST UNIT READY) all complete
+  st=50/58 err=00 with full data transfer; no ERR, no hang, no SRST. All
+  928 commands over the run are clean. Disk writes land at the expected
+  LBAs (temp dir 608, FAT1 64, FAT2 320, root 576, data 608+).
+- **The failure is DOS-internal**: INT 21h AH=40h for
+  `C:\WININST0.400\COMM.DRV` (caller 230F:5F32) returns AX=1820 for CX=9280
+  with CF=0 — a "successful" short write — with **no ATA command issued, no
+  INT 13h call, and no FAT allocation mark** for the file's clusters. INT 13h
+  shows zero failures all run. Same signature as the old pre-ab997de blocker
+  (GDI.EXE, AX=0x071C for 9280): the copy is deterministic, only the failing
+  file moved.
+- The DOS kernel drives the IDE itself: IO.SYS resident at FF39 (HMA copy at
+  FFF8) hooks INT 13h and its AH=67h does the writes directly (caller
+  FFFF:184A). SeaBIOS INT 13h is not in the copy path. The flush loop is
+  ISR-driven per command: it masks nIEN (device control 0x0A), issues the
+  write, transfers by polling, then unmasks (0x08) and expects the
+  completion INTRQ after the unmask — which real hardware produces because
+  the device holds BSY through its media-commit period.
+- After the short write the kernel zeroes its FAT cache (FF39:CC8A writes 0
+  words over FAT entries 46..84, then 2), flushes the zeroed FAT sector to
+  lba 64 and 320 (destroying the on-disk metadata), and prints the error.
+  The sweep frees exactly the clusters allocated after cluster 45 — a
+  rollback to the state at the last "known-good" allocation point.
+- The kernel's in-memory FAT at the failure is healthy up to entry 84, but
+  the allocation marks contain **dangling temps**: each allocation writes
+  FAT[N]=0x0001 at the newly allocated cluster and links FAT[N-1]=N, and
+  several file-boundary entries never receive their final 0xFFFF EOC — e.g.
+  FAT[67]=0x0001 for GDI.EXE's last cluster stays as the garbage value 1.
+
+Interpretation: the IDE layer and the reset paths are healthy and are NOT
+the cause. The wrong FAT bookkeeping values (dangling 0x0001 temps, missing
+EOCs, the 1820 short count) are computed by the guest DOS kernel itself, so
+the CPU's execution of the kernel's allocation routine (FF39:CC8A) is the
+prime suspect — the same frontier as the FreeDOS 0FF7:F7AF `0F 10` hang.
+Next diagnostic: trace/disassemble the DOS kernel allocation code around
+FF39:CC8A and check how the EOC/link writes (0xFFFF vs 0x0001) are computed
+and executed.
+
+Also landed: the IDE PIO write path now models the real media-commit delay —
+after the last data word the device reports BSY and completes (DRDY + INTRQ)
+only after `Ide.advance()` ticks (`WRITE_COMPLETION_DELAY` steps, wired
+per-step in `Machine.run`). Previously the write completed instantly at the
+last data write, so a driver polling status observed the completion before
+the interrupt. Setup's phase-1 copy still runs identically with the delay.
 
 ## Pre-installed FreeDOS image (M2.5) — current frontier
 
@@ -160,7 +204,7 @@ that workload; the win shows once VMM runs - see `docs/WIN98.md`).
 - **Tools** (`beac165`, `3b5dae9`): local IDE-only Win98 boot-image builder and
   a Roblox model build that tolerates a missing fixtures tree.
 
-**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1812 assertions.
+**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1867 assertions.
 
 ## Definition of done
 

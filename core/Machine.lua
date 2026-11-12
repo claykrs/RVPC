@@ -1028,6 +1028,14 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				pic:raise(8)
 			end
 		end
+		-- Retire pending PIO write completions (BSY -> DRDY + INTRQ) so guest
+		-- drivers observe the device-busy commit period of a real device.
+		if ide and ide.writeDoneCycles > 0 then
+			ide:advance()
+		end
+		if ide2 and ide2.writeDoneCycles > 0 then
+			ide2:advance()
+		end
 		if pic then
 			-- Each takeIrq is side-effect free unless its own pending/armed
 			-- field is set, so those fields are a cheap equivalent gate.

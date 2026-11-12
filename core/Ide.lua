@@ -27,6 +27,7 @@ const ST_ERR = 0x01
 const ST_DRQ = 0x08
 const ST_DSC = 0x10
 const ST_DRDY = 0x40
+const ST_BSY = 0x80
 
 const ATA_IDENTIFY = 0xEC
 const ATA_READ = 0x20
@@ -52,6 +53,15 @@ const ASC_INVALID_FIELD = 0x24
 const ASC_MEDIUM_NOT_PRESENT = 0x3A
 const ASC_MEDIA_REMOVAL_PREVENTED = 0x53
 const MAX_ATAPI_SECTORS = 2048
+
+-- A real device stays busy for a short period after the host hands over the
+-- last word of a PIO write (committing the sector) before signalling
+-- completion with DRDY + INTRQ. Guests drive the whole channel state machine
+-- off that interrupt, so completing the write instantly at the last data
+-- write makes the completion observable through the status register BEFORE
+-- the interrupt and double-signals the event. The delay is counted in
+-- advance() cycles (machine steps).
+const WRITE_COMPLETION_DELAY = 200
 
 export type Partition = {
 	index: number,
@@ -133,6 +143,8 @@ export type Ide = typeof(setmetatable(
 		dirty: boolean,
 		dirtyFirstSector: number?,
 		dirtyLastSector: number?,
+		-- Cycles left before a pending PIO write completion goes DRDY.
+		writeDoneCycles: number,
 		diskDirty: (self: Ide) -> boolean,
 		clearDiskDirty: (self: Ide) -> (),
 		dirtySectorRange: (self: Ide) -> (number?, number?),
@@ -146,6 +158,7 @@ export type Ide = typeof(setmetatable(
 		bmOut16: (self: Ide, port: number, value: number) -> (),
 		bmIn32: (self: Ide, port: number) -> number,
 		bmOut32: (self: Ide, port: number, value: number) -> (),
+		advance: (self: Ide) -> (),
 		takeIrq: (self: Ide) -> boolean,
 		reset: (self: Ide) -> (),
 	},
@@ -220,6 +233,7 @@ function Ide.new(config: Config?): Ide
 	self.dirty = false
 	self.dirtyFirstSector = nil
 	self.dirtyLastSector = nil
+	self.writeDoneCycles = 0
 	return self
 end
 
@@ -235,6 +249,7 @@ local function softReset(self: Ide)
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
+	self.writeDoneCycles = 0
 	self.master.status = if self.master.present then bor(ST_DRDY, ST_DSC) else 0
 	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
 	self.master.error = 0
@@ -251,6 +266,7 @@ function Ide.reset(self: Ide)
 	self.selected = self.master
 	self.selectedIndex = 0
 	self.deviceControl = 0
+	self.writeDoneCycles = 0
 	softReset(self)
 	self.bmCmd = 0
 	self.bmStatus = BM_STATUS_DMA_CAP
@@ -411,7 +427,13 @@ local function completeWrite(self: Ide, transfer: Transfer)
 		buffer.copy(drive.image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
 		markDiskDirty(self, transfer.lba, math.floor(transfer.length / 512))
 	end
-	finish(self, bor(ST_DRDY, ST_DSC))
+	-- The device received all sector data; hold BSY for the media-commit
+	-- period before signalling completion (see WRITE_COMPLETION_DELAY).
+	self.transfer = nil
+	self.pktCdb = false
+	self.pktData = false
+	self.writeDoneCycles = WRITE_COMPLETION_DELAY
+	self.selected.status = ST_BSY
 end
 
 function Ide.diskDirty(self: Ide): boolean
@@ -1068,6 +1090,12 @@ local function packetReady(self: Ide): boolean
 end
 
 local function command(self: Ide, cmd: number)
+	-- A guest should not issue commands while the device is busy committing a
+	-- write; if it does, the commit completes immediately first.
+	if self.writeDoneCycles > 0 then
+		self.writeDoneCycles = 0
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
 	self.commandCount += 1
 	self.lastCommand = cmd
 	self.packetPhase = 0
@@ -1480,6 +1508,18 @@ function Ide.bmOut32(self: Ide, port: number, value: number)
 		self:bmOut8(port + 2, band(rshift(value, 16), 0xFF))
 	elseif offset == 4 then
 		self.bmPrdt = band(value, 0xFFFFFFFC)
+	end
+end
+
+-- One machine step: retires the pending PIO write completion when its media
+-- commit period has elapsed. The host sees BSY until then and DRDY + INTRQ
+-- after, matching the timing real drivers sequence their state machine on.
+function Ide.advance(self: Ide)
+	if self.writeDoneCycles > 0 then
+		self.writeDoneCycles -= 1
+		if self.writeDoneCycles == 0 then
+			finish(self, bor(ST_DRDY, ST_DSC))
+		end
 	end
 end
 
