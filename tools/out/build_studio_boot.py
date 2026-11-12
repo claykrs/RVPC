@@ -97,7 +97,7 @@ return function(Rvpc, RvpcUi)
 	local floppyNames = { "x86BOOT", "x86DSK01", "x86DSK02", "x86DSK03", "x86DSK04", "x86DSK05" }
 	local floppyDisks = {}
 	for index, name in floppyNames do
-		floppyDisks[name] = buffer.fromstring(collect("BootFloppy" .. name, {floppyCounts}))
+		floppyDisks[name] = buffer.fromstring(collect("BootFloppy" .. name, {floppyPer}))
 	end
 	local machine = Rvpc.Machine.new({
 		Memory = Rvpc.Memory,
@@ -156,8 +156,8 @@ def main():
 		floppy_images.append((name, open(os.path.join(RVPC, "media", name + ".img"), "rb").read()))
 	floppy_chunks = []
 	for name, image in floppy_images:
-		for part in chunk_b64(image, 131072):
-			floppy_chunks.append((name, part))
+		for j, part in enumerate(chunk_b64(image, 131072), start=1):
+			floppy_chunks.append((name, f"{name}{j:02d}", part))
 	print(f"bios {len(bios)//1024}KB, vga {len(vga)//1024}KB, iso {len(iso)//1024}KB -> {n} chunks, floppy {len(floppy_chunks)} chunks")
 
 	# payload 1: fixtures folder + bios/vga chunks (Source caps at 200K chars)
@@ -193,8 +193,8 @@ def main():
 	for start in range(0, len(floppy_chunks), per):
 		group = floppy_chunks[start:start + per]
 		code = PRELUDE + "\n" + 'local fix = upsert(RS, "RvpcFixtures", "Folder")\n'
-		for name, chunk in group:
-			module_name = f"BootFloppy{name}"
+		for name, _mod, chunk in group:
+			module_name = f"BootFloppy{name}{j:02d}"
 			code += "local m = upsert(fix, " + json.dumps(module_name) + ", " + '"ModuleScript"' + ")\n"
 			code += "m.Source = RET .. Q .. " + json.dumps(chunk) + " .. Q\n"
 		code += f'return "floppy {start}..{start + len(group)} ok"'
@@ -205,7 +205,7 @@ def main():
 		.replace("{chunks}", str(n))
 		.replace("{biosChunks}", str(len(bios_chunks)))
 		.replace("{vgaChunks}", str(len(vga_chunks)))
-		.replace("{floppyCounts}", str(len(floppy_chunks))))
+		.replace("{floppyPer}", str(len(chunk_b64(floppy_images[0][1], 131072)))))
 	factory_b64 = base64.b64encode(factory.encode()).decode()
 	code = PRELUDE + "\n" + 'local fix = upsert(RS, "RvpcFixtures", "Folder")\n'
 	code += 'local m = upsert(RS, "RvpcBoot", "ModuleScript")\n'
