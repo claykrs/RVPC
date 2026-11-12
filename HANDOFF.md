@@ -2,6 +2,29 @@
 
 Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
+## Win98 SETUP phase-2 temp-write error — triage state
+
+With the staged 512 MB `media/win98-hdd.img` and `tools/probe_win98_cab.lua
+media/win98se-ide.iso 350 media/win98-hdd.img`, SETUP now gets through CD
+detection, Welcome, formatting, and the full phase-1 CAB copy (63M→137M
+steps — the OTI bus-float fix unblocked all of it). The failure reproduces
+at 137M, at the **phase-2 boundary**: SETUP reboots into its staged
+WININST DOS on C:, copies the next batch from CD to the temp dir, and prints
+"Setup is unable to write to the temporary directory".
+
+Capture at the error (probe_win98_cab.lua): cs=1B9F (phase-2 DOS), real
+mode, int21=11805, int13=629. IDE state: selected=slave (CD, head byte B0),
+496 packet commands issued (phase-1 CAB reads + phase-2 CD reads), C: dirty
+range 0..1921 sectors (phase-1 writes all landed). So C: writes work; the
+error surfaces during the phase-2 CD→C: copy — most likely an ATAPI read
+failure (PIO packet path, ~496 commands in) that SETUP reports as a write
+failure, or a phase-2 reboot/leftover state issue (the warm-reset IDE reset
+from c5be06b runs right before the failing phase).
+
+Next diagnostic: log ATAPI packet command results (status/error byte per
+packet) plus int13 AH codes through the failure — a hook on Ide.in8/out8 in
+a probe variant, dumping the last N results at the error PC 1B9F:17D6.
+
 ## Pre-installed FreeDOS image (M2.5) — current frontier
 
 A headless driver (`tools/_hinstall.lua`) drives the whole FreeDOS install in
