@@ -199,6 +199,10 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		elseif verb == "key" then
 			local code = tonumber(a)
 			if code then
+				if machine.kbc then
+					-- external drivers have no input lock: arm the keyboard
+					machine.kbc.keyboardEnabled = true
+				end
 				machine:pressKey(code)
 				machine:releaseKey(code)
 				return "key " .. a
