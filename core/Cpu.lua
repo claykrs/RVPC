@@ -3982,6 +3982,44 @@ local function bitTest(cpu: any, operation: number, immediate: boolean?)
 	end
 end
 
+-- 0F B0/B1 CMPXCHG r/m, reg (486+): compare AL/AX/EAX with the r/m operand,
+-- set ZF from that compare; on ZF store the source register into r/m, else
+-- load r/m into the accumulator. The compare flags come from the ALU.
+local function cmpXchg(cpu: any, width: number)
+	const e = cpu:modrm()
+	local acc, dest
+	if width == 8 then
+		acc = cpu:rb(0)
+		dest = cpu:readRM8(e)
+		doALU(cpu, 7, acc, dest, 8)
+	elseif cpu.operand32 then
+		acc = cpu:rr32(0)
+		dest = cpu:readRM32(e)
+		doALU(cpu, 7, acc, dest, 32)
+	else
+		acc = cpu:rr(0)
+		dest = cpu:readRM16(e)
+		doALU(cpu, 7, acc, dest, 16)
+	end
+	if cpu:getF(ZF) then
+		if width == 8 then
+			cpu:writeRM8(e, cpu:rb(e.reg))
+		elseif cpu.operand32 then
+			cpu:writeRM32(e, cpu:rr32(e.reg))
+		else
+			cpu:writeRM16(e, cpu:rr(e.reg))
+		end
+	else
+		if width == 8 then
+			cpu:wb(0, dest)
+		elseif cpu.operand32 then
+			cpu:wr32(0, dest)
+		else
+			cpu:wr(0, dest)
+		end
+	end
+end
+
 local H0F: { [number]: (cpu: any) -> () } = {}
 
 -- 00: SLDT/STR/LLDT/LTR/VERR/VERW
@@ -4233,6 +4271,22 @@ H0F[0xBB] = function(cpu: any)
 end
 H0F[0xBA] = function(cpu: any)
 	bitTest(cpu, 0, true) -- /4..7 applied inside after decoding modrm
+end
+
+-- 0F B0/B1 CMPXCHG r/m, reg (486+).
+H0F[0xB0] = function(cpu: any)
+	cmpXchg(cpu, 8)
+end
+H0F[0xB1] = function(cpu: any)
+	cmpXchg(cpu, if cpu.operand32 then 32 else 16)
+end
+
+-- 0F 18-1F hintable-NOP family (P6+; treated as modrm-consuming no-ops so
+-- newer toolchains' multi-byte NOPs run on this 486-class CPU).
+for nop = 0x18, 0x1F do
+	H0F[nop] = function(cpu: any)
+		cpu:modrm()
+	end
 end
 
 H0F[0x0B] = function(cpu: any): ()

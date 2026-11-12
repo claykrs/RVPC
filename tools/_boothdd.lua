@@ -16,8 +16,19 @@ local Uart = require("../core/Uart")
 local Lpt = require("../core/Lpt")
 local Machine = require("../core/Machine")
 local m = Machine.new({
-	Memory = Memory, Cpu = Cpu, Vga = Vga, Pic = Pic, Pit = Pit, Cmos = Cmos,
-	FwCfg = FwCfg, Ide = Ide, Kbc = Kbc, Fpu = Fpu, Xms = Xms, Uart = Uart, Lpt = Lpt,
+	Memory = Memory,
+	Cpu = Cpu,
+	Vga = Vga,
+	Pic = Pic,
+	Pit = Pit,
+	Cmos = Cmos,
+	FwCfg = FwCfg,
+	Ide = Ide,
+	Kbc = Kbc,
+	Fpu = Fpu,
+	Xms = Xms,
+	Uart = Uart,
+	Lpt = Lpt,
 }, {
 	memorySize = 32 * 1024 * 1024,
 	cpu = { cpuLevel = "486" },
@@ -27,9 +38,10 @@ local m = Machine.new({
 })
 local done = 0
 local hitAt = nil
-while done < 120_000_000 do
+local last = ""
+while done < 300_000_000 do
 	local ok, n = pcall(function()
-		return m:run(500_000)
+		return m:run(200_000)
 	end)
 	if not ok then
 		print("FAULT at", done, n)
@@ -40,10 +52,17 @@ while done < 120_000_000 do
 	end
 	done += n
 	local screen = m:outputText()
-	if string.find(screen, "C:", 1, true) and string.find(screen, ">", 1, true) then
+	if string.find(screen, "C:\\>", 1, true) or string.find(screen, "C>", 1, true) then
 		hitAt = done
 		break
 	end
+	if done % 5_000_000 < 200_000 then
+		local flat = (screen:gsub("[^%g\n]+", " "))
+		if flat ~= last then
+			last = flat
+			print("at", done, "screen tail:", flat:sub(-120):gsub("\n", " "))
+		end
+	end
 end
 print("boot done:", done, "promptAt:", hitAt)
-print(string.sub((m:outputText():gsub("[^%g\n]+", " ")), 1, 500))
+print(string.sub((m:outputText():gsub("[^%g\n]+", " ")), 1, 800))

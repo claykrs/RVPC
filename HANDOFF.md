@@ -69,7 +69,7 @@ per-step in `Machine.run`). Previously the write completed instantly at the
 last data write, so a driver polling status observed the completion before
 the interrupt. Setup's phase-1 copy still runs identically with the delay.
 
-## Pre-installed FreeDOS image (M2.5) — current frontier
+## Pre-installed FreeDOS image (M2.5) — RESOLVED: boots to C:\>
 
 A headless driver (`tools/_hinstall.lua`) drives the whole FreeDOS install in
 the Lune harness: the settle-repress key pattern (keys pressed right after a
@@ -77,18 +77,36 @@ prompt paints are eaten by the installer's keyboard purge — press, settle
 ~12M steps, re-press) walks language → FDI → proceed/format prompts →
 partition Success → reboot → format → sys-transfer. Dumping C: at
 "Set active boot partition" (media/fd13-c.img, 1 MiB payload, 64K-alignable)
-yields an image whose MBR→VBS→kernel chain boots: the FreeDOS 2043 kernel
-banner prints from the dumped disk.
+yields an image whose MBR→VBS→kernel chain boots. The install itself is
+verified pristine: an instrumented replay (tools/_hinstall_trace.lua) dumps a
+C: byte-identical to fd13-c.img.
 
-Current hang: after the banner the kernel reads CONFIG.SYS through its own
-disk code, loads COMMAND.COM to segment 0FF7, then executes `0F 10` (SSE
-MOVUPS, unimplemented) at 0FF7:F7AF. DOS-era binaries do not emit SSE, so
-this is most likely a decoder desync (an earlier instruction decoded with the
-wrong length steers execution into data) or a missing two-byte opcode. The
-core has only 43 H0F handlers — expanding two-byte-opcode coverage and
-validating 32-bit decoder lengths is the next workstream (same class as the
-Win98 GUI needs). CONFIG.SYS/AUTOEXEC.BAT are pre-written into the test image
-(media/_test_hdd.img) to isolate this from the missing config phase.
+The reported 0FF7:F7AF `0F 10` (SSE MOVUPS) fault was never a CPU bug. The
+lost step that turned fd13-c.img into media/_test_hdd.img (32 MiB pad +
+CONFIG.SYS/AUTOEXEC.BAT pre-write) corrupted the disk three ways: it shifted
+KERNEL.SYS and COMMAND.COM forward by exactly 2 bytes (two leading zeros, two
+tail bytes lost), claimed clusters 4/5 — the middle of COMMAND.COM's chain
+3..44 — for the two small files, and stamped FAT1[4]=FAT1[5]=0xFFFF over that
+chain (FAT2 kept the true chain; DOS reads FAT1). The kernel therefore read a
+4 KB truncation of COMMAND.COM, and its exec jumped to the (correct) entry
+0FF7:8410 inside zeroed memory; the CPU slid through `00 00` bytes until the
+`0F 10` bytes of the exec handoff frame at 0FF7:F7AF faulted as an
+unimplemented SSE opcode.
+
+tools/_fixfd13.lua rebuilds _test_hdd.img from the pristine dump and
+pre-writes CONFIG.SYS/AUTOEXEC.BAT correctly (root entries + both FAT copies
++ data on genuinely free clusters 68/69), then verifies every file chain in
+both FATs. tools/_boothdd.lua on the rebuilt image reaches the prompt:
+kernel banner → InitDisk → CONFIG.SYS (the DRIVPARM line logs a guest-syntax
+warning and is skipped) → FreeCom 0.85a → AUTOEXEC → `C:\>` at ~10.8M steps.
+
+CPU two-byte coverage touched while closing this: 0F B0/B1 CMPXCHG (the one
+missing 486-era instruction) and the 0F 18-1F hintable-NOP family (as
+modrm-consuming no-ops so newer toolchains' long NOPs run). MOVZX/MOVSX/
+BSF/BSR/BSWAP/SHLD/SHRD/IMUL/Jcc/SETcc/LFS/LSS/LGS/BT* were already present,
+and the 66-prefixed two-byte dispatch is now covered by tests (five new
+CpuTests cases). The Win98-lane FF39 FAT-cache mis-execution is a different
+frontier and is not reproduced by the FreeDOS boot.
 
 Also landed this round: the OTI "No drives found" root cause (ab997de) —
 empty IDE device positions now float the ISA bus (0xFF reads, lost writes,
@@ -204,7 +222,7 @@ that workload; the win shows once VMM runs - see `docs/WIN98.md`).
 - **Tools** (`beac165`, `3b5dae9`): local IDE-only Win98 boot-image builder and
   a Roblox model build that tolerates a missing fixtures tree.
 
-**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1867 assertions.
+**Tests:** `tools/bin/lune.exe run tools/check.lua` passes with 1877 assertions.
 
 ## Definition of done
 

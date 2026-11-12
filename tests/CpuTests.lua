@@ -945,4 +945,153 @@ T("signed_jl_jge_jg_sf_of", {
 	end,
 })
 
+-- 0F B0 CMPXCHG r/m8, r8 (486+): equal case stores the source into r/m.
+T("cmpxchg8_eq", {
+	setup = function(m)
+		putCode(m, {
+			0xB0,
+			0x42, -- MOV AL,0x42
+			0xBB,
+			0x00,
+			0x03, -- MOV BX,0x300
+			0xC6,
+			0x07,
+			0x42, -- MOV BYTE [BX],0x42
+			0xB1,
+			0x99, -- MOV CL,0x99
+			0x0F,
+			0xB0,
+			0x0F, -- CMPXCHG [BX],CL
+			0xF4,
+		})
+		fresh(m)
+	end,
+	check = function(m, cpu, expect)
+		expect(band(cpu.flags, 0x40) ~= 0, "ZF clear on equal compare")
+		expect(m.mem:read8(0x6000 + 0x300) == 0x99, "dest not updated with source")
+	end,
+})
+
+-- 0F B0 CMPXCHG r/m8, r8: unequal case loads r/m into the accumulator and
+-- leaves r/m alone.
+T("cmpxchg8_ne", {
+	setup = function(m)
+		putCode(m, {
+			0xB0,
+			0x41, -- MOV AL,0x41
+			0xBB,
+			0x00,
+			0x03, -- MOV BX,0x300
+			0xC6,
+			0x07,
+			0x42, -- MOV BYTE [BX],0x42
+			0xB1,
+			0x99, -- MOV CL,0x99
+			0x0F,
+			0xB0,
+			0x0F, -- CMPXCHG [BX],CL
+			0xF4,
+		})
+		fresh(m)
+	end,
+	check = function(m, cpu, expect)
+		expect(band(cpu.flags, 0x40) == 0, "ZF set on unequal compare")
+		expect(cpu:rb(0) == 0x42, "AL not loaded from dest")
+		expect(m.mem:read8(0x6000 + 0x300) == 0x42, "dest modified on unequal compare")
+	end,
+})
+
+-- 0F B1 CMPXCHG r/m16, r16: equal case, memory dest.
+T("cmpxchg16_eq", {
+	setup = function(m)
+		putCode(m, {
+			0xB8,
+			0x34,
+			0x12, -- MOV AX,0x1234
+			0xBB,
+			0x00,
+			0x03, -- MOV BX,0x300
+			0xC7,
+			0x07,
+			0x34,
+			0x12, -- MOV WORD [BX],0x1234
+			0xBE,
+			0xEF,
+			0xBE, -- MOV SI,0xBEEF
+			0x0F,
+			0xB1,
+			0x37, -- CMPXCHG [BX],SI
+			0xF4,
+		})
+		fresh(m)
+	end,
+	check = function(m, cpu, expect)
+		expect(band(cpu.flags, 0x40) ~= 0, "ZF clear on equal compare")
+		expect(m.mem:read16(0x6000 + 0x300) == 0xBEEF, "dest not updated with source")
+	end,
+})
+
+-- 66 0F B1 CMPXCHG r/m32, r32: validates the 66-prefixed two-byte dispatch.
+T("cmpxchg32_66", {
+	setup = function(m)
+		putCode(m, {
+			0x66,
+			0xB8,
+			0x44,
+			0x33,
+			0x22,
+			0x11, -- MOV EAX,0x11223344
+			0xBB,
+			0x00,
+			0x03, -- MOV BX,0x300
+			0x66,
+			0xC7,
+			0x07,
+			0x44,
+			0x33,
+			0x22,
+			0x11, -- MOV DWORD [BX],0x11223344
+			0x66,
+			0xBE,
+			0x55,
+			0x66,
+			0x77,
+			0x88, -- MOV ESI,0x88776655
+			0x66,
+			0x0F,
+			0xB1,
+			0x37, -- CMPXCHG DWORD [BX],ESI
+			0xF4,
+		})
+		fresh(m)
+	end,
+	check = function(m, cpu, expect)
+		expect(band(cpu.flags, 0x40) ~= 0, "ZF clear on equal compare")
+		expect(m.mem:read32(0x6000 + 0x300) == 0x88776655, "dest not updated with source")
+	end,
+})
+
+-- 0F 1F /0 multi-byte NOP (hintable-NOP family): consumes its modrm operand
+-- and falls through, so newer toolchains' long NOPs run on this CPU.
+T("hint_nop_0f1f", {
+	setup = function(m)
+		putCode(m, {
+			0xB8,
+			0x01,
+			0x00, -- MOV AX,1
+			0x0F,
+			0x1F,
+			0xC0, -- NOP AX (mod=11)
+			0xB8,
+			0x02,
+			0x00, -- MOV AX,2
+			0xF4,
+		})
+		fresh(m)
+	end,
+	check = function(_m, cpu, expect)
+		expect(cpu.r[1] == 2, "0F 1F did not fall through; AX=" .. cpu.r[1])
+	end,
+})
+
 return TESTS
