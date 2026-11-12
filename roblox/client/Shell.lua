@@ -164,7 +164,8 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 	end
 
 	local okView, view = pcall(RvpcUi.VgaView.new, vga, display, {
-		size = UDim2.fromScale(0.96, 0.9),
+		integerScale = true,
+		integerScaleY = 0.56,
 		background = Color3.new(0, 0, 0),
 	})
 	if okView then

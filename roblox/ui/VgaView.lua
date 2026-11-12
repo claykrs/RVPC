@@ -30,6 +30,11 @@ export type Options = {
 	size: UDim2?,
 	background: Color3?,
 	aspect: boolean?,
+	-- snap the frame to an integer multiple of the guest resolution, centered;
+	-- non-integer fills blur every glyph, integer scaling keeps them crisp
+	integerScale: boolean?,
+	-- vertical center position (0..1 scale) for the snapped frame
+	integerScaleY: number?,
 }
 
 export type VgaView = {
@@ -118,6 +123,40 @@ function VgaView.new(vga: any, parent: Instance, options: Options?): VgaView
 	self._width = initialWidth
 	self._height = initialHeight
 	self._destroyed = false
+
+	-- snap the frame to an integer multiple of the guest resolution, centered:
+	-- a fractional fill makes the pixelated resampler draw glyphs with uneven
+	-- pixel sizes, which reads as blur on text
+	local function applyIntegerScale()
+		if not cfg.integerScale then
+			return
+		end
+		if not parent:IsA("GuiObject") then
+			return
+		end
+		local abs = parent.AbsoluteSize
+		if abs.X < 1 or abs.Y < 1 then
+			return
+		end
+		local scale = math.max(1, math.floor(math.min(abs.X / self._width, abs.Y / self._height)))
+		local holder = frame:FindFirstChild("UIAspectRatioConstraint")
+		if holder then
+			holder:Destroy()
+		end
+		frame.AnchorPoint = Vector2.new(0.5, 0.5)
+		frame.Position = UDim2.fromScale(0.5, cfg.integerScaleY or 0.5)
+		frame.Size = UDim2.fromOffset(self._width * scale, self._height * scale)
+	end
+	self._applyIntegerScale = applyIntegerScale
+	if cfg.integerScale then
+		pcall(function()
+			(parent :: any).PropertyChanged:Connect(function(prop: string)
+				if prop == "AbsoluteSize" or prop == "Size" then
+					applyIntegerScale()
+				end
+			end)
+		end)
+	end
 
 	local function attach(width: number, height: number)
 		if self._destroyed then
@@ -212,6 +251,7 @@ function VgaView.new(vga: any, parent: Instance, options: Options?): VgaView
 		if self.Sink then
 			self.Sink:poll(true)
 		end
+		applyIntegerScale()
 	end
 
 	attach(initialWidth, initialHeight)
