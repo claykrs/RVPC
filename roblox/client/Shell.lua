@@ -287,8 +287,19 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 				local disks = machine.floppyDisks
 				if disks and machine.fdc then
 					local screen = machine:outputText()
+					-- the guest labels diskettes "x86-DSK1"; the table keys are
+					-- "x86DSK01", so normalize punctuation and pad the number
 					local label = string.match(screen, "diskette %S+ %((.-)%) in A")
-					local image = label and disks[label]
+					local image = nil
+					if label then
+						local tag = string.upper(string.gsub(label, "[^%w]", ""))
+						local num = string.match(tag, "^X86DSK(%d+)$")
+						if num then
+							image = disks["x86DSK" .. string.format("%02d", tonumber(num))]
+						elseif tag == "X86BOOT" then
+							image = disks.x86BOOT
+						end
+					end
 					local drive = machine.fdc.drives[1]
 					if image and drive and drive.image ~= image then
 						drive.image = image
