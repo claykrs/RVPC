@@ -179,6 +179,11 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		shellGui:SetAttribute("MachineReady", true)
 	end
 
+	-- headless-driving hook: external drivers (Studio execute_luau on the
+	-- Client datamodel) reach the machine, drive installs, and snapshot C:
+	-- selene: allow(global_usage)
+	_G.RvpcMachine = machine
+
 	if okView then
 		view.Frame.AnchorPoint = Vector2.new(0.5, 0.5)
 		view.Frame.Position = UDim2.fromScale(0.5, 0.47)
