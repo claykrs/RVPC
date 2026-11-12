@@ -8,6 +8,7 @@
 
 const Players = game:GetService("Players")
 const RunService = game:GetService("RunService")
+const HttpService = game:GetService("HttpService")
 const UserInputService = game:GetService("UserInputService")
 
 const Boot = require(script.Parent.Boot)
@@ -179,10 +180,51 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		shellGui:SetAttribute("MachineReady", true)
 	end
 
-	-- headless-driving hook: external drivers (Studio execute_luau on the
-	-- Client datamodel) reach the machine, drive installs, and snapshot C:
-	-- selene: allow(global_usage)
-	_G.RvpcMachine = machine
+	-- headless-driving hook: Studio execute_luau (Client datamodel) invokes
+	-- RvpcCmd to read the guest screen, send keys, and snapshot drive C: over
+	-- HttpService POSTs to a host-side listener
+	local cmd = Instance.new("BindableFunction")
+	cmd.Name = "RvpcCmd"
+	cmd.Parent = gui
+	cmd.OnInvoke = function(command: string): string
+		local verb, a, b = string.match(command, "^(%a+) (%S+) (%S+)$")
+		if not verb then
+			verb = string.match(command, "^(%a+)$")
+		end
+		if not machine or not verb then
+			return "ERR no machine or bad verb"
+		end
+		if verb == "screen" then
+			return machine:outputText()
+		elseif verb == "key" then
+			local code = tonumber(a)
+			if code then
+				machine:pressKey(code)
+				machine:releaseKey(code)
+				return "key " .. a
+			end
+			return "ERR bad key"
+		elseif verb == "swap" then
+			local image = machine.floppyDisks and machine.floppyDisks[a]
+			local drive = machine.fdc and machine.fdc.drives[1]
+			if image and drive then
+				drive.image = image
+				drive.mediaChanged = true
+				return "swap " .. a
+			end
+			return "ERR swap " .. tostring(a)
+		elseif verb == "dump" and HttpService then
+			local image = machine.ide.master.image
+			local off = tonumber(a) or 0
+			local len = tonumber(b) or 0
+			if image and len > 0 and off + len <= buffer.len(image) then
+				HttpService:PostAsync(b, buffer.readstring(image, off, len))
+				return "dumped " .. off .. "+" .. len
+			end
+			return "ERR dump bounds"
+		end
+		return "ERR unknown " .. tostring(command)
+	end
 
 	if okView then
 		view.Frame.AnchorPoint = Vector2.new(0.5, 0.5)
