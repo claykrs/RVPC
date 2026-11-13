@@ -27,6 +27,7 @@ const ST_ERR = 0x01
 const ST_DRQ = 0x08
 const ST_DSC = 0x10
 const ST_DRDY = 0x40
+const ST_BSY = 0x80
 
 const ATA_IDENTIFY = 0xEC
 const ATA_READ = 0x20
@@ -52,6 +53,15 @@ const ASC_INVALID_FIELD = 0x24
 const ASC_MEDIUM_NOT_PRESENT = 0x3A
 const ASC_MEDIA_REMOVAL_PREVENTED = 0x53
 const MAX_ATAPI_SECTORS = 2048
+
+-- A real device stays busy for a short period after the host hands over the
+-- last word of a PIO write (committing the sector) before signalling
+-- completion with DRDY + INTRQ. Guests drive the whole channel state machine
+-- off that interrupt, so completing the write instantly at the last data
+-- write makes the completion observable through the status register BEFORE
+-- the interrupt and double-signals the event. The delay is counted in
+-- advance() cycles (machine steps).
+const WRITE_COMPLETION_DELAY = 200
 
 export type Partition = {
 	index: number,
@@ -115,6 +125,9 @@ export type Ide = typeof(setmetatable(
 		packetPos: number,
 		pktCdb: boolean,
 		pktData: boolean,
+		-- ATAPI interrupt-reason phase: 1 = CDB accept (CoD=1), 2 = data
+		-- transfer (I/O=1), 3 = command completed (CoD=1, I/O=1). 0 = idle.
+		packetPhase: number,
 		features: number,
 		atapiDma: boolean,
 		irqPending: boolean,
@@ -130,6 +143,8 @@ export type Ide = typeof(setmetatable(
 		dirty: boolean,
 		dirtyFirstSector: number?,
 		dirtyLastSector: number?,
+		-- Cycles left before a pending PIO write completion goes DRDY.
+		writeDoneCycles: number,
 		diskDirty: (self: Ide) -> boolean,
 		clearDiskDirty: (self: Ide) -> (),
 		dirtySectorRange: (self: Ide) -> (number?, number?),
@@ -143,6 +158,7 @@ export type Ide = typeof(setmetatable(
 		bmOut16: (self: Ide, port: number, value: number) -> (),
 		bmIn32: (self: Ide, port: number) -> number,
 		bmOut32: (self: Ide, port: number, value: number) -> (),
+		advance: (self: Ide) -> (),
 		takeIrq: (self: Ide) -> boolean,
 		reset: (self: Ide) -> (),
 	},
@@ -201,6 +217,7 @@ function Ide.new(config: Config?): Ide
 	self.packetPos = 0
 	self.pktCdb = false
 	self.pktData = false
+	self.packetPhase = 0
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
@@ -216,20 +233,23 @@ function Ide.new(config: Config?): Ide
 	self.dirty = false
 	self.dirtyFirstSector = nil
 	self.dirtyLastSector = nil
+	self.writeDoneCycles = 0
 	return self
 end
 
-function Ide.reset(self: Ide)
-	self.selected = self.master
-	self.selectedIndex = 0
+-- ATA SRST (device control bit 2) resets both devices on the channel. The
+-- host's drive-select register and the nIEN bit are not part of the device
+-- reset, so the selected drive and deviceControl are preserved by this helper.
+local function softReset(self: Ide)
 	self.transfer = nil
 	self.packetPos = 0
 	self.pktCdb = false
 	self.pktData = false
+	self.packetPhase = 0
 	self.features = 0
 	self.atapiDma = false
 	self.irqPending = false
-	self.deviceControl = 0
+	self.writeDoneCycles = 0
 	self.master.status = if self.master.present then bor(ST_DRDY, ST_DSC) else 0
 	self.slave.status = if self.slave.present then bor(ST_DRDY, ST_DSC) else 0
 	self.master.error = 0
@@ -240,6 +260,14 @@ function Ide.reset(self: Ide)
 	self.senseAsc = 0
 	self.senseAscq = 0
 	self.mediaLocked = false
+end
+
+function Ide.reset(self: Ide)
+	self.selected = self.master
+	self.selectedIndex = 0
+	self.deviceControl = 0
+	self.writeDoneCycles = 0
+	softReset(self)
 	self.bmCmd = 0
 	self.bmStatus = BM_STATUS_DMA_CAP
 	self.bmPrdt = 0
@@ -331,6 +359,9 @@ local function finish(self: Ide, status: number)
 	self.transfer = nil
 	self.pktCdb = false
 	self.pktData = false
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -396,7 +427,13 @@ local function completeWrite(self: Ide, transfer: Transfer)
 		buffer.copy(drive.image, transfer.lba * 512, transfer.buffer, 0, transfer.length)
 		markDiskDirty(self, transfer.lba, math.floor(transfer.length / 512))
 	end
-	finish(self, bor(ST_DRDY, ST_DSC))
+	-- The device received all sector data; hold BSY for the media-commit
+	-- period before signalling completion (see WRITE_COMPLETION_DELAY).
+	self.transfer = nil
+	self.pktCdb = false
+	self.pktData = false
+	self.writeDoneCycles = WRITE_COMPLETION_DELAY
+	self.selected.status = ST_BSY
 end
 
 function Ide.diskDirty(self: Ide): boolean
@@ -517,6 +554,9 @@ function dmaFinish(self: Ide, ok: boolean)
 			bor(band(self.bmStatus, bit32.bnot(BM_STATUS_ACTIVE)), BM_STATUS_ERROR, BM_STATUS_INT)
 	end
 	self.transfer = nil
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -558,6 +598,9 @@ local function failCommand(self: Ide, errorCode: number)
 	self.transfer = nil
 	self.pktCdb = false
 	self.pktData = false
+	if self.packetPhase ~= 0 then
+		self.packetPhase = 3
+	end
 	self.irqPending = true
 end
 
@@ -604,6 +647,9 @@ local function atapiReply(self: Ide, data: buffer, allocation: number)
 	else
 		beginRead(self, data)
 	end
+	if self.transfer ~= nil then
+		self.packetPhase = 2
+	end
 	self.irqPending = true
 end
 
@@ -634,6 +680,9 @@ local function atapiRead(self: Ide, lba: number, count: number)
 	const data = buffer.create(count * 2048)
 	buffer.copy(data, 0, image, lba * 2048, count * 2048)
 	beginRead(self, data)
+	if self.transfer ~= nil then
+		self.packetPhase = 2
+	end
 	self.irqPending = true
 end
 
@@ -1041,16 +1090,20 @@ local function packetReady(self: Ide): boolean
 end
 
 local function command(self: Ide, cmd: number)
+	-- A guest should not issue commands while the device is busy committing a
+	-- write; if it does, the commit completes immediately first.
+	if self.writeDoneCycles > 0 then
+		self.writeDoneCycles = 0
+		finish(self, bor(ST_DRDY, ST_DSC))
+	end
 	self.commandCount += 1
 	self.lastCommand = cmd
+	self.packetPhase = 0
 	const drive = self.selected
 	if not drive.present then
-		-- No device on this position: report ABRT without asserting the shared
-		-- channel IRQ. SeaBIOS probes both secondary positions and must not
-		-- leave a stale IRQ15 pending for Windows.
-		drive.error = 0x04
-		self.lastError = 0x04
-		drive.status = bor(ST_DRDY, ST_ERR)
+		-- Unreachable through Ide.out8 (empty positions swallow command
+		-- writes), but keep the position inert if a command ever lands here:
+		-- no device means no status change, no error register and no IRQ.
 		self.transfer = nil
 		self.irqPending = false
 		return
@@ -1064,6 +1117,13 @@ local function command(self: Ide, cmd: number)
 		self.identifyCount += 1
 		if drive.kind ~= "hdd" then
 			failCommand(self, 0x04)
+			-- ATAPI devices keep the reset signature (0x14/0xEB in the
+			-- cylinder registers) after an aborted IDENTIFY DEVICE. DOS
+			-- ATAPI probes use ABRT + this signature pair to distinguish a
+			-- CD-ROM from an ATA disk.
+			if drive.kind == "cdrom" then
+				drive.sig = true
+			end
 			return
 		end
 		beginRead(self, identify(drive))
@@ -1137,6 +1197,7 @@ local function command(self: Ide, cmd: number)
 		self.packetPos = 0
 		self.pktCdb = true
 		self.pktData = false
+		self.packetPhase = 1
 		self.atapiDma = band(self.features, 0x01) ~= 0 and dmaReady(self, true)
 		drive.status = bor(ST_DRDY, ST_DSC, ST_DRQ)
 	elseif
@@ -1157,6 +1218,8 @@ local function command(self: Ide, cmd: number)
 		drive.sig = true
 		drive.error = 0
 		finish(self, bor(ST_DRDY, ST_DSC))
+		-- DEVICE RESET asserts INTRQ when the device is ready again.
+		self.irqPending = true
 	else
 		failCommand(self, 0x04)
 	end
@@ -1215,6 +1278,33 @@ end
 function Ide.out8(self: Ide, port: number, value: number)
 	value = band(value, 0xFF)
 	const offset = port - self.base
+	if port == self.altBase then
+		-- SRST is level-sensitive but the device reset occurs on the 0->1
+		-- transition. Clear any stale ERR/DRQ and reload both signatures;
+		-- the host's selected drive and nIEN bit survive the reset.
+		if band(value, 0x04) ~= 0 and band(self.deviceControl, 0x04) == 0 then
+			softReset(self)
+		end
+		self.deviceControl = value
+		return
+	end
+	if offset == 6 then
+		self.driveHead = value
+		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
+		self.selected = if self.selectedIndex == 0 then self.master else self.slave
+		if band(value, 0x40) ~= 0 then
+			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
+		end
+		return
+	end
+	-- The remaining task-file registers live in the selected device. With no
+	-- device at that position the writes are lost on the floating bus: nothing
+	-- latches, no signature is disturbed, no command runs and no IRQ is
+	-- raised. Answering as a live controller that rejects commands makes
+	-- drivers probe phantom devices on empty channels.
+	if not self.selected.present then
+		return
+	end
 	if offset == 0 then
 		if self.transfer and self.transfer.write then
 			writeDataByte(self, value)
@@ -1244,21 +1334,20 @@ function Ide.out8(self: Ide, port: number, value: number)
 	elseif offset == 5 then
 		self.lba = bor(band(self.lba, 0xFF00FFFF), lshift(value, 16))
 		self.selected.sig = false
-	elseif offset == 6 then
-		self.driveHead = value
-		self.selectedIndex = if band(value, 0x10) ~= 0 then 1 else 0
-		self.selected = if self.selectedIndex == 0 then self.master else self.slave
-		if band(value, 0x40) ~= 0 then
-			self.lba = bor(band(self.lba, 0x00FFFFFF), lshift(band(value, 0x0F), 24))
-		end
 	elseif offset == 7 then
 		command(self, value)
-	elseif port == self.altBase then
-		self.deviceControl = value
 	end
 end
 
 function Ide.in8(self: Ide, port: number): number
+	-- An unpopulated device position leaves the task file floating: the whole
+	-- register file (status, error, interrupt reason, signatures, data) reads
+	-- as 0xFF, the way an empty ISA/PCI IDE bus does. Drivers treat any 0xFF
+	-- status as "nothing here" and skip the position; answering with a live
+	-- controller's 0x00/0x41 makes them probe phantom devices.
+	if not self.selected.present then
+		return 0xFF
+	end
 	const offset = port - self.base
 	if offset == 0 then
 		return readDataByte(self)
@@ -1269,12 +1358,16 @@ function Ide.in8(self: Ide, port: number): number
 			return sigRegister(self.selected, 2)
 		end
 		-- During packet transfers the sector-count register is the interrupt
-		-- reason: REL bit 2, I/O bit 1, CoD bit 0. CDB delivery is CoD=1.
+		-- reason: REL bit 2, I/O bit 1, CoD bit 0. CDB delivery is CoD=1,
+		-- data-to-host is I/O=1, and command completion is CoD=1 with I/O=1.
 		if self.pktCdb then
 			return 0x01
 		end
 		if self.pktData and self.transfer ~= nil then
 			return if self.transfer.write then 0x00 else 0x02
+		end
+		if self.packetPhase == 3 then
+			return 0x03
 		end
 		return self.sectorCount
 	elseif offset == 3 then
@@ -1415,6 +1508,18 @@ function Ide.bmOut32(self: Ide, port: number, value: number)
 		self:bmOut8(port + 2, band(rshift(value, 16), 0xFF))
 	elseif offset == 4 then
 		self.bmPrdt = band(value, 0xFFFFFFFC)
+	end
+end
+
+-- One machine step: retires the pending PIO write completion when its media
+-- commit period has elapsed. The host sees BSY until then and DRDY + INTRQ
+-- after, matching the timing real drivers sequence their state machine on.
+function Ide.advance(self: Ide)
+	if self.writeDoneCycles > 0 then
+		self.writeDoneCycles -= 1
+		if self.writeDoneCycles == 0 then
+			finish(self, bor(ST_DRDY, ST_DSC))
+		end
 	end
 end
 

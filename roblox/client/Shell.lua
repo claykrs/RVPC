@@ -8,6 +8,7 @@
 
 const Players = game:GetService("Players")
 const RunService = game:GetService("RunService")
+const HttpService = game:GetService("HttpService")
 const UserInputService = game:GetService("UserInputService")
 
 const Boot = require(script.Parent.Boot)
@@ -164,9 +165,71 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 	end
 
 	local okView, view = pcall(RvpcUi.VgaView.new, vga, display, {
-		size = UDim2.fromScale(0.96, 0.9),
+		integerScale = true,
+		integerScaleY = 0.56,
 		background = Color3.new(0, 0, 0),
 	})
+	-- headless-driving hook: client-side Luau (execute_luau on the Client
+	-- datamodel) reaches the machine through the shell attribute
+	local shellGui = Instance.new("ScreenGui")
+	shellGui.Name = "RvpcShellGui"
+	shellGui.Parent = (cfg.container :: any)
+		or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+	shellGui:SetAttribute("HasMachine", true)
+	if machine then
+		shellGui:SetAttribute("MachineReady", true)
+	end
+
+	-- headless-driving hook: Studio execute_luau (Client datamodel) invokes
+	-- RvpcCmd to read the guest screen, send keys, and snapshot drive C: over
+	-- HttpService POSTs to a host-side listener
+	local cmd = Instance.new("BindableFunction")
+	cmd.Name = "RvpcCmd"
+	cmd.Parent = gui
+	cmd.OnInvoke = function(command: string): string
+		local verb, a, b = string.match(command, "^(%a+) (%S+) (%S+)$")
+		if not verb then
+			verb = string.match(command, "^(%a+)$")
+		end
+		if not machine or not verb then
+			return "ERR no machine or bad verb"
+		end
+		if verb == "screen" then
+			return machine:outputText()
+		elseif verb == "key" then
+			local code = tonumber(a)
+			if code then
+				if machine.kbc then
+					-- external drivers have no input lock: arm the keyboard
+					machine.kbc.keyboardEnabled = true
+				end
+				machine:pressKey(code)
+				machine:releaseKey(code)
+				return "key " .. a
+			end
+			return "ERR bad key"
+		elseif verb == "swap" then
+			local image = machine.floppyDisks and machine.floppyDisks[a]
+			local drive = machine.fdc and machine.fdc.drives[1]
+			if image and drive then
+				drive.image = image
+				drive.mediaChanged = true
+				return "swap " .. a
+			end
+			return "ERR swap " .. tostring(a)
+		elseif verb == "dump" and HttpService then
+			local image = machine.ide.master.image
+			local off = tonumber(a) or 0
+			local len = tonumber(b) or 0
+			if image and len > 0 and off + len <= buffer.len(image) then
+				HttpService:PostAsync(b, buffer.readstring(image, off, len))
+				return "dumped " .. off .. "+" .. len
+			end
+			return "ERR dump bounds"
+		end
+		return "ERR unknown " .. tostring(command)
+	end
+
 	if okView then
 		view.Frame.AnchorPoint = Vector2.new(0.5, 0.5)
 		view.Frame.Position = UDim2.fromScale(0.5, 0.47)
@@ -191,7 +254,13 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 	local frames = 0
 	local statusTime = 0
 	local textTime = 0
+	local screenTime = 0
 	local fps = 0
+	local machineMsTotal = 0
+	local pollMsTotal = 0
+	local pollCount = 0
+	local stepsMark = 0
+	local maxFrameMs = 0
 	local running = true
 
 	local function statusText(): string
@@ -239,8 +308,13 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 		if not running then
 			return
 		end
+		if dt * 1000 > maxFrameMs then
+			maxFrameMs = dt * 1000
+		end
 		const ok, err = pcall(function()
 			input:Step()
+			local machineMs = 0
+			local pollMs = 0
 			if machine then
 				const started = os.clock()
 				const budget = cfg.timeBudget or 0.006
@@ -255,6 +329,7 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 						break
 					end
 				until frameSteps >= maxSteps or os.clock() - started >= budget
+				machineMs = (os.clock() - started) * 1000
 			end
 			-- Text-mode writes land in plain B8000 RAM, not the VGA aperture, so
 			-- the core cannot see them dirty. Repaint text mode at 20 Hz; the
@@ -269,14 +344,64 @@ function Shell.start(Rvpc: any, RvpcUi: any, options: Options?): Shell?
 			then
 				forceText = true
 				textTime = 0
+				-- publish the guest's top screen lines for external drivers
+				local text = machine:outputText()
+				local first = string.match(text, "[^\n]+") or ""
+				background:SetAttribute("ScreenLine", first)
+				screenTime += dt
+				if screenTime >= 2 then
+					screenTime = 0
+					background:SetAttribute("ScreenText", string.sub(text, 1, 1200))
+				end
+				-- FreeDOS floppy-edition install support: when the guest asks
+				-- for a package diskette, swap the image into drive A. The
+				-- boot factory exposes the embedded set as machine.floppyDisks.
+				local disks = machine.floppyDisks
+				if disks and machine.fdc then
+					local screen = machine:outputText()
+					-- the guest labels diskettes "x86-DSK1"; the table keys are
+					-- "x86DSK01", so normalize punctuation and pad the number
+					local label = string.match(screen, "diskette %S+ %((.-)%) in A")
+					local image = nil
+					if label then
+						local tag = string.upper(string.gsub(label, "[^%w]", ""))
+						local num = string.match(tag, "^X86DSK(%d+)$")
+						if num then
+							image = disks["x86DSK" .. string.format("%02d", tonumber(num))]
+						elseif tag == "X86BOOT" then
+							image = disks.x86BOOT
+						end
+					end
+					local drive = machine.fdc.drives[1]
+					if image and drive and drive.image ~= image then
+						drive.image = image
+						drive.mediaChanged = true
+					end
+				end
 			end
 			if view then
+				const pollStart = os.clock()
 				view:Poll(forceText)
+				pollMs = (os.clock() - pollStart) * 1000
 			end
+			-- perf telemetry for live tuning (read from the Studio property panel)
+			machineMsTotal += machineMs
+			pollMsTotal += pollMs
+			pollCount += 1
 			frames += 1
 			statusTime += dt
 			if statusTime >= 0.5 then
 				fps = frames / statusTime
+				gui:SetAttribute("RvpcFps", math.floor(fps))
+				gui:SetAttribute("RvpcMachineMs", math.floor(machineMsTotal / frames * 10) / 10)
+				gui:SetAttribute("RvpcPollMs", math.floor(pollMsTotal / frames * 100) / 100)
+				gui:SetAttribute("RvpcStepsPerS", math.floor((steps - stepsMark) / statusTime))
+				gui:SetAttribute("RvpcMaxFrameMs", math.floor(maxFrameMs * 10) / 10)
+				maxFrameMs = 0
+				machineMsTotal = 0
+				pollMsTotal = 0
+				pollCount = 0
+				stepsMark = steps
 				frames = 0
 				statusTime = 0
 				refreshStatus()

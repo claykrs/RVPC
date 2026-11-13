@@ -7,6 +7,7 @@ const Ide = require("../core/Ide")
 const Memory = require("../core/Memory")
 const Cpu = require("../core/Cpu")
 const Pic = require("../core/Pic")
+const Cmos = require("../core/Cmos")
 const Machine = require("../core/Machine")
 
 const TESTS = {}
@@ -220,6 +221,13 @@ T("ata_identify_and_read", function(expect)
 	expect(buffer.readu8(sector, 15) == 0xAF, "sector tail")
 end)
 
+-- Advance the write-commit delay until the device reports ready.
+local function settleWrite(ide)
+	for _ = 1, 400 do
+		ide:advance()
+	end
+end
+
 T("ata_write_and_flush", function(expect)
 	const hdd = makeHdd()
 	const ide = Ide.new({ hdd = hdd })
@@ -234,8 +242,80 @@ T("ata_write_and_flush", function(expect)
 	end
 	expect(buffer.readu16(hdd, 100 * 512) == 0x5A00, "first word")
 	expect(buffer.readu16(hdd, 100 * 512 + 510) == 0x5AFF, "last word")
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "device not busy during write commit")
+	settleWrite(ide)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "not ready after write commit")
 	ide:out8(0x1F7, 0xE7)
 	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "not ready after flush")
+end)
+
+T("ata_write_commit_busy_then_ready", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	-- The DRQ-ready interrupt fires at command issue; the host consumes it.
+	expect(ide:takeIrq(), "write DRQ-ready IRQ missing")
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	-- The device holds BSY and raises no interrupt while committing.
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "commit did not assert BSY")
+	expect(not ide:takeIrq(), "commit IRQ fired before the commit period ended")
+	for _ = 1, 100 do
+		ide:advance()
+	end
+	expect(band(ide:in8(0x1F7), 0x80) ~= 0, "commit period ended too early")
+	-- The completion is signalled exactly once, with the interrupt.
+	settleWrite(ide)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "commit did not end ready")
+	expect(ide:takeIrq(), "commit completion IRQ missing")
+	expect(not ide:takeIrq(), "commit completion IRQ latched twice")
+end)
+
+T("ata_write_commit_interruptible_by_command", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	ide:advance()
+	-- A guest issuing a command during the commit period first gets the
+	-- pending completion, then the command runs.
+	ide:out8(0x1F7, 0xE7)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "flush did not report ready")
+	expect(ide:takeIrq(), "pending commit IRQ missing after flush")
+end)
+
+T("ata_write_commit_cancelled_by_srst", function(expect)
+	const hdd = makeHdd()
+	const ide = Ide.new({ hdd = hdd })
+	selectDrive(ide, false)
+	ide:out8(0x1F2, 1)
+	ide:out8(0x1F3, 100)
+	ide:out8(0x1F4, 0)
+	ide:out8(0x1F5, 0)
+	ide:out8(0x1F7, 0x30)
+	for index = 0, 255 do
+		ide:out16(0x1F0, 0x5A00 + index)
+	end
+	ide:advance()
+	-- SRST cancels the pending completion without signalling it.
+	ide:out8(0x3F6, 0x06)
+	expect(ide.writeDoneCycles == 0, "SRST left the commit pending")
+	ide:out8(0x3F6, 0x02)
+	expect(band(ide:in8(0x1F7), 0x40) ~= 0, "SRST did not clear busy")
+	expect(not ide:takeIrq(), "cancelled commit raised an interrupt")
 end)
 
 local function writeSectors(ide, lba, count, firstWord)
@@ -400,6 +480,53 @@ T("atapi_signature_and_device_reset", function(expect)
 	expect(band(ide:in8(0x1F7), 0x09) == 0, "DEVICE RESET left BSY or ERR set")
 	expect(ide:in8(0x1F4) == 0x14, "DEVICE RESET did not reload ATAPI cylinder low")
 	expect(ide:in8(0x1F5) == 0xEB, "DEVICE RESET did not reload ATAPI cylinder high")
+	expect(ide:takeIrq(), "DEVICE RESET did not assert IRQ")
+end)
+
+T("ata_srst_clears_stale_error_and_reloads_signature", function(expect)
+	const ide = Ide.new({ hdd = makeHdd(), cdrom = makeIso() })
+	-- What OAKCDROM does to an ATA master while looking for an ATAPI device:
+	-- IDENTIFY PACKET aborts and leaves ERR/ABRT behind.
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xA1)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "A1 on ATA did not report ERR")
+	expect(ide.master.error == 0x04, "A1 on ATA did not report ABRT")
+	-- Put the channel in a transfer/IRQ state on the CD.
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA0)
+	submitPacket(ide, { 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide.irqPending, "CD packet did not latch IRQ")
+	-- Assert SRST with nIEN set. Both signatures must reload, the transfer and
+	-- IRQ must clear, and the host's drive select/nIEN must survive.
+	ide:out8(0x3F6, 0x06)
+	expect(ide.master.status == 0x50 and ide.master.error == 0, "SRST left ATA master in error")
+	expect(ide.slave.status == 0x50 and ide.slave.error == 0, "SRST left ATAPI slave in error")
+	expect(ide.transfer == nil, "SRST left a transfer armed")
+	expect(not ide.irqPending, "SRST left IRQ pending")
+	expect(ide.selectedIndex == 1, "SRST changed the host's selected drive")
+	expect(band(ide.deviceControl, 0x02) ~= 0, "SRST cleared nIEN")
+	expect(ide:in8(0x1F2) == 0x01, "SRST did not reload sector count")
+	expect(ide:in8(0x1F4) == 0x14 and ide:in8(0x1F5) == 0xEB, "SRST did not reload ATAPI signature")
+	selectDrive(ide, false)
+	expect(ide:in8(0x1F4) == 0x00 and ide:in8(0x1F5) == 0x00, "SRST did not reload ATA signature")
+	-- The falling edge must not reset a drive that has a real error.
+	ide.master.error = 0x04
+	ide.master.status = 0x41
+	ide:out8(0x3F6, 0x02)
+	expect(ide.master.error == 0x04, "SRST falling edge reset the drive")
+end)
+
+T("ata_identify_recovers_after_atapi_probe", function(expect)
+	const ide = Ide.new({ hdd = makeHdd() })
+	selectDrive(ide, false)
+	ide:out8(0x1F7, 0xA0)
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "PACKET on ATA did not fail")
+	-- A normal ATA IDENTIFY must clear the stale ABRT and return data.
+	ide:out8(0x1F7, 0xEC)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY after PACKET probe did not assert DRQ")
+	expect(ide:in8(0x1F1) == 0x00, "IDENTIFY kept stale error")
+	const words = readWords(ide, 256)
+	expect(words[1] == 0x0040, string.format("IDENTIFY word0=%04X", words[1]))
 end)
 
 T("atapi_capacity_and_toc", function(expect)
@@ -773,6 +900,76 @@ T("ata_nien_suppresses_irq", function(expect)
 	expect(not ide:takeIrq(), "nIEN did not suppress the IRQ")
 	ide.deviceControl = 0
 	expect(ide:takeIrq(), "IRQ did not appear after clearing nIEN")
+end)
+
+T("atapi_packet_phase_interrupt_reason", function(expect)
+	const ide = Ide.new({ hdd = makeHdd(), cdrom = makeIso() })
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA0)
+	-- CDB accept: CoD=1, I/O=0, byte count limit 12.
+	expect(ide:in8(0x1F2) == 0x01, "CDB accept phase")
+	expect(ide:in8(0x1F4) == 0x0C, "CDB accept byte count low")
+	submitPacket(ide, { 0x12, 0, 0, 0, 36, 0 })
+	-- Data ready: CoD=0, I/O=1.
+	expect(ide:in8(0x1F2) == 0x02, "data phase")
+	-- Draining the data completes the command; the interrupt reason must
+	-- then report CoD=1 with I/O=1 (the Win9x drivers require this).
+	readBytes(ide, 36)
+	expect(ide:in8(0x1F2) == 0x03, "completion phase")
+	expect(band(ide:in8(0x1F7), 0x09) == 0, "completion left BSY or ERR")
+	-- A non-data packet command completes straight into the completion phase.
+	sendPacket(ide, { 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide:in8(0x1F2) == 0x03, "non-data completion phase")
+	-- A rejected opcode reports the completion phase with ERR set.
+	sendPacket(ide, { 0xEE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 })
+	expect(ide:in8(0x1F2) == 0x03, "failed packet completion phase")
+	expect(band(ide:in8(0x1F7), 0x01) ~= 0, "bad opcode did not report ERR")
+	-- The next PACKET command restarts the phases.
+	sendPacket(ide, { 0x12, 0, 0, 0, 36, 0 })
+	expect(ide:in8(0x1F2) == 0x02, "data phase after resend")
+end)
+
+T("atapi_completion_irq_survives_slave_mask", function(expect)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu, Pic = Pic, Ide = Ide }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = "486" },
+		cdrom = makeIso(),
+	})
+	const io = m.cpu.io
+	m.pic.master.imr = 0
+	m.pic.slave.imr = 0
+	selectDrive(m.ide, true)
+	io.out8(0x1F7, 0xA0)
+	submitPacket(m.ide, { 0x12, 0, 0, 0, 36, 0 })
+	expect(m.ide.irqPending, "INQUIRY data-ready IRQ missing")
+	m.cpu.halted = true
+	m.cpu.flags = bor(band(m.cpu.flags, 0xFFFF), 0x202)
+	m.cpu.ss = 0
+	m.cpu:setSP(0x7000)
+	m:run(1)
+	expect(m.irqCount == 1, ("data-ready irqCount=%d"):format(m.irqCount))
+	-- The driver's handler ends with a slave EOI followed by a master EOI.
+	io.out8(0xA0, 0x20)
+	io.out8(0x20, 0x20)
+	-- The OTI-91x driver masks IRQ14 around the data phase and unmasks it
+	-- only when it is ready to wait for completion. The request raised while
+	-- masked must not assert the master cascade, and it must surface once the
+	-- slave is unmasked instead of being dropped.
+	io.out8(0xA1, 0x40)
+	readPortBytes(io, 0x1F0, 36)
+	m.cpu.halted = true
+	m:run(1)
+	expect(band(m.pic.slave.irr, 0x40) ~= 0, "completion request lost while masked")
+	expect(band(m.pic.master.irr, 0x04) == 0, "cascade asserted for a masked slave request")
+	expect((m.cpu.intCounts[0x0A] or 0) == 0, "spurious cascade vector 0x0A dispatched")
+	io.out8(0xA1, 0x00)
+	m.cpu.halted = true
+	m.cpu.flags = bor(band(m.cpu.flags, 0xFFFF), 0x202)
+	m:run(1)
+	expect(m.irqCount == 2, ("completion irqCount=%d"):format(m.irqCount))
+	expect(band(m.pic.slave.isr, 0x40) ~= 0, "IRQ14 not in service")
+	expect(band(m.pic.master.isr, 0x04) ~= 0, "IRQ14 cascade not in service")
+	expect(io.in8(0x1F2) == 0x03, "completion phase register")
 end)
 
 T("piix3_bmdma_read_write", function(expect)
@@ -1160,6 +1357,7 @@ T("ata_pio_ignores_armed_bmide", function(expect)
 		512
 	)
 	expect(band(ide:bmIn8(0xC002), 0x04) == 0, "PIO write set BMIDE INT")
+	settleWrite(ide)
 	expect(ide:takeIrq(), "PIO write with armed BMIDE IRQ")
 end)
 
@@ -1176,6 +1374,35 @@ T("ata_read_rejects_cdrom", function(expect)
 	expect(ide:in8(0x1F1) == 0x04, "ATA READ to CD error register")
 	expect(ide:takeIrq(), "ATA READ to CD IRQ")
 	expect(buffer.readu8(iso, 0) == 0x46, "ATA READ mutated the CD image")
+end)
+
+T("ata_identify_device_on_atapi_preserves_signature", function(expect)
+	const ide = Ide.new({ cdrom = makeIso() })
+	selectDrive(ide, true)
+	-- Stale task-file values left by the preceding DEVICE RESET probe.
+	ide:out8(0x1F4, 0x24)
+	ide:out8(0x1F5, 0x00)
+	ide:out8(0x1F7, 0xEC) -- IDENTIFY DEVICE, must abort on the ATAPI device
+	const status = ide:in8(0x1F7)
+	expect(band(status, 0x01) ~= 0, "ATAPI IDENTIFY DEVICE did not set ERR")
+	expect(band(status, 0x40) ~= 0, "ATAPI IDENTIFY DEVICE did not stay DRDY")
+	expect(ide:in8(0x1F1) == 0x04, "ATAPI IDENTIFY DEVICE error is not ABRT")
+	expect(ide:in8(0x1F4) == 0x14, "1F4 did not return ATAPI signature low")
+	expect(ide:in8(0x1F5) == 0xEB, "1F5 did not return ATAPI signature high")
+	expect(ide.slave.sig, "ATAPI signature state was not preserved")
+	expect(ide:takeIrq(), "ATAPI IDENTIFY DEVICE IRQ")
+
+	-- A normal task-file write must clear the signature again.
+	ide:out8(0x1F5, 0x00)
+	expect(ide:in8(0x1F5) == 0x00, "task-file write did not clear the signature")
+
+	-- The next ATAPI command must still identify normally.
+	selectDrive(ide, true)
+	ide:out8(0x1F7, 0xA1)
+	expect(band(ide:in8(0x1F7), 0x08) ~= 0, "IDENTIFY PACKET after probe did not assert DRQ")
+	const id = readWords(ide, 256)
+	expect(id[1] == 0x85C0, string.format("ATAPI IDENTIFY PACKET word0=%04X", id[1]))
+	expect(ide:takeIrq(), "ATAPI IDENTIFY PACKET IRQ")
 end)
 
 if realIso then
@@ -1262,5 +1489,130 @@ if realIso then
 		expect(be32(toc, 16) == totalSectors, "real ISO leadout LBA=" .. be32(toc, 16))
 	end)
 end
+
+T("machine_int19_resets_ide_channels", function(expect)
+	const m = Machine.new({
+		Memory = Memory,
+		Cpu = Cpu,
+		Pic = Pic,
+		Cmos = Cmos,
+		Ide = Ide,
+	}, {
+		memorySize = 1024 * 1024,
+		hdd = buffer.create(32 * 1024 * 1024),
+	})
+	const ide = m.ide
+	ide.master.error = 0x04
+	ide.master.status = 0x41
+	ide.slave.error = 0x04
+	ide.slave.status = 0x41
+	const cpu = m.cpu
+	cpu:loadSeg("cs", 0x600)
+	cpu.ip = 0x100
+	cpu.halted = false
+	m.mem:write8(0x6100, 0xCD)
+	m.mem:write8(0x6101, 0x19)
+	m.mem:write8(0x6102, 0xF4)
+	m:run(8)
+	expect(ide.master.error == 0, ("master error=%02X"):format(ide.master.error))
+	expect(band(ide.master.status, 0x40) ~= 0, "master not ready after INT 19")
+	expect(ide.slave.status == 0, "absent slave should stay not-ready")
+end)
+
+-- An unpopulated device position must float the ISA/PCI bus: every task-file
+-- read returns 0xFF and writes are lost. The OTI-91X boot driver's detect loop
+-- (seg0:6ECF) treats status 0xFF as "no device" (ERR bit set -> flip -> fail
+-- the slot) and its scratch test (seg0:9548) needs IN 55 after OUT 55; a
+-- channel that answers 0x00/0x41 or latches registers makes it probe phantom
+-- ATAPI devices on the empty secondary/tertiary/quaternary channels.
+T("ide_empty_position_reads_float_ff", function(expect)
+	const ide = Ide.new({})
+	for _, slave in ipairs({ false, true }) do
+		selectDrive(ide, slave)
+		const ports = { 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7, 0x3F6 }
+		for _, port in ipairs(ports) do
+			expect(
+				ide:in8(port) == 0xFF,
+				("%s read %03X = %02X, want FF"):format(
+					slave and "slave" or "master",
+					port,
+					ide:in8(port)
+				)
+			)
+		end
+		expect(ide:in16(0x1F0) == 0xFFFF, "data word should float")
+	end
+end)
+
+T("ide_empty_position_writes_are_lost", function(expect)
+	const ide = Ide.new({})
+	selectDrive(ide, true)
+	ide:out8(0x1F2, 0x55)
+	ide:out8(0x1F4, 0x55) -- the driver's scratch-register test
+	ide:out8(0x1F5, 0x55)
+	expect(ide:in8(0x1F2) == 0xFF, "count register did not float")
+	expect(ide:in8(0x1F4) == 0xFF, "scratch test: wrote 55, want FF back")
+	expect(ide:in8(0x1F5) == 0xFF, "cyl-high did not float")
+	-- Commands execute nowhere: no status change, no error register, no IRQ.
+	ide:out8(0x1F7, 0xEC) -- IDENTIFY DEVICE
+	expect(ide:in8(0x1F7) == 0xFF, "IDENTIFY on empty position changed status")
+	expect(ide:in8(0x1F1) == 0xFF, "error register did not float")
+	expect(not ide.irqPending, "empty position raised IRQ14")
+	ide:out8(0x1F7, 0x08) -- DEVICE RESET
+	expect(ide:in8(0x1F7) == 0xFF, "DEVICE RESET on empty position changed status")
+	expect(not ide.irqPending, "DEVICE RESET on empty position raised IRQ14")
+	ide:out8(0x1F7, 0xA0) -- PACKET
+	expect(not ide.irqPending, "PACKET on empty position raised IRQ14")
+end)
+
+T("ide_empty_position_hides_atapi_signature", function(expect)
+	const ide = Ide.new({})
+	selectDrive(ide, true)
+	-- SRST is channel-level and still runs, but with no device the task file
+	-- keeps floating instead of reloading a signature.
+	ide:out8(0x3F6, 0x04)
+	ide:out8(0x3F6, 0x00)
+	expect(ide:in8(0x1F5) == 0xFF, "cyl-high should float, not report 0xEB")
+	expect(ide:in8(0x1F4) == 0xFF, "cyl-low should float, not report 0x14")
+	expect(ide:in8(0x1F7) == 0xFF, "status should float after SRST")
+end)
+
+T("ide_present_cd_signature_survives", function(expect)
+	const ide = Ide.new({ cdrom = makeIso() })
+	selectDrive(ide, true)
+	ide:out8(0x3F6, 0x04)
+	ide:out8(0x3F6, 0x00)
+	expect(ide:in8(0x1F5) == 0xEB, "ATAPI signature cyl-high")
+	expect(ide:in8(0x1F4) == 0x14, "ATAPI signature cyl-low")
+	-- The scratch registers of a live device still latch.
+	ide:out8(0x1F4, 0x55)
+	expect(ide:in8(0x1F4) == 0x55, "live device scratch test")
+end)
+
+T("machine_secondary_channel_is_empty_bus", function(expect)
+	const m = Machine.new({
+		Memory = Memory,
+		Cpu = Cpu,
+		Pic = Pic,
+		Cmos = Cmos,
+		Ide = Ide,
+	}, {
+		memorySize = 1024 * 1024,
+		hdd = buffer.create(32 * 1024 * 1024),
+	})
+	const io = m.cpu.io
+	-- Both secondary positions are empty: the driver probing 0x170 must see
+	-- the floating bus, including with the slave selected.
+	io.out8(0x176, 0xF0)
+	expect(io.in8(0x177) == 0xFF, "secondary slave status should float")
+	expect(io.in8(0x174) == 0xFF, "secondary slave cyl-low should float")
+	expect(io.in8(0x376) == 0xFF, "secondary alt status should float")
+	io.out8(0x177, 0xEC)
+	expect(io.in8(0x177) == 0xFF, "secondary IDENTIFY must not answer")
+	expect(not m.ide2.irqPending, "secondary probe must not raise IRQ15")
+	-- The primary slave (the CD) keeps its live response.
+	io.out8(0x1F6, 0xF0)
+	expect(band(io.in8(0x1F7), 0x40) ~= 0, "primary slave CD not ready")
+end)
 
 return TESTS

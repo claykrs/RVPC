@@ -75,9 +75,16 @@ function Pit.advance(self: Pit, cycles: number): boolean
 		local remaining = channel.counter - cycles
 		while remaining <= 0 do
 			remaining += period
-			channel.output = not channel.output
 			if index == 0 then
 				irq = true
+			end
+			-- Mode 0 (interrupt on terminal count) drives the output high at
+			-- the terminal count and leaves it high until reprogrammed. SeaBIOS
+			-- uses this on channel 2 for TSC calibration and polls PPI bit 5.
+			if channel.mode == 0 then
+				channel.output = true
+			else
+				channel.output = not channel.output
 			end
 		end
 		channel.counter = remaining

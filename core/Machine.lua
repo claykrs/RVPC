@@ -83,6 +83,7 @@ export type Machine = typeof(setmetatable(
 		pic: any?,
 		pit: any?,
 		cmos: any?,
+		rtcState: any?,
 		fwcfg: any?,
 		ide: any?,
 		ide2: any?,
@@ -114,10 +115,14 @@ export type Machine = typeof(setmetatable(
 		elcrMaster: number,
 		elcrSlave: number,
 		sb16Clock: number,
+		ppi: number,
 		lastInPort: number,
 		lastOutPort: number,
 		lastOutValue: number,
 		irqCount: number,
+		int19Count: number,
+		atResetVector: boolean,
+		booted: boolean,
 		debugLog: { string },
 		run: (self: Machine, maxSteps: number?) -> number,
 		reset: (self: Machine) -> (),
@@ -386,7 +391,9 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		if cfg.floppy1 and cfg.floppy1.image then
 			floppyType = bor(floppyType, 0x04) -- drive B: 1.44M
 		end
-		self.cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
+		const cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
+		self.cmos = cmos
+		self.rtcState = cmos.rtc
 	end
 	if deps.FwCfg then
 		self.fwcfg = deps.FwCfg.new(self.mem.size, cfg.vgaRom)
@@ -497,11 +504,15 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.elcrMaster = 0
 	self.elcrSlave = 0
 	self.sb16Clock = 0
+	self.ppi = 0
 	self.hostConfig = {}
 	self.lastInPort = 0
 	self.lastOutPort = 0
 	self.lastOutValue = 0
 	self.irqCount = 0
+	self.int19Count = 0
+	self.atResetVector = false
+	self.booted = false
 	self.debugLog = {}
 
 	local function pciAddressByte(index: number): number
@@ -587,11 +598,26 @@ function Machine.new(deps: Deps, config: Config?): Machine
 			if self.pit and port >= PIT_BASE and port <= PIT_BASE + 3 then
 				return self.pit:in8(port)
 			end
-			if self.cmos and (port == CMOS_INDEX or port == CMOS_DATA) then
+			if self.cmos and port == CMOS_INDEX then
+				return self.cmos:in8(port)
+			end
+			if self.cmos and port == CMOS_DATA then
 				return self.cmos:in8(port)
 			end
 			if port == PORT_A20 then
 				return if self.mem.a20 then 0x02 else 0x00
+			end
+			if port == 0x61 then
+				-- PPI port B: bits 0/1 are the speaker gate/data latch; bit 4
+				-- is the refresh toggle and bit 5 the timer-2 output. The AIC
+				-- ASPI delay loop only needs bit 4 to keep changing; the BIOS
+				-- TSC calibration waits on bit 5, so it must follow PIT 2.
+				local tsc = self.cpu and self.cpu.tsc or 0
+				return bor(
+					band(self.ppi, 0x03),
+					if band(rshift(tsc, 4), 1) ~= 0 then 0x10 else 0,
+					if self.pit and self.pit.channels[3].output then 0x20 else 0
+				)
 			end
 			if port >= PCI_ADDRESS and port <= PCI_ADDRESS + 3 then
 				return pciAddressByte(port - PCI_ADDRESS)
@@ -763,8 +789,16 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				self.pit:out8(port, value)
 				return
 			end
-			if self.cmos and (port == CMOS_INDEX or port == CMOS_DATA) then
+			if self.cmos and port == CMOS_INDEX then
 				self.cmos:out8(port, value)
+				return
+			end
+			if self.cmos and port == CMOS_DATA then
+				if self.cmos:out8(port, value) and self.pic then
+					-- Enabling an interrupt whose status C flag is already set
+					-- raises IRQ8 immediately, as on the real RTC.
+					self.pic:raise(8)
+				end
 				return
 			end
 			if port == PORT_A20 then
@@ -772,6 +806,10 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				if band(value, 0x01) ~= 0 then
 					self:reset()
 				end
+				return
+			end
+			if port == 0x61 then
+				self.ppi = band(value, 0x03)
 				return
 			end
 			if port >= PCI_ADDRESS and port <= PCI_ADDRESS + 3 then
@@ -931,6 +969,7 @@ function Machine.reset(self: Machine)
 		self.sb16:resetDsp()
 	end
 	self.sb16Clock = 0
+	self.ppi = 0
 	self.exitCode = nil
 end
 
@@ -952,6 +991,15 @@ function Machine.deliverInterrupt(self: Machine): boolean
 	return true
 end
 
+local function resetIdeChannels(self: Machine)
+	if self.ide then
+		self.ide:reset()
+	end
+	if self.ide2 then
+		self.ide2:reset()
+	end
+end
+
 function Machine.run(self: Machine, maxSteps: number?): number
 	local steps = 0
 	local idle = 0
@@ -965,11 +1013,28 @@ function Machine.run(self: Machine, maxSteps: number?): number
 	const ne2000 = self.ne2000
 	const sb16 = self.sb16
 	const fdc = self.fdc
+	const cmos = self.cmos
 	while steps < budget and not self.exitCode do
 		if pit then
 			if pit:advance(1) and pic then
 				pic:raise(0)
 			end
+		end
+		-- MC146818 clock and interrupt engine. The periodic tick is what
+		-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise IRQ8
+		-- through the same status C/IRQF path.
+		if cmos then
+			if cmos:advance(1) and pic then
+				pic:raise(8)
+			end
+		end
+		-- Retire pending PIO write completions (BSY -> DRDY + INTRQ) so guest
+		-- drivers observe the device-busy commit period of a real device.
+		if ide and ide.writeDoneCycles > 0 then
+			ide:advance()
+		end
+		if ide2 and ide2.writeDoneCycles > 0 then
+			ide2:advance()
 		end
 		if pic then
 			-- Each takeIrq is side-effect free unless its own pending/armed
@@ -1005,6 +1070,13 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			end
 		end
 		if cpu.halted then
+			-- The TSC is a free-running counter. BIOS timer waits (notably
+			-- INT 15h/AH=86h) use it to measure elapsed time; if it only
+			-- advanced on retired instructions, a halted CPU would make those
+			-- waits effectively infinite.
+			if cpu.tsc then
+				cpu.tsc += 1
+			end
 			if not self:deliverInterrupt() then
 				idle += 1
 				-- A halted CPU waits for the next timer tick; give a full 8254
@@ -1027,6 +1099,23 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				cpu:step()
 			end
 			idle = 0
+		end
+		-- A guest warm boot can re-enter the BIOS via INT 19h or the reset
+		-- vector without asserting IDE SRST. Reset the channels so a stale
+		-- OAKCDROM probe error cannot hide the HDD from the next boot's
+		-- SeaBIOS drive scan.
+		const int19 = cpu.intCounts[0x19] or 0
+		if int19 > self.int19Count then
+			self.int19Count = int19
+			resetIdeChannels(self)
+		end
+		const atResetVector = cpu.cs == 0xF000 and cpu.ip == 0xFFF0
+		if self.booted and atResetVector and not self.atResetVector then
+			resetIdeChannels(self)
+		end
+		self.atResetVector = atResetVector
+		if not self.booted and not atResetVector then
+			self.booted = true
 		end
 		steps += 1
 	end

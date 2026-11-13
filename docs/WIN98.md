@@ -20,15 +20,36 @@
 
 SeaBIOS boots the Win98 SE CD (El Torito, 1.44M floppy emulation) to the
 "Microsoft Windows 98 CD-ROM Startup Menu". With `2` (Boot from CD-ROM)
-answered, the CD's DOS startup image loads: the Windows 98 Startup Menu
-appears with its 29 s countdown, the OTI-91X ATAPI CD driver and the AIC-6260
-ASPI manager load, and the config.sys boot loop restarts when the CD driver
-gives up. SETUP never starts yet; the exact blocker is the OTI-91x IRQ
-handshake — the driver sets its completion flag and our controller raises
-IRQ14 with the slave PIC unmasked, but the driver's wait loop does not accept
-it and times out after 75 ticks. The working hypothesis list is edge/level
-timing, BSR/DRQ ordering in the packet completion phase, or leftover slave-PIC
-ISR state from the earlier El Torito boot.
+answered, the CD's DOS startup image loads and the OTI-91X ATAPI CD driver
+reports `Number of drives : 1`.
+
+The **stock** image now also works: the RTC periodic IRQ8 model (`41c1608`)
+lets SeaBIOS's `INT 15h/AH=86h` waits expire, so the AIC ASPI drivers finish
+and MSCDEX/OEMSETUP start. Both the stock ISO and the IDE-only
+`media/win98se-ide.iso` reach **Windows 98 Setup**, complete formatting, and
+run the CAB copy deep into protected mode.
+
+Resolved this pass (2026-11-13):
+
+- **CMPS/SCAS flag width** (`63caa8b`): `stringOp` passed its raw byte-count
+  width (2/4) to `doALU`, which silently fell through to 8-bit flags — every
+  CMPSW/CMPSD/SCASW judged a 16/32-bit compare by the low byte only. SETUP's
+  `repz cmpsw` walk of the BIOS device-header chain therefore matched
+  `"COMM    "` against `"COM1    "` (differs at word 1, low byte equal), the
+  kernel initialized the file's SFT entry as the COM1 character device, and
+  the 9280-byte write took the cooked device path — byte-at-a-time device
+  requests stopped at a stray Ctrl-Z and "succeeded" with AX=1820. Setup read
+  the short write as disk-full. This was the whole "temporary directory"
+  error; the FAT allocation path at FF39:CC8A was never at fault.
+- **Undefined opcodes deliver #UD in protected mode** (`7185937`): SETUP
+  deliberately executes `0F FF` after registering a #UD handler via
+  INT 31h AX=0203 BL=06 to test exception delivery; the core now raises
+  fault 6 through the IDT when PE=1 (real mode keeps the loud error).
+
+State: the copy phase runs to ~188M steps with ~276 more file operations
+than before (int21 12081, int13 740), and SETUP enters its protected-mode
+transition (CR0.PE=1, segment 0367). IDE/PIO, INT 13, ATAPI, FAT16 and
+HIMEM/UMB are otherwise healthy.
 
 Everything below it is green:
 
@@ -81,16 +102,38 @@ Windows media is **not** committed. Supply it locally:
 - **Menu shows and counts down, then a `bad FF /7` fault:** the harness did
   not answer the menu; the countdown path executes into the AIC ASPI data blob
   loaded at `0000:7C00`. Fixed by the harness `Boot from CD-ROM` injection.
-- **"No drives found, aborting installation":** the OTI-91X driver rejected
-  the CD. This is the current blocker. Reproduce with
-  `lune run tools/probe_win98_boot.lua 12` (millions of steps), which logs
-  IDE port traffic from the OTI banner on, snapshots the driver's IRQ
-  ownership (`CS:[68A4]`), its IRQ-received flag (`CS:[68A3]`), the IVT
-  76h target and the PIC state inside the wait loop (`028E:82A9-84A7`).
-  Observed at the stall: INQUIRY data fully transferred (18 words), completion
-  IRQ raised by the IDE, `IF=1`, slave PIC `irr=isr=00`, `imr=0x8E` (IRQ14
-  unmasked), `CS:[68A3]=1`, `CS:[68A4]=1`, IVT 76h = `028E:8560` - the driver
-  waits anyway until its 75-tick timeout.
+- **"No drives found, aborting installation":** two emulator bugs, both
+  fixed. (1, `ed95334`) The driver's ATA/ATAPI discrimination (resident
+  subcommand `AH=23h`, seg0:7D29) issues IDENTIFY DEVICE and requires
+  `ABRT` with the ATAPI signature `EB/14` left in `1F5/1F4`; the aborted
+  command now preserves it. (2) The registration loop (init segment
+  `0B5B/0B5F:0780`, 8 drive slots, drive count at `cs:03F0`) runs every
+  empty channel through the same detect: its `AH=0` handler (seg0:6ECF)
+  polls status for `50` or the `EB/14` signature, and the slot also has to
+  pass a write-55/read-55 scratch test on `1F4`. With no drive attached the
+  task file must float `0xFF` - the old model answered `0x00` before the
+  first command and `DRDY|ERR/ABRT` after, and the empty secondary slave
+  (kind cdrom, signature still armed) answered the `EB/14` signature like a
+  live CD, so the driver probed phantom ATAPI devices on the empty channels
+  and could miss the count. Empty positions now float the bus on every read
+  and swallow every task-file write, so only the real CD is detected and
+  the probe finishes several million steps sooner.
+- **"PCI bus scan complete." then a halt at `F000:B757`:** fixed in
+  `41c1608`. SeaBIOS's `INT 15h/AH=86h` uses the MC146818 periodic interrupt;
+  the CMOS now exposes status A/B/C, sets PF and raises IRQ8 while PIE is
+  enabled. The stock ISO proceeds to MSCDEX/Setup.
+- **Formatting/CAB copy:** formatting completes and the CAB copy writes files
+  through `COMM.DRV`; the next step fails in the guest CAB/file-write
+  completion path, leaving `GDI.EXE` zero-length and a short `AH=40`
+  completion count. `FF39` is resident IO.SYS, not an overlay. This is the
+  active Setup blocker.
+- **Cold boot after partition restart:** fixed in `c5be06b`. `Ide.softReset`/
+  SRST clears the stale OAKCDROM probe ERR and reloads signatures; Machine
+  resets both IDE channels on an INT 19 attempt or a return to `F000:FFF0`.
+  A fresh blank HDD now reports `BDA 0x475=1` and reaches Setup Welcome.
+- **IDE-only image reaches Setup:** MSCDEX prints `Drive D: = Driver OEMCD001
+  unit 0`, FINDCD/OEMSETUP run, and Setup reaches Welcome/disk configuration.
+  No protected-mode fault has been observed yet.
 - **Warm reset loop:** the startup menu reboots the machine after the CD
   driver fails; each cycle looks like the menu appearing again. This is
   guest-side control flow, not an emulator crash.
@@ -113,17 +156,24 @@ Windows media is **not** committed. Supply it locally:
 ## Install flow
 
 1. SeaBIOS boots the 98 SE CD; the Microsoft menu is answered with 2.
-2. Setup loads a RAM disk / real-mode drivers (OTI-91x CD, AIC ASPI).
+2. The IDE-only boot image loads HIMEM + OAKCDROM, MSCDEX assigns D:, and
+   OEMSETUP starts. (The stock image's AIC/BT ASPI drivers are skipped.)
 3. Partition and format the virtual HDD (FAT16/32).
 4. Copy CAB files, reboot into the GUI setup.
 5. First boot to the desktop; install VGA/mouse/sound/network drivers.
 
 ## Known blockers to clear
 
-- OTI-91x driver handshake (see Triage guide) - blocks SETUP entirely.
+- OTI-91X IDE detection is fixed (`ed95334` signature, empty-channel bus
+  float after it); the stock ASPI wait is fixed by the RTC periodic IRQ8
+  model (`41c1608`), and both stock and IDE-only images reach Setup
+  formatting.
+- The CAB copy now runs 188M+ steps and SETUP's PM transition begins; the
+  next frontier is whatever follows the #UD exception-delivery test.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
-- 80-bit x87 precision and hardware task gates remain incomplete.
+- 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
+  only if SETUP/VMM trips them.
 - PS/2 mouse integration and audio/network drivers after first boot.
 
 ## Non-goals for the first 98 boot

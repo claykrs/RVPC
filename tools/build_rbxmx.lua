@@ -89,7 +89,9 @@ local doc = '<?xml version="1.0" encoding="utf-8"?>\n'
 	.. '<roblox xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="4">\n'
 doc = doc .. tree("core", "Rvpc", "  ", "init.lua", "ModuleScript")
 doc = doc .. tree("roblox/ui", "RvpcUi", "  ", "init.lua", "ModuleScript")
-doc = doc .. tree("fixtures", "RvpcFixtures", "  ", nil, "Folder")
+if fs.isDir("fixtures") then
+	doc = doc .. tree("fixtures", "RvpcFixtures", "  ", nil, "Folder")
+end
 doc = doc .. tree("roblox/client", "RvpcClient", "  ", nil, "Folder")
 doc = doc .. "</roblox>\n"
 fs.writeFile("Rvpc.rbxmx", doc)

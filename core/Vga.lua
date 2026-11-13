@@ -29,10 +29,12 @@
 -- geometry from GC6/AR10 and the CRTC registers. INT 10h AX=0012 therefore
 -- reaches the planar renderer on its own.
 --
--- Not implemented: sync timing, interlace/double-scan timing, CGA/EGA 2bpp
--- shift-register output, chain-2 memory, horizontal pel/byte panning,
--- split-screen line compare, hardware text cursor, the GC6 memory-map windows
--- at B0000/B8000, and the 256 KiB VGA memory map beyond the first 64 KiB.
+-- Text mode 3 also models CRTC cursor start/end/location, the cursor
+-- enable/disable bit, the text attribute blink phase, and the hardware cursor
+-- in snapshots. Not implemented: sync timing, interlace/double-scan timing,
+-- CGA/EGA 2bpp shift-register output, chain-2 memory, horizontal pel/byte
+-- panning, split-screen line compare, the GC6 memory-map windows at
+-- B0000/B8000, and the 256 KiB VGA memory map beyond the first 64 KiB.
 
 const band, bor, bxor, lshift, rshift, bnot =
 	bit32.band, bit32.bor, bit32.bxor, bit32.lshift, bit32.rshift, bit32.bnot
@@ -610,7 +612,9 @@ end
 
 export type Vga = typeof(setmetatable(
 	{} :: {
-		mem: Memory,
+		-- held as any like the other core devices: Memory's typeof-based type
+		-- does not surface its metatable methods for cross-module calls
+		mem: any,
 		modeNumber: number,
 		info: ModeInfo,
 		crtc: { number },
@@ -639,6 +643,8 @@ export type Vga = typeof(setmetatable(
 		rgba: buffer,
 		widthPx: number,
 		heightPx: number,
+		blinkPhase: boolean,
+		blinkTicks: number,
 		dirty: boolean,
 		dirtyX0: number,
 		dirtyY0: number,
@@ -697,6 +703,8 @@ function Vga.new(mem: Memory): Vga
 	self.rgba = buffer.create(1) -- replaced by setMode
 	self.widthPx = 640
 	self.heightPx = 480
+	self.blinkPhase = true
+	self.blinkTicks = 0
 	self.dirty = false
 	self.dirtyX0 = 0
 	self.dirtyY0 = 0
@@ -1103,6 +1111,8 @@ function Vga.setMode(self: Vga, mode: number): boolean
 	self.widthPx = info.width
 	self.heightPx = info.height
 	self.rgba = buffer.create(info.width * info.height * 4)
+	self.blinkPhase = true
+	self.blinkTicks = 0
 	self:resetPalette()
 	self:markAllDirty()
 	return true
@@ -1842,7 +1852,17 @@ function Vga.writeCrtc(self: Vga, value: number)
 		return
 	end
 	self.crtc[index] = band(value, 0xFF)
-	if index == 0x0C or index == 0x0D or index == 0x13 or index == 0x14 or index == 0x17 then
+	if
+		index == 0x0A
+		or index == 0x0B
+		or index == 0x0C
+		or index == 0x0D
+		or index == 0x0E
+		or index == 0x0F
+		or index == 0x13
+		or index == 0x14
+		or index == 0x17
+	then
 		self:markAllDirty()
 	end
 end
@@ -2129,6 +2149,19 @@ function Vga.renderLinear(self: Vga)
 	blitLinear(self, 0, 0, self.widthPx, self.heightPx)
 end
 
+-- Advance the text/cursor blink generator by `ticks` host frames (default 1).
+-- The half-period is 16 frames, so at 30 fps the cursor is visible for about
+-- 0.53 s and hidden for about 0.53 s. The host must call this once per presented
+-- frame; snapshotRGBA deliberately does not advance the phase itself.
+function Vga.tickBlink(self: Vga, ticks: number?)
+	self.blinkTicks += if ticks and ticks > 0 then ticks else 1
+	while self.blinkTicks >= 16 do
+		self.blinkTicks -= 16
+		self.blinkPhase = not self.blinkPhase
+		self:markAllDirty()
+	end
+end
+
 function Vga.renderText(self: Vga)
 	self:syncLegacyMode()
 	self:ensurePalette()
@@ -2139,7 +2172,26 @@ function Vga.renderText(self: Vga)
 	const start = band(self:displayStartBytes(), 0x7FFF)
 	const colors = self.color16RGBA
 	const blank = FONT[63] :: { number }
-	const blink = band(self.attr[16], 0x08) ~= 0
+	const blinkEnabled = band(self.attr[16], 0x08) ~= 0
+
+	-- CRTC 0A/0B define the cursor scanline span. 0A bit 5 disables the
+	-- cursor. 0B bit 5 is the cursor blink bit here; mode 3's text blink mode
+	-- also makes the cursor blink by default, matching normal BIOS behavior.
+	const cursorStartReg = self.crtc[0x0A] or 0
+	const cursorEndReg = self.crtc[0x0B] or 0
+	const cursorStart = band(cursorStartReg, 0x1F)
+	const cursorEnd = math.min(band(cursorEndReg, 0x1F), TEXT_CELL_HEIGHT - 1)
+	const cursorBlink = band(cursorEndReg, 0x20) ~= 0 or blinkEnabled
+	const startWord = band(rshift(start, 1), 0xFFFF)
+	const cursorWord = bor(lshift(self.crtc[0x0E] or 0, 8), self.crtc[0x0F] or 0)
+	const cursorOffset = band(cursorWord - startWord, 0xFFFF)
+	const cursorVisible = band(cursorStartReg, 0x20) == 0
+		and cursorStart < TEXT_CELL_HEIGHT
+		and cursorEnd >= cursorStart
+		and cursorOffset < TEXT_COLS * TEXT_ROWS
+		and (not cursorBlink or self.blinkPhase)
+	const cursorRow = if cursorVisible then math.floor(cursorOffset / TEXT_COLS) else -1
+	const cursorCol = if cursorVisible then cursorOffset % TEXT_COLS else -1
 
 	for row = 0, TEXT_ROWS - 1 do
 		const sourceRow = band(start + row * TEXT_COLS * 2, 0x7FFF)
@@ -2148,21 +2200,31 @@ function Vga.renderText(self: Vga)
 			const code = self.mem:read8(TEXT_BASE + cell)
 			const attribute = self.mem:read8(TEXT_BASE + cell + 1)
 			const foreground = colors[band(attribute, 0x0F) + 1]
-			const backgroundBits = blink and band(rshift(attribute, 4), 0x07)
+			const backgroundBits = blinkEnabled and band(rshift(attribute, 4), 0x07)
 				or band(rshift(attribute, 4), 0x0F)
 			const background = colors[backgroundBits + 1]
+			const blinking = blinkEnabled and band(attribute, 0x80) ~= 0
+			const backgroundOnly = blinking and not self.blinkPhase
+			const isCursor = cursorVisible and row == cursorRow and col == cursorCol
 			const glyph = FONT[code] or blank
 			for glyphRow = 0, 7 do
 				const bits = glyph[glyphRow]
-				const row0 = (row * TEXT_CELL_HEIGHT + glyphRow * 2) * width * 4
-				const row1 = row0 + width * 4
+				const scan0 = glyphRow * 2
+				const scan1 = scan0 + 1
+				const cursor0 = isCursor and scan0 >= cursorStart and scan0 <= cursorEnd
+				const cursor1 = isCursor and scan1 >= cursorStart and scan1 <= cursorEnd
+				const row0 = (row * TEXT_CELL_HEIGHT + scan0) * width * 4
+				const row1 = (row * TEXT_CELL_HEIGHT + scan1) * width * 4
 				const column = (col * TEXT_CELL_WIDTH) * 4
 				for glyphCol = 0, 7 do
 					const set = band(bits, lshift(1, 7 - glyphCol)) ~= 0
-					const color = set and foreground or background
+					const color = if backgroundOnly
+						then background
+						elseif set then foreground
+						else background
 					const pixel = column + glyphCol * 4
-					buffer.writeu32(target, row0 + pixel, color)
-					buffer.writeu32(target, row1 + pixel, color)
+					buffer.writeu32(target, row0 + pixel, if cursor0 then foreground else color)
+					buffer.writeu32(target, row1 + pixel, if cursor1 then foreground else color)
 				end
 			end
 		end
@@ -2229,6 +2291,27 @@ function Vga.snapshotRegionRGBA(
 		blitPlanar(self, x0, y0, x1, y1)
 	end
 	return self.rgba
+end
+
+-- Cheap change detector for the visible text plane (80x25 cells = 4000 bytes
+-- at the CRTC start). Text-mode writes land in B8000 RAM outside the dirty
+-- tracking, so presenters poll this every frame and only snapshot/upload when
+-- the plane (or its start address) actually moved.
+function Vga.textChecksum(self: Vga): number
+	const start = band(self:displayStartBytes(), 0x7FFF)
+	const plane = self.mem:copyTo(TEXT_BASE + start, 4096)
+	local hash = 0
+	for i = 0, 4095 do
+		hash = band(hash * 31 + buffer.readu8(plane, i), 0xFFFFFFFF)
+	end
+	const cursorStyle = bor(
+		lshift(band(self.crtc[0x0E] or 0, 0xFF), 24),
+		lshift(band(self.crtc[0x0F] or 0, 0xFF), 16),
+		lshift(band(self.crtc[0x0A] or 0, 0xFF), 8),
+		band(self.crtc[0x0B] or 0, 0xFF)
+	)
+	const phase = if self.blinkPhase then 0x20000000 else 0
+	return band(hash + start + cursorStyle + phase, 0xFFFFFFFF)
 end
 
 function Vga.snapshot(self: Vga): Snapshot

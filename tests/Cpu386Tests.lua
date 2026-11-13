@@ -731,4 +731,70 @@ T("x87_mf_idt_vector16_frame", function(expect)
 	expect(m.cpu.halted, "WAIT did not resume after handler IRETD")
 end)
 
+-- 16-bit protected-mode fixture in the DOSX/DPMI shape: PE on, 16-bit
+-- byte-granular code and data segments from a real GDT (like the LDT entries
+-- WIN98 SETUP's DOS phase uses), CPL 0, no paging.
+local function pm16Machine(cpuLevel: string?)
+	const m = Machine.new({ Memory = Memory, Cpu = Cpu }, {
+		memorySize = 16 * 1024 * 1024,
+		cpu = { cpuLevel = cpuLevel or "486" },
+	})
+	const cpu = m.cpu
+	cpu.cr0 = 1
+	cpu.cr[0] = 1
+	writeDescriptor(m, 0x3008, 0, 0xFFFFF, 0x9A, 0x00)
+	writeDescriptor(m, 0x3010, 0, 0xFFFFF, 0x92, 0x00)
+	cpu.gdtr = { base = 0x3000, limit = 0x1F }
+	cpu:loadSeg("cs", 8)
+	cpu:loadSeg("ds", 0x10)
+	cpu:loadSeg("es", 0x10)
+	cpu:loadSeg("ss", 0x10)
+	cpu.ip = 0x1000
+	cpu.flags = 2
+	cpu:setSP(0x8000)
+	return m
+end
+
+-- Undefined opcodes are #UD (INT 6) in protected mode. WIN98 SETUP's DOS
+-- extender deliberately executes 0F FF at 0367:AF59 after registering a #UD
+-- handler through DPMI INT 31h AX=0203 BL=06, purely to verify that exception
+-- delivery works. The handler must receive the faulting instruction's START
+-- address (a fault restarts, it does not skip) so it can resume past the
+-- two-byte undefined opcode.
+T("pm_ud_0f_ff_delivers_exception_6", function(expect)
+	const m = pm16Machine()
+	installGate(m, 6, 0x6000, 8, 0x86)
+	putCode(m, 0x6000, {
+		0x55, -- PUSH BP
+		0x89,
+		0xE5, -- MOV BP,SP
+		0x8B,
+		0x46,
+		0x02, -- MOV AX,[BP+2]  saved IP
+		0xA3,
+		0x00,
+		0x40, -- MOV [0x4000],AX
+		0x83,
+		0x46,
+		0x02,
+		0x02, -- ADD WORD [BP+2],2  skip the 0F FF
+		0x5D, -- POP BP
+		0xCF, -- IRET
+	})
+	putCode(m, 0x1000, {
+		0x0F,
+		0xFF, -- deliberately undefined two-byte opcode
+		0xB8,
+		0x66,
+		0x66, -- MOV AX,0x6666 (must run after the handler resumes)
+		0xF4, -- HLT
+	})
+	m:run(12)
+	expect((m.cpu.intCounts[6] or 0) == 1, "vector 6 count=" .. (m.cpu.intCounts[6] or 0))
+	expect(m.mem:read16(0x4000) == 0x1000, string.format("saved IP=%04X", m.mem:read16(0x4000)))
+	expect(m.cpu.r[1] == 0x6666, string.format("AX=%04X", m.cpu.r[1]))
+	expect(m.cpu:getSP() == 0x8000, string.format("SP=%04X", m.cpu:getSP()))
+	expect(m.cpu.halted, "execution did not resume past the undefined opcode")
+end)
+
 return TESTS

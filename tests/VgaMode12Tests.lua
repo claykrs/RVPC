@@ -782,4 +782,114 @@ T("attribute_controller_colour_select", function(expect)
 	expect(vga:in8(0x3C1) == 0x05, "attribute data readback")
 end)
 
+T("text_cursor_shape_location_and_enable", function(expect)
+	const vga = fresh()
+	expect(vga:setMode(0x03), "mode 3 rejected")
+	-- Standard mode-3 underline: scanlines 13..14 at cell 0,0.
+	writeCrtc(vga, 0x0A, 0x0D)
+	writeCrtc(vga, 0x0B, 0x0E)
+	writeCrtc(vga, 0x0E, 0x00)
+	writeCrtc(vga, 0x0F, 0x00)
+	vga:writeText(0, 0, " ", 0x0F)
+	local pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 255, 255, 255, "cursor scanline 13")
+	expectPixel(expect, pixels, 7, 14, 640, 255, 255, 255, "cursor scanline 14")
+	expectPixel(expect, pixels, 0, 12, 640, 0, 0, 0, "pixel above cursor")
+	pixels = vga:snapshotRegionRGBA(0, 13, 8, 2)
+	expectPixel(expect, pixels, 0, 13, 640, 255, 255, 255, "region cursor scanline")
+
+	-- Cursor location 1 moves it to displayed cell 0,1.
+	vga:writeText(0, 1, " ", 0x0F)
+	writeCrtc(vga, 0x0F, 0x01)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 0, 0, 0, "old cursor cell cleared")
+	expectPixel(expect, pixels, 8, 13, 640, 255, 255, 255, "cursor cell 1")
+
+	-- Single-scanline shape.
+	writeCrtc(vga, 0x0B, 0x0D)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 8, 13, 640, 255, 255, 255, "single-line cursor top")
+	expectPixel(expect, pixels, 8, 14, 640, 0, 0, 0, "single-line cursor bottom")
+
+	-- Cursor disable bit 0x0A bit 5.
+	writeCrtc(vga, 0x0A, 0x2D)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 8, 13, 640, 0, 0, 0, "disabled cursor still drawn")
+end)
+
+T("text_cursor_respects_crtc_start", function(expect)
+	const vga = fresh()
+	expect(vga:setMode(0x03), "mode 3 rejected")
+	-- Display starts at character word 1, so CRTC cursor word 1 is cell 0,0.
+	writeCrtc(vga, 0x0C, 0x00)
+	writeCrtc(vga, 0x0D, 0x01)
+	writeCrtc(vga, 0x0A, 0x0D)
+	writeCrtc(vga, 0x0B, 0x0E)
+	writeCrtc(vga, 0x0E, 0x00)
+	writeCrtc(vga, 0x0F, 0x01)
+	vga:writeText(0, 1, " ", 0x0F)
+	local pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 255, 255, 255, "cursor after start-address rebase")
+	expectPixel(expect, pixels, 8, 13, 640, 0, 0, 0, "cursor not shifted by start address")
+end)
+
+T("text_blink_attribute_and_phase", function(expect)
+	const vga = fresh()
+	expect(vga:setMode(0x03), "mode 3 rejected")
+	writeAttr(vga, 0x10, 0x0C) -- text blink enabled
+	vga:writeText(0, 0, "A", 0x9F) -- blink attribute, white on colour 1
+	vga:writeText(0, 1, "A", 0x1F) -- non-blinking attribute
+
+	local function whitePixelsInCell(column: number): number
+		const pixels = vga:snapshotRGBA()
+		local count = 0
+		for y = 0, 15 do
+			for x = column * 8, column * 8 + 7 do
+				const r, g, b = pixelRGBA(pixels, x, y, 640)
+				if r == 255 and g == 255 and b == 255 then
+					count += 1
+				end
+			end
+		end
+		return count
+	end
+
+	expect(whitePixelsInCell(0) > 0, "blink glyph missing in visible phase")
+	expect(whitePixelsInCell(1) > 0, "non-blink glyph missing")
+	vga:tickBlink(16)
+	expect(whitePixelsInCell(0) == 0, "blink glyph not hidden in dark phase")
+	expect(whitePixelsInCell(1) > 0, "non-blink glyph changed with blink phase")
+	vga:tickBlink(16)
+	expect(whitePixelsInCell(0) > 0, "blink glyph did not return in visible phase")
+
+	-- With text blink disabled, attribute bit 7 is background intensity and
+	-- must not hide the glyph in the dark phase.
+	writeAttr(vga, 0x10, 0x04)
+	vga:tickBlink(16)
+	expect(whitePixelsInCell(0) > 0, "non-blinking attribute lost glyph")
+end)
+
+T("text_cursor_blinks_and_disable_wins", function(expect)
+	const vga = fresh()
+	expect(vga:setMode(0x03), "mode 3 rejected")
+	-- 0x0B bit 5 requests cursor blinking; standard shape 13..14.
+	writeCrtc(vga, 0x0A, 0x0D)
+	writeCrtc(vga, 0x0B, 0x2E)
+	writeCrtc(vga, 0x0E, 0x00)
+	writeCrtc(vga, 0x0F, 0x00)
+	vga:writeText(0, 0, " ", 0x0F)
+	local pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 255, 255, 255, "cursor visible phase")
+	vga:tickBlink(16)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 0, 0, 0, "cursor dark phase")
+	vga:tickBlink(16)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 255, 255, 255, "cursor visible again")
+
+	writeCrtc(vga, 0x0A, 0x2D)
+	pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 13, 640, 0, 0, 0, "disabled cursor rendered")
+end)
+
 return TESTS

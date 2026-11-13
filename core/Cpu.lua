@@ -10,6 +10,7 @@ const band, bor, bxor, bnot, lshift, rshift =
 const CF, PF, AF, ZF, SF, TF, IFF, DFF, OFLG = 1, 4, 16, 64, 128, 256, 512, 1024, 2048
 const RF = 0x10000
 const VM = 0x20000
+const NT = 0x4000
 const AC = 0x40000
 const ALWAYS = 2
 const FLAGMASK = 4053 -- CF|PF|AF|ZF|SF|TF|IF|DF|OF (0xFD5)
@@ -228,6 +229,7 @@ export type Cpu = {
 	tripleFault: (self: Cpu) -> (),
 	loadSeg: (self: Cpu, reg: string, selector: number) -> (),
 	farCall: (self: Cpu, selector: number, offset: number, isCall: boolean) -> (),
+	taskSwitch: (self: Cpu, newSelector: number, kind: string) -> (),
 	baseOf: (self: Cpu, reg: string) -> number,
 	linear: (self: Cpu, reg: string, off: number, size: number) -> number,
 	fetch8: (self: Cpu) -> number,
@@ -1024,6 +1026,12 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 		error(("#GP: far transfer selector %04X absent or outside GDT/LDT limit"):format(selector))
 	end
 	const gateType = band(desc.access, 0x1F)
+	if gateType == 0x01 or gateType == 0x03 or gateType == 0x09 or gateType == 0x0B then
+		-- Far CALL/JMP to a TSS: hardware task switch. CALL nests (back-link
+		-- + NT), JMP replaces the task outright.
+		self:taskSwitch(selector, if isCall then "call" else "jmp")
+		return
+	end
 	if gateType ~= 0x04 and gateType ~= 0x0C then
 		if not descriptorIsCode(desc) then
 			error(
@@ -1158,6 +1166,158 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	self.ip = targetOffset
 end
 
+-- Hardware task switch: save the current task into its TSS (TR), load the new
+-- task's state from the TSS named by newSelector, and maintain the nested-task
+-- chain. kind is "jmp" (plain switch, old task unbusies), "call"/"int"
+-- (nested: old task stays busy, back-link + NT written into the new task), or
+-- "iret" (return through the back-link of a busy task; resumed task keeps the
+-- NT from its saved flags so deeper nesting chains keep working).
+function Cpu.taskSwitch(self: Cpu, newSelector: number, kind: string)
+	newSelector = band(newSelector, 0xFFFF)
+	const tsCode = band(newSelector, 0xFFFC)
+	if tsCode == 0 then
+		self:fault(10, 0)
+	end
+	if self.tr == 0 then
+		error("#TS: task switch with no current TSS (LTR never ran)")
+	end
+	const desc = readDescriptor(self, newSelector)
+	if desc == nil then
+		self:fault(10, tsCode)
+		return
+	end
+	if band(desc.access, 0x80) == 0 then
+		self:fault(10, tsCode)
+		return
+	end
+	const tssType = band(desc.access, 0x1F)
+	const newIs32 = tssType == 0x09 or tssType == 0x0B
+	const newBusy = tssType == 0x03 or tssType == 0x0B
+	if tssType ~= 0x01 and tssType ~= 0x03 and tssType ~= 0x09 and tssType ~= 0x0B then
+		self:fault(10, tsCode)
+		return
+	end
+	if newBusy and kind ~= "iret" then
+		self:fault(10, tsCode)
+		return
+	end
+	if desc.limit < (if newIs32 then 0x67 else 0x2B) then
+		self:fault(10, tsCode)
+		return
+	end
+	const t = desc.base
+
+	-- Save the current task. The old task's busy bit survives a nested switch
+	-- (it is suspended and still linked) and clears for JMP/IRET exits.
+	const oldTss = self.trBase
+	if self.tr32 then
+		self:write32(oldTss + 0x1C, self.cr3, true)
+		self:write32(oldTss + 0x20, band(self.ip, self:ipMask()), true)
+		self:write32(oldTss + 0x24, self.flags, true)
+		for i = 0, 7 do
+			self:write32(oldTss + 0x28 + i * 4, self:rr32(i), true)
+		end
+		self:write32(oldTss + 0x48, self.es, true)
+		self:write32(oldTss + 0x4C, self.cs, true)
+		self:write32(oldTss + 0x50, self.ss, true)
+		self:write32(oldTss + 0x54, self.ds, true)
+		self:write32(oldTss + 0x58, self.fs, true)
+		self:write32(oldTss + 0x5C, self.gs, true)
+	else
+		self:write16(oldTss + 0x1A, band(self.ip, 0xFFFF), true)
+		self:write16(oldTss + 0x1C, band(self.flags, 0xFFFF), true)
+		for i = 0, 7 do
+			self:write16(oldTss + 0x1E + i * 2, self:rr(i), true)
+		end
+		self:write16(oldTss + 0x2E, self.es, true)
+		self:write16(oldTss + 0x30, self.cs, true)
+		self:write16(oldTss + 0x32, self.ss, true)
+		self:write16(oldTss + 0x34, self.ds, true)
+	end
+	local oldDescAddr = if band(self.tr, 4) ~= 0
+		then self.ldtrBase + band(self.tr, 0xFFF8)
+		else self.gdtr.base + band(self.tr, 0xFFF8)
+	if kind == "jmp" or kind == "iret" then
+		local oldAccess = self:read8(oldDescAddr + 5, true)
+		self:write8(oldDescAddr + 5, band(oldAccess, 0xFD), true)
+	end
+
+	-- Read the new task's register image. segs follows the 32-bit TSS order
+	-- ES CS SS DS FS GS; a 16-bit TSS has no FS/GS slots, which load as null.
+	local newIp: number
+	local newFlags: number
+	local newCr3: number? = nil
+	local segs: { number }
+	if newIs32 then
+		newCr3 = band(self:read32(t + 0x1C, true), 0xFFFFF000)
+		newIp = self:read32(t + 0x20, true)
+		newFlags = self:read32(t + 0x24, true)
+		for i = 0, 7 do
+			self:wr32(i, self:read32(t + 0x28 + i * 4, true))
+		end
+		segs = {
+			self:read32(t + 0x48, true),
+			self:read32(t + 0x4C, true),
+			self:read32(t + 0x50, true),
+			self:read32(t + 0x54, true),
+			self:read32(t + 0x58, true),
+			self:read32(t + 0x5C, true),
+		}
+	else
+		newIp = self:read16(t + 0x1A, true)
+		newFlags = self:read16(t + 0x1C, true)
+		for i = 0, 7 do
+			self:wr(i, self:read16(t + 0x1E + i * 2, true))
+		end
+		segs = {
+			self:read16(t + 0x2E, true),
+			self:read16(t + 0x30, true),
+			self:read16(t + 0x32, true),
+			self:read16(t + 0x34, true),
+			0,
+			0,
+		}
+	end
+	if kind == "call" or kind == "int" then
+		self:write16(t + 0x00, self.tr, true)
+		newFlags = bor(newFlags, NT)
+	end
+
+	-- Mark the new TSS busy and install it as the current task.
+	local newDescAddr = if band(newSelector, 4) ~= 0
+		then self.ldtrBase + band(newSelector, 0xFFF8)
+		else self.gdtr.base + band(newSelector, 0xFFF8)
+	if not newBusy then
+		local newAccess = self:read8(newDescAddr + 5, true)
+		self:write8(newDescAddr + 5, bor(newAccess, 2), true)
+	end
+	self.tr = newSelector
+	self.trBase = t
+	self.trLimit = desc.limit
+	self.tr32 = newIs32
+	if newCr3 and self.cr3 ~= newCr3 then
+		self.cr3 = newCr3
+		self.cr[3] = newCr3
+		self:flushTlb()
+	end
+
+	-- Segment loads: data segments first, then SS so the stored SP applies
+	-- with the new stack width, then CS last so ipMask follows the new D bit.
+	self:loadSeg("es", segs[1])
+	self:loadSeg("ds", segs[4])
+	self:loadSeg("fs", segs[5])
+	self:loadSeg("gs", segs[6])
+	self:loadSeg("ss", segs[3])
+	if newIs32 then
+		self:setSP(self:read32(t + 0x38, true))
+	else
+		self:setSP(self:read16(t + 0x26, true))
+	end
+	self:loadSeg("cs", segs[2])
+	self.flags = bor(band(newFlags, self.flagMask), self.fixedFlags)
+	self.ip = band(newIp, self:ipMask())
+end
+
 -- Protected-mode interrupt/trap gate delivery. INT n and exceptions use the
 -- IDT; hardware IRQs pass software=false and skip the DPL check.
 function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boolean?)
@@ -1184,7 +1344,14 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		error(("#NP: INT %02X gate %d not present"):format(n, n))
 	end
 	if gateType == 0x05 then
-		error(("#GP: INT %02X task gate not implemented"):format(n))
+		-- Task gate: the DPL check still applies to software INTs, then
+		-- delivery is a nested task switch to the gate's TSS selector.
+		const gateDpl = band(rshift(access, 5), 3)
+		if software and gateDpl < self:cpl() then
+			error(("#GP: INT %02X task gate DPL%d below CPL%d"):format(n, gateDpl, self:cpl()))
+		end
+		self:taskSwitch(targetSelector, "int")
+		return
 	end
 	if gateType ~= 0x06 and gateType ~= 0x07 and gateType ~= 0x0E and gateType ~= 0x0F then
 		error(("#GP: INT %02X gate type %02X is not an interrupt/trap gate"):format(n, gateType))
@@ -2394,6 +2561,10 @@ end
 -- string ops: 0 MOVS, 1 CMPS, 2 STOS, 3 LODS, 4 SCAS
 local function stringOp(cpu: any, id: number, width: number)
 	const sz = width
+	-- doALU's width argument is the flag-width vocabulary (32/16/true/8), not the
+	-- byte count; a raw byte count of 2/4 would silently fall through to 8-bit
+	-- flags and make CMPS/SCAS judge 16/32-bit compares by the low byte only.
+	const flagWidth = if width == 4 then 32 elseif width == 2 then 16 else false
 	const delta = if cpu:getF(DFF) then -sz else sz
 	const mask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
 	const sReg = cpu.osegReg or "ds"
@@ -2437,7 +2608,7 @@ local function stringOp(cpu: any, id: number, width: number)
 			setIndex(6, band(indexValue(6) + delta, mask))
 			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 1 then
-			doALU(cpu, 5, readMem(srcAddr()), readMem(dstAddr()), sz)
+			doALU(cpu, 5, readMem(srcAddr()), readMem(dstAddr()), flagWidth)
 			setIndex(6, band(indexValue(6) + delta, mask))
 			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 2 then
@@ -2458,7 +2629,7 @@ local function stringOp(cpu: any, id: number, width: number)
 			setIndex(6, band(indexValue(6) + delta, mask))
 		else
 			const value = if sz == 4 then cpu:rr32(0) elseif sz == 2 then cpu:rr(0) else cpu:rb(0)
-			doALU(cpu, 5, value, readMem(dstAddr()), sz)
+			doALU(cpu, 5, value, readMem(dstAddr()), flagWidth)
 			setIndex(7, band(indexValue(7) + delta, mask))
 		end
 	end
@@ -2643,6 +2814,13 @@ H[0xCE] = function(cpu: any)
 	end
 end
 H[0xCF] = function(cpu: any) -- IRET / IRETD
+	if cpu:isProtected() and not cpu:isV86() and band(cpu.flags, NT) ~= 0 then
+		-- Nested-task return: no frame is popped; the switch follows the
+		-- back-link stored at offset 0 of the current task's TSS.
+		const backLink = cpu:read16(cpu.trBase, true)
+		cpu:taskSwitch(backLink, "iret")
+		return
+	end
 	const width = if cpu.operand32 then 4 else 2
 	const ip = if width == 4 then cpu:pop32() else cpu:pop16()
 	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
@@ -3808,6 +3986,44 @@ local function bitTest(cpu: any, operation: number, immediate: boolean?)
 	end
 end
 
+-- 0F B0/B1 CMPXCHG r/m, reg (486+): compare AL/AX/EAX with the r/m operand,
+-- set ZF from that compare; on ZF store the source register into r/m, else
+-- load r/m into the accumulator. The compare flags come from the ALU.
+local function cmpXchg(cpu: any, width: number)
+	const e = cpu:modrm()
+	local acc, dest
+	if width == 8 then
+		acc = cpu:rb(0)
+		dest = cpu:readRM8(e)
+		doALU(cpu, 7, acc, dest, 8)
+	elseif cpu.operand32 then
+		acc = cpu:rr32(0)
+		dest = cpu:readRM32(e)
+		doALU(cpu, 7, acc, dest, 32)
+	else
+		acc = cpu:rr(0)
+		dest = cpu:readRM16(e)
+		doALU(cpu, 7, acc, dest, 16)
+	end
+	if cpu:getF(ZF) then
+		if width == 8 then
+			cpu:writeRM8(e, cpu:rb(e.reg))
+		elseif cpu.operand32 then
+			cpu:writeRM32(e, cpu:rr32(e.reg))
+		else
+			cpu:writeRM16(e, cpu:rr(e.reg))
+		end
+	else
+		if width == 8 then
+			cpu:wb(0, dest)
+		elseif cpu.operand32 then
+			cpu:wr32(0, dest)
+		else
+			cpu:wr(0, dest)
+		end
+	end
+end
+
 local H0F: { [number]: (cpu: any) -> () } = {}
 
 -- 00: SLDT/STR/LLDT/LTR/VERR/VERW
@@ -4061,6 +4277,22 @@ H0F[0xBA] = function(cpu: any)
 	bitTest(cpu, 0, true) -- /4..7 applied inside after decoding modrm
 end
 
+-- 0F B0/B1 CMPXCHG r/m, reg (486+).
+H0F[0xB0] = function(cpu: any)
+	cmpXchg(cpu, 8)
+end
+H0F[0xB1] = function(cpu: any)
+	cmpXchg(cpu, if cpu.operand32 then 32 else 16)
+end
+
+-- 0F 18-1F hintable-NOP family (P6+; treated as modrm-consuming no-ops so
+-- newer toolchains' multi-byte NOPs run on this 486-class CPU).
+for nop = 0x18, 0x1F do
+	H0F[nop] = function(cpu: any)
+		cpu:modrm()
+	end
+end
+
 H0F[0x0B] = function(cpu: any): ()
 	error(("#UD: UD2 at %04X:%08X"):format(cpu.cs, cpu.ip))
 end
@@ -4201,6 +4433,16 @@ H[0x0F] = function(cpu: any)
 	const op = cpu:fetch8()
 	const h = H0F[op]
 	if not h then
+		-- Undefined 0F opcodes are #UD. With PE set the IDT may carry a real
+		-- handler: DOSX/DPMI hosts deliberately execute invalid opcodes to test
+		-- exception delivery (WIN98 SETUP does exactly this at 0367:AF59 with
+		-- 0F FF after registering a handler via INT 31h AX=0203 BL=06). Deliver
+		-- the exception and let the guest decide. In real mode an undefined
+		-- opcode is almost always a slide into data, so keep the loud error.
+		if band(cpu.cr0, 1) ~= 0 then
+			cpu:fault(6, nil)
+			return
+		end
 		error(
 			("unimplemented 0F opcode %02X at %04X:%04X"):format(
 				op,
@@ -4365,6 +4607,13 @@ function Cpu.executeStep(self: Cpu): number
 	end
 	const h = H[op] :: ((cpu: any) -> ())?
 	if not h then
+		-- #UD through the IDT in protected mode/V86 (same rationale as the 0F
+		-- escape: guests register #UD handlers on purpose); loud error in real
+		-- mode, where an undefined opcode is usually a slide.
+		if band(self.cr0, 1) ~= 0 then
+			self:fault(6, nil)
+			return 1
+		end
 		error(
 			("unimplemented opcode %02X at %04X:%08X"):format(
 				op,
