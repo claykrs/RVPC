@@ -1094,4 +1094,168 @@ T("hint_nop_0f1f", {
 	end,
 })
 
+-- REPE CMPSW: 16-bit strings that differ at a word whose LOW byte is equal
+-- ("M1" vs "MM": res=0xE400, low byte 0x00). The compare must judge the full
+-- word, not the low byte: ZF=0 at word 1 stops the repeat with CX=2.
+T("repz_cmpsw_word_flags", {
+	setup = function(m)
+		putCode(m, {
+			0xBE,
+			0x00,
+			0x03, -- MOV SI,0x300
+			0xBF,
+			0x20,
+			0x03, -- MOV DI,0x320
+			0xB9,
+			0x04,
+			0x00, -- MOV CX,4
+			0xFC, -- CLD
+			0xF3,
+			0xA7, -- REPE CMPSW
+			0xF4,
+		})
+		fresh(m)
+		putData(m, 0x300, { 0x43, 0x4F, 0x4D, 0x31, 0x20, 0x20, 0x20, 0x20 }) -- "COM1    "
+		putData(m, 0x320, { 0x43, 0x4F, 0x4D, 0x4D, 0x20, 0x20, 0x20, 0x20 }) -- "COMM    "
+	end,
+	check = function(_m, cpu, expect)
+		expect(
+			bit32.band(cpu.flags, 0x40) == 0,
+			"REPE CMPSW saw a low-byte-only difference as equal"
+		)
+		expect(cpu.r[2] == 2, "CX=" .. cpu.r[2] .. " (stop after the differing word)")
+		expect(cpu.r[7] == 0x304, "SI=" .. cpu.r[7])
+		expect(cpu.r[8] == 0x324, "DI=" .. cpu.r[8])
+		expect(bit32.band(cpu.flags, 1) ~= 0, "CF set (source < destination)")
+	end,
+})
+
+-- REPE CMPSW over equal strings: all words equal, CX drains to zero, ZF=1.
+T("repz_cmpsw_equal", {
+	setup = function(m)
+		putCode(m, {
+			0xBE,
+			0x00,
+			0x03, -- MOV SI,0x300
+			0xBF,
+			0x20,
+			0x03, -- MOV DI,0x320
+			0xB9,
+			0x02,
+			0x00, -- MOV CX,2
+			0xFC, -- CLD
+			0xF3,
+			0xA7, -- REPE CMPSW
+			0xF4,
+		})
+		fresh(m)
+		putData(m, 0x300, { 0x43, 0x4F, 0x4D, 0x31, 0x20, 0x20, 0x20, 0x20 }) -- "COM1    "
+		putData(m, 0x320, { 0x43, 0x4F, 0x4D, 0x31, 0x20, 0x20, 0x20, 0x20 })
+	end,
+	check = function(_m, cpu, expect)
+		expect(bit32.band(cpu.flags, 0x40) ~= 0, "equal strings must leave ZF set")
+		expect(cpu.r[2] == 0, "CX=" .. cpu.r[2])
+	end,
+})
+
+-- REPNE CMPSW: stops on the first EQUAL word (ZF=1) with the rest of CX left.
+T("repne_cmpsw_stop_on_equal", {
+	setup = function(m)
+		putCode(m, {
+			0xBE,
+			0x00,
+			0x03, -- MOV SI,0x300
+			0xBF,
+			0x20,
+			0x03, -- MOV DI,0x320
+			0xB9,
+			0x04,
+			0x00, -- MOV CX,4
+			0xFC, -- CLD
+			0xF2,
+			0xA7, -- REPNE CMPSW
+			0xF4,
+		})
+		fresh(m)
+		putData(m, 0x300, { 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33 })
+		putData(m, 0x320, { 0xAA, 0xAA, 0x22, 0x22, 0x44, 0x44, 0x44, 0x44 })
+	end,
+	check = function(_m, cpu, expect)
+		expect(bit32.band(cpu.flags, 0x40) ~= 0, "REPNE must stop at the equal word")
+		expect(cpu.r[2] == 2, "CX=" .. cpu.r[2])
+		expect(cpu.r[7] == 0x304, "SI=" .. cpu.r[7])
+	end,
+})
+
+-- 32-bit REPE CMPSD (66 prefix): a difference confined to the high word of a
+-- dword (0x20000000 vs 0x10000000) must not read as equal.
+T("repz_cmpsd_32bit_flags", {
+	setup = function(m)
+		putCode(m, {
+			0x66,
+			0xBE,
+			0x00,
+			0x03,
+			0x00,
+			0x00, -- MOV SI,0x300
+			0x66,
+			0xBF,
+			0x20,
+			0x03,
+			0x00,
+			0x00, -- MOV DI,0x320
+			0x66,
+			0xB9,
+			0x01,
+			0x00,
+			0x00,
+			0x00, -- MOV ECX,1
+			0xFC, -- CLD
+			0x66,
+			0xF3,
+			0xA7, -- REPE CMPSD
+			0xF4,
+		})
+		fresh(m)
+		putData(m, 0x300, { 0x78, 0x56, 0x34, 0x12 }) -- 0x12345678
+		putData(m, 0x320, { 0x78, 0x56, 0x34, 0x21 }) -- 0x21345678
+	end,
+	check = function(_m, cpu, expect)
+		expect(bit32.band(cpu.flags, 0x40) == 0, "CMPSD judged a dword by its low 16 bits")
+		expect(cpu:rr32(1) == 0, "ECX=" .. cpu:rr32(1))
+	end,
+})
+
+-- REPE SCASW: scanning for a word that differs only in the high byte of the
+-- accumulator word (AX=0x4D31 vs memory 0x4D4D) must not report a match.
+T("repz_scasw_word_flags", {
+	setup = function(m)
+		putCode(m, {
+			0xB8,
+			0x4D,
+			0x31, -- MOV AX,0x314D
+			0xBF,
+			0x20,
+			0x03, -- MOV DI,0x320
+			0xB9,
+			0x02,
+			0x00, -- MOV CX,2
+			0xFC, -- CLD
+			0xF3,
+			0xAF, -- REPE SCASW
+			0xF4,
+		})
+		fresh(m)
+		putData(m, 0x320, { 0x4D, 0x4D, 0x4D, 0x4D })
+	end,
+	check = function(_m, cpu, expect)
+		-- word 0 (0x314D vs 0x4D4D) differs by its high byte only; the old
+		-- low-byte-only flags judged it equal (ZF=1) and scanned on. The fixed
+		-- compare reports the mismatch and REPE stops after word 0.
+		expect(bit32.band(cpu.flags, 0x40) == 0, "SCASW judged a 16-bit compare by its low byte")
+		expect(cpu.r[2] == 1, "CX=" .. cpu.r[2])
+		expect(cpu.r[8] == 0x322, "DI=" .. cpu.r[8])
+	end,
+})
+
 return TESTS

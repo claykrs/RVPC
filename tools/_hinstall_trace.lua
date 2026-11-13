@@ -7,7 +7,6 @@
 -- Dump the logs and the C: image at the "Set active boot partition" point.
 -- The key/settle/repress flow is byte-identical to tools/_hinstall.lua.
 local fs = require("@lune/fs")
-local band = bit32.band
 local Memory = require("../core/Memory")
 local Cpu = require("../core/Cpu")
 local Vga = require("../core/Vga")
@@ -117,7 +116,7 @@ local function press(code)
 	m:releaseKey(code)
 end
 local function answerKey(code, sig)
-	for attempt = 1, 4 do
+	for _ = 1, 4 do
 		press(code)
 		pumpUntil(12_000_000, nil)
 		if flat(m:outputText()) ~= sig then

@@ -2561,6 +2561,10 @@ end
 -- string ops: 0 MOVS, 1 CMPS, 2 STOS, 3 LODS, 4 SCAS
 local function stringOp(cpu: any, id: number, width: number)
 	const sz = width
+	-- doALU's width argument is the flag-width vocabulary (32/16/true/8), not the
+	-- byte count; a raw byte count of 2/4 would silently fall through to 8-bit
+	-- flags and make CMPS/SCAS judge 16/32-bit compares by the low byte only.
+	const flagWidth = if width == 4 then 32 elseif width == 2 then 16 else false
 	const delta = if cpu:getF(DFF) then -sz else sz
 	const mask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
 	const sReg = cpu.osegReg or "ds"
@@ -2604,7 +2608,7 @@ local function stringOp(cpu: any, id: number, width: number)
 			setIndex(6, band(indexValue(6) + delta, mask))
 			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 1 then
-			doALU(cpu, 5, readMem(srcAddr()), readMem(dstAddr()), sz)
+			doALU(cpu, 5, readMem(srcAddr()), readMem(dstAddr()), flagWidth)
 			setIndex(6, band(indexValue(6) + delta, mask))
 			setIndex(7, band(indexValue(7) + delta, mask))
 		elseif id == 2 then
@@ -2625,7 +2629,7 @@ local function stringOp(cpu: any, id: number, width: number)
 			setIndex(6, band(indexValue(6) + delta, mask))
 		else
 			const value = if sz == 4 then cpu:rr32(0) elseif sz == 2 then cpu:rr(0) else cpu:rb(0)
-			doALU(cpu, 5, value, readMem(dstAddr()), sz)
+			doALU(cpu, 5, value, readMem(dstAddr()), flagWidth)
 			setIndex(7, band(indexValue(7) + delta, mask))
 		end
 	end
