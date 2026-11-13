@@ -4433,6 +4433,16 @@ H[0x0F] = function(cpu: any)
 	const op = cpu:fetch8()
 	const h = H0F[op]
 	if not h then
+		-- Undefined 0F opcodes are #UD. With PE set the IDT may carry a real
+		-- handler: DOSX/DPMI hosts deliberately execute invalid opcodes to test
+		-- exception delivery (WIN98 SETUP does exactly this at 0367:AF59 with
+		-- 0F FF after registering a handler via INT 31h AX=0203 BL=06). Deliver
+		-- the exception and let the guest decide. In real mode an undefined
+		-- opcode is almost always a slide into data, so keep the loud error.
+		if band(cpu.cr0, 1) ~= 0 then
+			cpu:fault(6, nil)
+			return
+		end
 		error(
 			("unimplemented 0F opcode %02X at %04X:%04X"):format(
 				op,
@@ -4597,6 +4607,13 @@ function Cpu.executeStep(self: Cpu): number
 	end
 	const h = H[op] :: ((cpu: any) -> ())?
 	if not h then
+		-- #UD through the IDT in protected mode/V86 (same rationale as the 0F
+		-- escape: guests register #UD handlers on purpose); loud error in real
+		-- mode, where an undefined opcode is usually a slide.
+		if band(self.cr0, 1) ~= 0 then
+			self:fault(6, nil)
+			return 1
+		end
 		error(
 			("unimplemented opcode %02X at %04X:%08X"):format(
 				op,
