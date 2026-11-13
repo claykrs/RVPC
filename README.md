@@ -30,7 +30,7 @@ SeaBIOS ──▶ boot menu ──▶ CD / floppy / HDD ──▶ FreeDOS 1.3 �
 | Chipset: PIC×2, PIT, MC146818 RTC (clock/alarm/periodic IRQ8), 8237 DMA, PIIX3 PCI | ✅ working |
 | NE2000 Ethernet + host virtual ISP (DHCP/DNS/TCP/HTTP) | ✅ working |
 | FreeDOS 1.3 CD install onto the virtual HDD (diskette auto-swap) | ✅ working |
-| Windows 98 SE SETUP | 🚧 blocker: CD-driver registration — see the [triage guide](docs/WIN98.md) |
+| Windows 98 SE SETUP | 🚧 install copy phase reaches 188M steps and SETUP's protected-mode transition — see the [triage guide](docs/WIN98.md) |
 | PS/2 mouse integration, SB16 audio in-guest | 🔜 planned |
 
 CI runs the full gate (StyLua, Selene, strict `luau-analyze`, **1800+

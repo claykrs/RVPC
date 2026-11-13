@@ -27,13 +27,29 @@ The **stock** image now also works: the RTC periodic IRQ8 model (`41c1608`)
 lets SeaBIOS's `INT 15h/AH=86h` waits expire, so the AIC ASPI drivers finish
 and MSCDEX/OEMSETUP start. Both the stock ISO and the IDE-only
 `media/win98se-ide.iso` reach **Windows 98 Setup**, complete formatting, and
-start the CAB copy. The copy creates and writes
-`C:\WININST0.400\COMM.DRV`, closes it successfully, then the guest CAB
-decompressor/file-write completion fails and Setup prints "Setup is unable to
-write to the temporary directory". `FF39` is resident IO.SYS, not an overlay;
-no CPU fault is present. At failure `GDI.EXE` is zero-length, and the DOS
-completion path shows `AX=0x071C` (1820) for a 9280-byte write request.
-IDE/PIO, INT 13, ATAPI, FAT16 and HIMEM/UMB are otherwise healthy.
+run the CAB copy deep into protected mode.
+
+Resolved this pass (2026-11-13):
+
+- **CMPS/SCAS flag width** (`63caa8b`): `stringOp` passed its raw byte-count
+  width (2/4) to `doALU`, which silently fell through to 8-bit flags — every
+  CMPSW/CMPSD/SCASW judged a 16/32-bit compare by the low byte only. SETUP's
+  `repz cmpsw` walk of the BIOS device-header chain therefore matched
+  `"COMM    "` against `"COM1    "` (differs at word 1, low byte equal), the
+  kernel initialized the file's SFT entry as the COM1 character device, and
+  the 9280-byte write took the cooked device path — byte-at-a-time device
+  requests stopped at a stray Ctrl-Z and "succeeded" with AX=1820. Setup read
+  the short write as disk-full. This was the whole "temporary directory"
+  error; the FAT allocation path at FF39:CC8A was never at fault.
+- **Undefined opcodes deliver #UD in protected mode** (`7185937`): SETUP
+  deliberately executes `0F FF` after registering a #UD handler via
+  INT 31h AX=0203 BL=06 to test exception delivery; the core now raises
+  fault 6 through the IDT when PE=1 (real mode keeps the loud error).
+
+State: the copy phase runs to ~188M steps with ~276 more file operations
+than before (int21 12081, int13 740), and SETUP enters its protected-mode
+transition (CR0.PE=1, segment 0367). IDE/PIO, INT 13, ATAPI, FAT16 and
+HIMEM/UMB are otherwise healthy.
 
 Everything below it is green:
 
@@ -152,8 +168,8 @@ Windows media is **not** committed. Supply it locally:
   float after it); the stock ASPI wait is fixed by the RTC periodic IRQ8
   model (`41c1608`), and both stock and IDE-only images reach Setup
   formatting.
-- The 512 MiB HDD is partitioned/formatted; the CAB copy reaches `COMM.DRV`
-  and then fails in the guest CAB/file-write completion path.
+- The CAB copy now runs 188M+ steps and SETUP's PM transition begins; the
+  next frontier is whatever follows the #UD exception-delivery test.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck
