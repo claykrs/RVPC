@@ -337,6 +337,29 @@ T("timer_divisor_scales_pit_against_instructions", function(expect)
 	expect(fastTicks == 100, "divisor 4 ticks=" .. fastTicks)
 end)
 
+T("pit_channel0_divisor_slows_irq0_only", function(expect)
+	const m = freshMachine()
+	m.pit.channel0Divisor = 8
+	for _, port in { 0x40, 0x42 } do
+		m.pit:out8(0x43, if port == 0x40 then 0x34 else 0xB4)
+		m.pit:out8(port, 0x00)
+		m.pit:out8(port, 0x00)
+	end
+	const before0 = m.pit.channels[1].counter
+	const before2 = m.pit.channels[3].counter
+	for _ = 1, 400 do
+		m.pit:advance(1)
+	end
+	expect(
+		before0 - m.pit.channels[1].counter == 50,
+		"ch0 ticks=" .. (before0 - m.pit.channels[1].counter)
+	)
+	expect(
+		before2 - m.pit.channels[3].counter == 400,
+		"ch2 ticks=" .. (before2 - m.pit.channels[3].counter)
+	)
+end)
+
 T("cmos_memory_and_shutdown", function(expect)
 	const cmos = Cmos.new({ memorySize = 32 * 1024 * 1024 })
 	cmos:out8(0x70, 0x30)

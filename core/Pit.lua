@@ -29,6 +29,8 @@ export type Pit = typeof(setmetatable(
 	{} :: {
 		channels: { Channel },
 		irqPending: boolean,
+		channel0Divisor: number,
+		channel0Phase: number,
 		in8: (self: Pit, port: number) -> number,
 		out8: (self: Pit, port: number, value: number) -> (),
 		advance: (self: Pit, cycles: number) -> boolean,
@@ -55,6 +57,11 @@ function Pit.new(): Pit
 	local self = setmetatable({}, Pit) :: any
 	self.channels = { newChannel(), newChannel(), newChannel() }
 	self.irqPending = false
+	-- Channel 0 (IRQ0) advances once per `channel0Divisor` advance() calls so a
+	-- host can keep channel 2 fast (speed benchmarks) without flooding guests
+	-- with timer IRQs far above real-time rate.
+	self.channel0Divisor = 1
+	self.channel0Phase = 0
 	return self
 end
 
@@ -70,7 +77,20 @@ end
 function Pit.advance(self: Pit, cycles: number): boolean
 	local irq = false
 	const channels = self.channels
+	local skipChannel0 = false
+	if self.channel0Divisor > 1 then
+		const phase = self.channel0Phase + 1
+		if phase >= self.channel0Divisor then
+			self.channel0Phase = 0
+		else
+			self.channel0Phase = phase
+			skipChannel0 = true
+		end
+	end
 	for index = 0, CHANNELS - 1 do
+		if index == 0 and skipChannel0 then
+			continue
+		end
 		const channel = channels[index + 1]
 		-- Inline reloadValue: advance runs once per guest instruction.
 		const period = if channel.reload == 0 then 0x10000 else channel.reload
