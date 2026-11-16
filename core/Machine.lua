@@ -121,6 +121,12 @@ export type Machine = typeof(setmetatable(
 		lastOutValue: number,
 		irqCount: number,
 		int19Count: number,
+		-- Guest instructions retired per PIT/RTC clock tick (1 = the historic
+		-- one-instruction-per-timer-cycle pacing, ~1 MIPS against the 1.19 MHz
+		-- PIT). Win98 SETUP benchmarks IDIV against PIT channel 2 and refuses
+		-- CPUs below 66 MHz, so hosts running it set 2 or more.
+		timerDivisor: number,
+		timerPhase: number,
 		atResetVector: boolean,
 		booted: boolean,
 		debugLog: { string },
@@ -511,6 +517,8 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.lastOutValue = 0
 	self.irqCount = 0
 	self.int19Count = 0
+	self.timerDivisor = 1
+	self.timerPhase = 0
 	self.atResetVector = false
 	self.booted = false
 	self.debugLog = {}
@@ -1014,18 +1022,24 @@ function Machine.run(self: Machine, maxSteps: number?): number
 	const sb16 = self.sb16
 	const fdc = self.fdc
 	const cmos = self.cmos
+	const timerDivisor = self.timerDivisor
+	local timerPhase = self.timerPhase
 	while steps < budget and not self.exitCode do
-		if pit then
-			if pit:advance(1) and pic then
-				pic:raise(0)
+		timerPhase += 1
+		if timerPhase >= timerDivisor then
+			timerPhase = 0
+			if pit then
+				if pit:advance(1) and pic then
+					pic:raise(0)
+				end
 			end
-		end
-		-- MC146818 clock and interrupt engine. The periodic tick is what
-		-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise IRQ8
-		-- through the same status C/IRQF path.
-		if cmos then
-			if cmos:advance(1) and pic then
-				pic:raise(8)
+			-- MC146818 clock and interrupt engine. The periodic tick is what
+			-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise
+			-- IRQ8 through the same status C/IRQF path.
+			if cmos then
+				if cmos:advance(1) and pic then
+					pic:raise(8)
+				end
 			end
 		end
 		-- Retire pending PIO write completions (BSY -> DRDY + INTRQ) so guest
@@ -1119,6 +1133,7 @@ function Machine.run(self: Machine, maxSteps: number?): number
 		end
 		steps += 1
 	end
+	self.timerPhase = timerPhase
 	return steps
 end
 

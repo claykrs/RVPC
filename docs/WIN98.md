@@ -46,10 +46,31 @@ Resolved this pass (2026-11-13):
   INT 31h AX=0203 BL=06 to test exception delivery; the core now raises
   fault 6 through the IDT when PE=1 (real mode keeps the loud error).
 
-State: the copy phase runs to ~188M steps with ~276 more file operations
-than before (int21 12081, int13 740), and SETUP enters its protected-mode
-transition (CR0.PE=1, segment 0367). IDE/PIO, INT 13, ATAPI, FAT16 and
-HIMEM/UMB are otherwise healthy.
+Resolved 2026-11-16 (SETUP now reaches its graphical "Welcome to Windows 98
+Setup" screen):
+
+- **Far transfer to a not-present descriptor delivers #NP** (`2cd07d8`): SETUP's
+  DOS extender marks LDT code selector 046F not-present on purpose and loads
+  it from its #NP handler; the core aborted instead of raising vector 11.
+- **Repeated 66/67 prefixes are idempotent** (`d879107`): a doubled address-size
+  prefix toggled back to 16-bit, so the blitter's `67 67 2E FF A0 disp32` jump
+  table jumped to garbage and a glyph loop ran 1536 characters past its segment.
+- **8254 read-back command** (`dacd2ba`): channel select is bits 1-3 and a clear
+  bit 4 latches a status byte returned before the count. SETUP's CPU benchmark
+  (segment 0597:0150, five IDIVs timed on PIT channel 2 with `0xC8`) read
+  garbage.
+- **Guest CPU speed vs the PIT**: with one PIT tick per instruction the
+  benchmark measures ~43 MHz (about 6 ticks per five-IDIV pass) and SETUP stops
+  with "requires a computer with a 66MHz or faster processor". Hosts running
+  SETUP set `machine.timerDivisor = 2` (instructions per PIT/RTC tick; default 1);
+  `tools/probe_win98_cab.lua` and `tools/stage_win98.lua` callers should do
+  the same. Do not raise it far: SeaBIOS busy-waits on the PIT and a large
+  divisor stalls them (64 hung the boot).
+
+State: the CAB copy completes, SETUP leaves the ScanDisk/"Setup initializes"
+text phase around 287M steps, switches to VGA 640x480 and shows the Welcome
+dialog by ~600M steps with `timerDivisor = 2`. IDE/PIO, INT 13, ATAPI, FAT16
+and HIMEM/UMB are otherwise healthy.
 
 Everything below it is green:
 
@@ -168,8 +189,9 @@ Windows media is **not** committed. Supply it locally:
   float after it); the stock ASPI wait is fixed by the RTC periodic IRQ8
   model (`41c1608`), and both stock and IDE-only images reach Setup
   formatting.
-- The CAB copy now runs 188M+ steps and SETUP's PM transition begins; the
-  next frontier is whatever follows the #UD exception-delivery test.
+- SETUP's Welcome dialog is up; the next frontier is driving it (Continue,
+  license, directory, copy, reboot). Setup text rendering also drops the letters
+  W/w in the sidebar/banner bitmap text - check the VGA planar blit path.
 - No ACPI: Win98 falls back to Standard PC. SMBIOS 2.4 and APM 1.2 are
   present.
 - 80-bit x87 and hardware task gates landed (`9e81135`, `39b96de`); recheck

@@ -315,6 +315,28 @@ T("pit_readback_latches_status_then_count", function(expect)
 	)
 end)
 
+T("timer_divisor_scales_pit_against_instructions", function(expect)
+	const slow = freshMachine()
+	const fast = freshMachine()
+	fast.timerDivisor = 4
+	for _, m in { slow, fast } do
+		m.pit:out8(0x43, 0x34) -- channel 0, LSB/MSB, mode 2
+		m.pit:out8(0x40, 0x00)
+		m.pit:out8(0x40, 0x00) -- reload 0x10000
+		putCode(m, 0xF0000, { 0xEB, 0xFE }) -- JMP $
+		m.cpu:loadSeg("cs", 0xF000)
+		m.cpu.ip = 0
+		m.cpu.cs = 0xF000
+	end
+	const before = slow.pit.channels[1].counter
+	slow:run(400)
+	fast:run(400)
+	const slowTicks = before - slow.pit.channels[1].counter
+	const fastTicks = before - fast.pit.channels[1].counter
+	expect(slowTicks == 400, "default divisor ticks=" .. slowTicks)
+	expect(fastTicks == 100, "divisor 4 ticks=" .. fastTicks)
+end)
+
 T("cmos_memory_and_shutdown", function(expect)
 	const cmos = Cmos.new({ memorySize = 32 * 1024 * 1024 })
 	cmos:out8(0x70, 0x30)
