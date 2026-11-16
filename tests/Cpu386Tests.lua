@@ -797,4 +797,32 @@ T("pm_ud_0f_ff_delivers_exception_6", function(expect)
 	expect(m.cpu.halted, "execution did not resume past the undefined opcode")
 end)
 
+-- A far JMP to an in-limit descriptor with P=0 raises #NP (vector 11) with the
+-- selector as the error code instead of aborting the host. WIN98 SETUP's DOS
+-- extender jumps to such a not-present LDT code segment (046F) and relies on
+-- its #NP handler to load it.
+T("pm_far_jmp_not_present_delivers_np", function(expect)
+	const m = pm16Machine()
+	writeDescriptor(m, 0x3018, 0x100000, 0x417, 0x1A, 0x00)
+	installGate(m, 11, 0x6000, 8, 0x86)
+	putCode(m, 0x6000, {
+		0x58, -- POP AX  error code
+		0xA3,
+		0x00,
+		0x40, -- MOV [0x4000],AX
+		0xF4, -- HLT
+	})
+	putCode(m, 0x1000, {
+		0xEA,
+		0x00,
+		0x00,
+		0x1B,
+		0x00, -- JMP FAR 001B:0000 (RPL 3, not present)
+	})
+	m:run(8)
+	expect((m.cpu.intCounts[11] or 0) == 1, "vector 11 count=" .. (m.cpu.intCounts[11] or 0))
+	expect(m.mem:read16(0x4000) == 0x0018, string.format("error code=%04X", m.mem:read16(0x4000)))
+	expect(m.cpu.halted, "#NP handler did not run")
+end)
+
 return TESTS

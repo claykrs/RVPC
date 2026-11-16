@@ -1022,6 +1022,14 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 		error("#GP: far transfer with null selector")
 	end
 	const desc = readDescriptor(self, selector)
+	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
+		-- A real in-limit descriptor with P=0 is #NP(selector), not a fatal
+		-- host error: DPMI hosts/VMMs mark segments not-present on purpose
+		-- and their #NP handler loads them. Win98 SETUP hits this on LDT
+		-- selector 046F (code, base 0x01000000, P=0) via a far transfer.
+		self:fault(11, band(selector, 0xFFFC))
+		return
+	end
 	if not desc or band(desc.access, 0x80) == 0 then
 		error(("#GP: far transfer selector %04X absent or outside GDT/LDT limit"):format(selector))
 	end
