@@ -825,4 +825,49 @@ T("pm_far_jmp_not_present_delivers_np", function(expect)
 	expect(m.cpu.halted, "#NP handler did not run")
 end)
 
+-- Operand/address-size prefixes are idempotent: repeating one is still a
+-- single override of the segment default, not a double toggle. WIN98's
+-- blitter jump table is `67 67 2E FF A0 disp32` (JMP WORD CS:[EAX+disp32]);
+-- toggling twice decoded it with 16-bit addressing and jumped to garbage.
+T("pm_repeated_size_prefixes_are_idempotent", function(expect)
+	const m = pm16Machine()
+	putCode(m, 0x1000, {
+		0x66,
+		0x66,
+		0xB8,
+		0x78,
+		0x56,
+		0x34,
+		0x12, -- 66 66 MOV EAX,imm32
+		0xF4,
+	})
+	m:run(4)
+	expect(m.cpu:rr32(0) == 0x12345678, string.format("EAX=%08X", m.cpu:rr32(0)))
+	expect(m.cpu.halted, "66 66 did not decode as a single override")
+end)
+
+T("pm_double_address_prefix_jump_table", function(expect)
+	const m = pm16Machine()
+	m.mem:write16(0x4004, 0x1100)
+	putCode(m, 0x1000, {
+		0xB8,
+		0x04,
+		0x00, -- MOV AX,4
+		0x67,
+		0x67,
+		0xFF,
+		0xA0,
+		0x00,
+		0x40,
+		0x00,
+		0x00, -- JMP WORD [EAX+0x4000] with a doubled 67 prefix
+	})
+	putCode(m, 0x1100, { 0xF4 })
+	m:run(6)
+	expect(
+		m.cpu.halted and m.cpu.ip == 0x1101,
+		string.format("halted=%s ip=%04X", tostring(m.cpu.halted), m.cpu.ip)
+	)
+end)
+
 return TESTS

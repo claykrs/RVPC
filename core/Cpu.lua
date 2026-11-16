@@ -4598,11 +4598,14 @@ function Cpu.executeStep(self: Cpu): number
 		elseif op == 0x65 and self.level >= CPU_386 then
 			self.oseg, self.osegReg = self.gs, "gs"
 		elseif op == 0x66 and self.level >= CPU_386 then
-			self.operand32 = not self.operand32
+			-- Size-override prefixes select the opposite of the segment's
+			-- default and are idempotent: 66 66 is one override, not two
+			-- toggles (WIN98's blitter emits 67 67 2E FF A0 for a jump table).
+			self.operand32 = not self.baseOperand32
 		elseif op == 0x66 and self.level >= CPU_286 then
 			self.operand32 = true
 		elseif op == 0x67 and self.level >= CPU_386 then
-			self.address32 = not self.address32
+			self.address32 = not self.baseAddress32
 		elseif op == 0xF2 then
 			self.rep = 2
 		elseif op == 0xF3 then
