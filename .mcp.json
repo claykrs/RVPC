@@ -1,0 +1,16 @@
+{
+	"mcpServers": {
+		"roblox-studio": {
+			"type": "stdio",
+			"command": "cmd",
+			"args": ["/c", "${LOCALAPPDATA}\\Roblox\\mcp.bat"]
+		},
+		"github": {
+			"type": "http",
+			"url": "https://api.githubcopilot.com/mcp/",
+			"headers": {
+				"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+			}
+		}
+	}
+}

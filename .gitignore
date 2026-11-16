@@ -33,3 +33,8 @@ tools/studio_*.json
 # Python analysis caches
 __pycache__/
 *.pyc
+
+# stray automation logs, untracked scratch probes, local MCP results
+@AutomationLog.txt
+tools/_*.lua
+tools/mcp_result.json
