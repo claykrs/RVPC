@@ -294,6 +294,27 @@ T("pit_counter_and_irq", function(expect)
 	expect(pit.irqPending, "irqPending")
 end)
 
+T("pit_readback_latches_status_then_count", function(expect)
+	const pit = Pit.new()
+	pit:out8(0x43, 0xB0) -- channel 2, LSB/MSB, mode 0, binary
+	pit:out8(0x42, 0xFF)
+	pit:out8(0x42, 0xFF)
+	pit:advance(0x0123)
+	pit:out8(0x43, 0xC8) -- read-back: latch count AND status of channel 2
+	const status = pit:in8(0x42)
+	expect(band(status, 0x3E) == 0x30, string.format("status access/mode=%02X", status))
+	const low = pit:in8(0x42)
+	const high = pit:in8(0x42)
+	const count = high * 256 + low
+	expect(count == 0xFFFF - 0x0123, string.format("count=%04X", count))
+	pit:advance(50) -- a latched count must not follow the live counter
+	pit:out8(0x43, 0xD8) -- count only (bit 4 set): no status byte this time
+	expect(
+		pit:in8(0x42) == band(0xFFFF - 0x0123 - 50, 0xFF),
+		"count-only latch returned a status byte"
+	)
+end)
+
 T("cmos_memory_and_shutdown", function(expect)
 	const cmos = Cmos.new({ memorySize = 32 * 1024 * 1024 })
 	cmos:out8(0x70, 0x30)

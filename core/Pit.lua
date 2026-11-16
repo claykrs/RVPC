@@ -6,7 +6,7 @@
 -- the PC speaker. The BIOS uses channel 0 both for the system tick and as a
 -- calibrated delay source, so reads must return a changing count.
 
-const band, lshift, rshift = bit32.band, bit32.lshift, bit32.rshift
+const band, bor, lshift, rshift = bit32.band, bit32.bor, bit32.lshift, bit32.rshift
 
 const Pit = {}
 Pit.__index = Pit
@@ -21,6 +21,7 @@ type Channel = {
 	bcd: boolean,
 	flipFlop: number,
 	latched: number?,
+	statusLatched: number?, -- read-back status byte, returned before the count
 	output: boolean,
 }
 
@@ -45,6 +46,7 @@ local function newChannel(): Channel
 		bcd = false,
 		flipFlop = 0,
 		latched = nil,
+		statusLatched = nil,
 		output = false,
 	}
 end
@@ -100,10 +102,26 @@ function Pit.out8(self: Pit, port: number, value: number)
 	if port == 0x43 then
 		const channelIndex = rshift(value, 6)
 		if channelIndex == 3 then
-			-- Read-back command: latch the selected counters' current values.
+			-- Read-back command (11 !COUNT !STATUS C2 C1 C0 0). Bits 1-3 select
+			-- channels; a clear bit 5 latches the count, a clear bit 4 latches
+			-- the status byte, which the next read returns before the count.
+			-- WIN98 SETUP times IDIV with 0xC8 (channel 2, count + status).
+			const latchCount = band(value, 0x20) == 0
+			const latchStatus = band(value, 0x10) == 0
 			for index = 0, 2 do
-				if band(value, lshift(1, index)) == 0 then
-					self.channels[index + 1].latched = self.channels[index + 1].counter
+				if band(value, lshift(2, index)) ~= 0 then
+					const target = self.channels[index + 1]
+					if latchCount and target.latched == nil then
+						target.latched = target.counter
+					end
+					if latchStatus and target.statusLatched == nil then
+						target.statusLatched = bor(
+							if target.output then 0x80 else 0,
+							lshift(target.access, 4),
+							lshift(target.mode, 1),
+							if target.bcd then 1 else 0
+						)
+					end
 				end
 			end
 			return
@@ -143,6 +161,11 @@ function Pit.in8(self: Pit, port: number): number
 		return 0xFF
 	end
 	const channel = self.channels[port - 0x40 + 1]
+	if channel.statusLatched ~= nil then
+		const status = channel.statusLatched :: number
+		channel.statusLatched = nil
+		return status
+	end
 	local value
 	if channel.latched ~= nil then
 		value = channel.latched :: number
