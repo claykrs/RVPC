@@ -825,6 +825,32 @@ T("pm_far_jmp_not_present_delivers_np", function(expect)
 	expect(m.cpu.halted, "#NP handler did not run")
 end)
 
+-- MOV ES,AX of a not-present descriptor raises #NP (restartable) rather than a
+-- host error: WIN98 setup loads lazily-populated LDT data selectors (0907).
+T("pm_mov_es_not_present_delivers_np", function(expect)
+	const m = pm16Machine()
+	writeDescriptor(m, 0x3018, 0x100000, 0x417, 0x12, 0x00)
+	installGate(m, 11, 0x6000, 8, 0x86)
+	putCode(m, 0x6000, {
+		0x58, -- POP AX  error code
+		0xA3,
+		0x00,
+		0x40, -- MOV [0x4000],AX
+		0xF4, -- HLT
+	})
+	putCode(m, 0x1000, {
+		0xB8,
+		0x1B,
+		0x00, -- MOV AX,001B
+		0x8E,
+		0xC0, -- MOV ES,AX
+	})
+	m:run(10)
+	expect((m.cpu.intCounts[11] or 0) == 1, "vector 11 count=" .. (m.cpu.intCounts[11] or 0))
+	expect(m.mem:read16(0x4000) == 0x0018, string.format("error code=%04X", m.mem:read16(0x4000)))
+	expect(m.cpu.halted, "#NP handler did not run")
+end)
+
 -- Operand/address-size prefixes are idempotent: repeating one is still a
 -- single override of the segment default, not a double toggle. WIN98's
 -- blitter jump table is `67 67 2E FF A0 disp32` (JMP WORD CS:[EAX+disp32]);

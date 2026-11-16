@@ -947,6 +947,12 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 		return
 	end
 	const desc = readDescriptor(self, selector)
+	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
+		-- Present bit clear on a real descriptor: #NP (#SS for SS), restartable.
+		-- DOS extenders lazily populate LDT slots from their handlers.
+		self:fault(if reg == "ss" then 12 else 11, band(selector, 0xFFFC))
+		return
+	end
 	if not desc or band(desc.access, 0x80) == 0 then
 		error(
 			("#GP: %s selector %04X: absent or outside %s limit"):format(
