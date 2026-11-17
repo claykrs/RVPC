@@ -874,6 +874,29 @@ T("pm_pop_es_and_les_not_present_restartable", function(expect)
 	expect(m.cpu.r[5] == 0x6FFA, string.format("sp after frame+pop=%04X", m.cpu.r[5])) -- frame pushed below the unmodified 0x7000
 end)
 
+T("pm_retf_imm_not_present_cs_keeps_handler_stack", function(expect)
+	const m = pm16Machine()
+	writeDescriptor(m, 0x3018, 0x100000, 0x417, 0x1A, 0x00) -- code, P=0
+	installGate(m, 11, 0x6000, 8, 0x86)
+	putCode(m, 0x6000, {
+		0x58, -- POP AX  error code
+		0xF4, -- HLT
+	})
+	-- RETF 4 with ip=0x1234 cs=0018 on the stack; the #NP must not let the
+	-- retf's trailing "SP += 4" run on top of the handler's frame.
+	m.mem:write16(0x7000, 0x1234)
+	m.mem:write16(0x7002, 0x0018)
+	m.cpu.r[5] = 0x7000
+	m.cpu.ss = 0x10
+	putCode(m, 0x1000, { 0xCA, 0x04, 0x00 })
+	m:run(6)
+	expect((m.cpu.intCounts[11] or 0) == 1, "vector 11 count=" .. (m.cpu.intCounts[11] or 0))
+	expect(
+		m.cpu.r[5] == 0x6FFA,
+		string.format("sp=%04X (frame must sit below the unmodified 0x7000)", m.cpu.r[5])
+	)
+end)
+
 -- Operand/address-size prefixes are idempotent: repeating one is still a
 -- single override of the segment default, not a double toggle. WIN98's
 -- blitter jump table is `67 67 2E FF A0 disp32` (JMP WORD CS:[EAX+disp32]);

@@ -228,7 +228,7 @@ export type Cpu = {
 	write32: (self: Cpu, addr: number, value: number, supervisor: boolean?) -> (),
 	reset: (self: Cpu) -> (),
 	tripleFault: (self: Cpu) -> (),
-	loadSeg: (self: Cpu, reg: string, selector: number) -> (),
+	loadSeg: (self: Cpu, reg: string, selector: number) -> boolean,
 	farCall: (self: Cpu, selector: number, offset: number, isCall: boolean) -> (),
 	taskSwitch: (self: Cpu, newSelector: number, kind: string) -> (),
 	baseOf: (self: Cpu, reg: string) -> number,
@@ -929,12 +929,12 @@ function Cpu.ensureSeg(self: Cpu, reg: string)
 	self:loadSeg(reg, selector)
 end
 
-function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
+function Cpu.loadSeg(self: Cpu, reg: string, selector: number): boolean
 	selector = band(selector, 0xFFFF)
 	if not self:isProtected() or self:isV86() then
 		setSeg(self, reg, selector)
 		cacheReal(self, reg, selector)
-		return
+		return true
 	end
 	if selector == 0 then
 		-- Null data selectors are legal and leave the segment unusable.
@@ -947,7 +947,7 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 		self.segAccess[reg] = 0
 		self.segFlags[reg] = 0
 		self.segSel[reg] = 0
-		return
+		return true
 	end
 	const desc = readDescriptor(self, selector)
 	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
@@ -955,7 +955,7 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 		-- DOS extenders lazily populate LDT slots from their handlers.
 		self.r[5] = self.opSP -- POP Sreg already advanced SP; restart needs it undone
 		self:fault(if reg == "ss" then 12 else 11, band(selector, 0xFFFC))
-		return
+		return false -- faulted: callers must not touch SP/IP after this
 	end
 	if not desc or band(desc.access, 0x80) == 0 then
 		error(
@@ -987,6 +987,7 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 	self.segAccess[reg] = desc.access
 	self.segFlags[reg] = desc.flags
 	self.segSel[reg] = selector
+	return true
 end
 
 function Cpu.baseOf(self: Cpu, reg: string): number
@@ -2802,7 +2803,9 @@ local function retf(cpu: any, extra: number)
 		outerSs = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	end
 	cpu.ip = ip
-	cpu:loadSeg("cs", csSel)
+	if cpu:loadSeg("cs", csSel) == false then
+		return -- #NP delivered: the handler's frame/SP must stay as built
+	end
 	if outerSs then
 		cpu:loadSeg("ss", outerSs)
 		cpu:setSP(outerSp :: number)
