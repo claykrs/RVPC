@@ -140,6 +140,7 @@ export type Cpu = {
 	-- the pending fault context used when a #PF or synchronous exception frame
 	-- is built.
 	opIP: number,
+	opSP: number,
 	opCS: number,
 	faultIP: number?,
 	faultCS: number?,
@@ -361,6 +362,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.inPageFault = false
 	self.aborting = false
 	self.opIP = 0
+	self.opSP = 0
 	self.opCS = 0
 	self.faultIP = nil
 	self.faultCS = nil
@@ -834,6 +836,7 @@ function Cpu.reset(self: Cpu)
 	self.faultIP = nil
 	self.faultCS = nil
 	self.opIP = 0
+	self.opSP = 0
 	self.opCS = 0
 	self.tsc = 0
 	self.intCounts = {}
@@ -950,6 +953,7 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number)
 	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
 		-- Present bit clear on a real descriptor: #NP (#SS for SS), restartable.
 		-- DOS extenders lazily populate LDT slots from their handlers.
+		self.r[5] = self.opSP -- POP Sreg already advanced SP; restart needs it undone
 		self:fault(if reg == "ss" then 12 else 11, band(selector, 0xFFFC))
 		return
 	end
@@ -2733,24 +2737,24 @@ H[0xC4] = function(cpu: any) -- LES r, m16:16 / m16:32
 	const e = cpu:modrm()
 	if cpu.operand32 then
 		const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
-		cpu:wr32(e.reg, cpu:read32(addr))
 		cpu:loadSeg("es", cpu:read16(addr + 4))
+		cpu:wr32(e.reg, cpu:read32(addr))
 	else
 		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-		cpu:wr(e.reg, cpu:read16(addr))
 		cpu:loadSeg("es", cpu:read16(addr + 2))
+		cpu:wr(e.reg, cpu:read16(addr))
 	end
 end
 H[0xC5] = function(cpu: any) -- LDS r, m16:16 / m16:32
 	const e = cpu:modrm()
 	if cpu.operand32 then
 		const addr = cpu:linear(e.seg :: string, e.off :: number, 6)
-		cpu:wr32(e.reg, cpu:read32(addr))
 		cpu:loadSeg("ds", cpu:read16(addr + 4))
+		cpu:wr32(e.reg, cpu:read32(addr))
 	else
 		const addr = cpu:linear(e.seg :: string, e.off :: number, 4)
-		cpu:wr(e.reg, cpu:read16(addr))
 		cpu:loadSeg("ds", cpu:read16(addr + 2))
+		cpu:wr(e.reg, cpu:read16(addr))
 	end
 end
 
@@ -4221,11 +4225,11 @@ local function loadFarSeg(cpu: any, e: ModRM, reg: string)
 	const width = if cpu.operand32 then 6 else 4
 	const addr = cpu:linear(e.seg :: string, e.off :: number, width)
 	if cpu.operand32 then
-		cpu:wr32(e.reg, cpu:read32(addr))
 		cpu:loadSeg(reg, cpu:read16(addr + 4))
+		cpu:wr32(e.reg, cpu:read32(addr))
 	else
-		cpu:wr(e.reg, cpu:read16(addr))
 		cpu:loadSeg(reg, cpu:read16(addr + 2))
+		cpu:wr(e.reg, cpu:read16(addr))
 	end
 end
 H0F[0xB2] = function(cpu: any)
@@ -4577,6 +4581,7 @@ function Cpu.executeStep(self: Cpu): number
 	end
 	self.opIP = self.ip
 	self.opCS = self.cs
+	self.opSP = self.r[5]
 	self.faultIP = nil
 	self.faultCS = nil
 	self.oseg = nil

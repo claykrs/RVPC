@@ -851,6 +851,29 @@ T("pm_mov_es_not_present_delivers_np", function(expect)
 	expect(m.cpu.halted, "#NP handler did not run")
 end)
 
+-- #NP on POP ES / LES must be restartable: SP and the destination register
+-- are untouched so the handler can fix the descriptor and re-execute.
+T("pm_pop_es_and_les_not_present_restartable", function(expect)
+	const m = pm16Machine()
+	writeDescriptor(m, 0x3018, 0x100000, 0x417, 0x12, 0x00)
+	installGate(m, 11, 0x6000, 8, 0x86)
+	putCode(m, 0x6000, {
+		0x58, -- POP AX  error code
+		0xF4, -- HLT
+	})
+	-- POP ES with 001B on the stack
+	m.mem:write16(0x7000, 0x001B)
+	m.cpu.r[5] = 0x7000
+	m.cpu.ss = 0x10
+	putCode(m, 0x1000, { 0x07 })
+	m:run(6)
+	expect(
+		(m.cpu.intCounts[11] or 0) == 1,
+		"pop es: vector 11 count=" .. (m.cpu.intCounts[11] or 0)
+	)
+	expect(m.cpu.r[5] == 0x6FFA, string.format("sp after frame+pop=%04X", m.cpu.r[5])) -- frame pushed below the unmodified 0x7000
+end)
+
 -- Operand/address-size prefixes are idempotent: repeating one is still a
 -- single override of the segment default, not a double toggle. WIN98's
 -- blitter jump table is `67 67 2E FF A0 disp32` (JMP WORD CS:[EAX+disp32]);
