@@ -978,4 +978,35 @@ T("popfd_at_cpl0_changes_iopl", function(expect)
 	expect(band(flags, 0x3000) == 0, "IOPL cleared, flags=" .. string.format("%X", flags))
 end)
 
+-- MOV SS / POP SS hold interrupts off for one instruction so SS:SP can be
+-- loaded as a pair; Windows' real-mode stack switchers rely on it.
+local function ssShadowCpu(bytes)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = 0x202
+	cpu:setSP(0x7000)
+	m.mem:write16(0x7000, 0x0000) -- value popped by POP SS
+	putCode(m, 0x1000, bytes)
+	m:run(1)
+	return cpu
+end
+
+T("mov_ss_inhibits_interrupts_for_one_instruction", function(expect)
+	const cpu = ssShadowCpu({ 0x8E, 0xD0 }) -- mov ss, ax
+	expect(cpu.irqDelay == 1, "irqDelay after MOV SS = " .. tostring(cpu.irqDelay))
+end)
+
+T("pop_ss_inhibits_interrupts_for_one_instruction", function(expect)
+	const cpu = ssShadowCpu({ 0x17 }) -- pop ss
+	expect(cpu.irqDelay == 1, "irqDelay after POP SS = " .. tostring(cpu.irqDelay))
+end)
+
+T("mov_ds_does_not_inhibit_interrupts", function(expect)
+	const cpu = ssShadowCpu({ 0x8E, 0xD8 }) -- mov ds, ax
+	expect(cpu.irqDelay == 0, "irqDelay after MOV DS = " .. tostring(cpu.irqDelay))
+end)
+
 return TESTS

@@ -2196,7 +2196,9 @@ H[0x16] = function(cpu: any)
 	cpu:push16(cpu.ss)
 end
 H[0x17] = function(cpu: any)
-	cpu:loadSeg("ss", cpu:pop16())
+	if cpu:loadSeg("ss", cpu:pop16()) then
+		cpu.irqDelay = 1 -- POP SS inhibits interrupts for one instruction
+	end
 end
 H[0x1E] = function(cpu: any)
 	cpu:push16(cpu.ds)
@@ -2477,7 +2479,10 @@ H[0x8E] = function(cpu: any)
 	if e.reg == 1 then
 		error("MOV CS, r/m is reserved")
 	end
-	cpu:loadSeg(SEGREG[e.reg + 1], cpu:readRM16(e))
+	const reg = SEGREG[e.reg + 1]
+	if cpu:loadSeg(reg, cpu:readRM16(e)) and reg == "ss" then
+		cpu.irqDelay = 1 -- MOV SS inhibits interrupts for one instruction
+	end
 end
 H[0x8F] = function(cpu: any)
 	local e = cpu:modrm()
@@ -4251,6 +4256,9 @@ local function loadFarSeg(cpu: any, e: ModRM, reg: string)
 	else
 		cpu:loadSeg(reg, cpu:read16(addr + 2))
 		cpu:wr(e.reg, cpu:read16(addr))
+	end
+	if reg == "ss" then
+		cpu.irqDelay = 1 -- LSS also inhibits interrupts for one instruction
 	end
 end
 H0F[0xB2] = function(cpu: any)

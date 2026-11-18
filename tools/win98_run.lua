@@ -279,12 +279,13 @@ if watchAddr and opts.watchStep then
 	m.cpu.executeStep = function(self)
 		local pc = ("%04X:%X"):format(self.cs, self.ip)
 		local before = watchBytes()
-		local pre = ("pre ecx=%X esi=%X edi=%X ds=%04X es=%04X"):format(
+		local pre = ("pre ecx=%X esi=%X edi=%X ds=%04X es=%04X sp=%X"):format(
 			self:rr32(1),
 			self:rr32(6),
 			self:rr32(7),
 			self.ds,
-			self.es
+			self.es,
+			self:rr32(4)
 		)
 		local r = orig(self)
 		if watchHits < 40 then
@@ -321,11 +322,14 @@ if opts.ringAt then
 	local rlin = if wantCs then nil else tonumber(opts.ringAt)
 	local ringLen = tonumber(opts.ringLen) or 64
 	local ring, rpos = {}, 0
+	local lastCs, lastIp = 0, 0
 	local orig2 = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
 		if
-			(rlin and self.cs * 16 + self.ip == rlin)
-			or (not rlin and self.cs == rcs and self.ip == rip)
+			(
+				(rlin and self.cs * 16 + self.ip == rlin)
+				or (not rlin and self.cs == rcs and self.ip == rip)
+			) and (opts.ringSp == nil or self:rr32(4) == tonumber(opts.ringSp))
 		then
 			for k = 1, ringLen do
 				local e = ring[(rpos + k - 1) % ringLen + 1]
@@ -340,8 +344,39 @@ if opts.ringAt then
 				table.insert(bt, ("%02X"):format(m.mem:read8(cb + q)))
 			end
 			print("CODE(-8..+24): " .. table.concat(bt, " "))
-			print(("A20=%s SS=%04X SP=%X"):format(tostring(m.mem.a20), self.ss, self:rr32(4)))
+			if opts.ringMem then
+				local ma = tonumber(opts.ringMem)
+				print(
+					("MEM %X: %04X %04X %04X %04X"):format(
+						ma,
+						m.mem:read16(ma),
+						m.mem:read16(ma + 2),
+						m.mem:read16(ma + 4),
+						m.mem:read16(ma + 6)
+					)
+				)
+			end
+			print(
+				("A20=%s SS=%04X SP=%X DS=%04X ES=%04X SI=%X DI=%X BX=%X"):format(
+					tostring(m.mem.a20),
+					self.ss,
+					self:rr32(4),
+					self.ds,
+					self.es,
+					self:rr32(6),
+					self:rr32(7),
+					self:rr32(3)
+				)
+			)
 			process.exit(0)
+		end
+		local jump = opts.ringXfer == nil
+			or self.cs ~= lastCs
+			or self.ip < lastIp
+			or self.ip - lastIp > 12
+		lastCs, lastIp = self.cs, self.ip
+		if not jump then
+			return orig2(self)
 		end
 		ring[rpos % ringLen + 1] = ("%04X:%04X cr0=%X ax=%X bx=%X cx=%X dx=%X sp=%X"):format(
 			self.cs,
@@ -354,7 +389,11 @@ if opts.ringAt then
 			self:rr32(4)
 		)
 		rpos += 1
-		return orig2(self)
+		local r3 = orig2(self)
+		if opts.ringPost and self.opCS * 16 + self.opIP == tonumber(opts.ringPost) then
+			print(("POST op=%04X:%X -> %04X:%X"):format(self.opCS, self.opIP, self.cs, self.ip))
+		end
+		return r3
 	end
 end
 

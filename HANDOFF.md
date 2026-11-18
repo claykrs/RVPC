@@ -212,6 +212,10 @@ Further narrowing of the 1438M derail (all from `tools/out/w98n.snap.1400m`, run
 - A reference emulator is not installed (no qemu/bochs/dosbox); nothing was downloaded.
 - Tools: `--ring-at` also accepts a linear address (no colon), `tools/dis16.py SNAP SEG START LEN` disassembles 16-bit code straight from a checkpoint.
 
+## Update (2026-11-18, 1438M derail FIXED: MOV SS / POP SS interrupt shadow)
+
+Root cause of the 1438M failure: the real-mode INT hook wrapper at `4689:06F4..071C` switches stacks with `mov ss,[24C0]` / `mov sp,[24C2]` (and `pop ss` / `mov sp,[100]`). x86 holds interrupts off for one instruction after `MOV SS`/`POP SS` (and `LSS`) so SS:SP loads as a pair; the CPU only had that shadow after STI, POPF and IRET. A timer IRQ landing between the two instructions pushed its frame on the old stack with the new SS, the saved SS:SP slot was clobbered, and the wrapper later returned onto a stack inside the code of segment `1B9F` (`sp=8C4`), whose `and [bp+0Ah],300h` flag merge then overwrote code (`1B9F:08CC`), sending execution into the zero sled. Fix: `core/Cpu.lua` sets `irqDelay = 1` after POP SS, MOV SS and LSS; tests `mov_ss_inhibits_interrupts_for_one_instruction`, `pop_ss_...`, `mov_ds_does_not_inhibit_interrupts`. From `tools/out/w98n.snap.1400m` SETUP now runs past 1438M with no fault (1500M reached, VGA 640x480, IRQs flowing). Earlier entries about the 4974 call and the HMA return chain were symptoms of this single bug.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
