@@ -18,6 +18,7 @@ const PIT_BASE = 0x40
 const CMOS_INDEX = 0x70
 const CMOS_DATA = 0x71
 const PORT_A20 = 0x92
+const DEVICE_BATCH = 8
 const PCI_ADDRESS = 0xCF8
 const PCI_DATA = 0xCFC
 -- The ISP side must not share the guest NIC's default MAC (52:54:00:12:34:56).
@@ -126,6 +127,7 @@ export type Machine = typeof(setmetatable(
 		-- PIT). Win98 SETUP benchmarks IDIV against PIT channel 2 and refuses
 		-- CPUs below 66 MHz, so hosts running it set 2 or more.
 		timerDivisor: number,
+		devPhase: number,
 		timerPhase: number,
 		atResetVector: boolean,
 		booted: boolean,
@@ -518,6 +520,7 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.irqCount = 0
 	self.int19Count = 0
 	self.timerDivisor = 1
+	self.devPhase = 0
 	self.timerPhase = 0
 	self.atResetVector = false
 	self.booted = false
@@ -1024,116 +1027,168 @@ function Machine.run(self: Machine, maxSteps: number?): number
 	const cmos = self.cmos
 	const timerDivisor = self.timerDivisor
 	local timerPhase = self.timerPhase
-	while steps < budget and not self.exitCode do
-		timerPhase += 1
-		if timerPhase >= timerDivisor then
-			timerPhase = 0
-			if pit then
-				if pit:advance(1) and pic then
-					pic:raise(0)
+	local devPhase = self.devPhase
+	-- The step loop runs under one pcall instead of one per instruction: a
+	-- guest fault that must unwind a half-executed instruction (#GP/#PF raised
+	-- from a memory access) throws the CPU's abort token, which retires that
+	-- instruction here and resumes the loop.
+	const abortToken = cpu.abortToken
+	local function stepLoop()
+		while steps < budget and not self.exitCode do
+			devPhase += 1
+			-- Devices are serviced every DEVICE_BATCH steps and on the first step of
+			-- each run() call; `pending` steps are accounted to the timers at once.
+			if devPhase >= DEVICE_BATCH or steps == 0 then
+				const pending = devPhase
+				devPhase = 0
+				timerPhase += pending
+				if timerPhase >= timerDivisor then
+					const ticks = timerPhase // timerDivisor
+					timerPhase -= ticks * timerDivisor
+					if pit then
+						if pit:advance(ticks) and pic then
+							pic:raise(0)
+						end
+					end
+					-- MC146818 clock and interrupt engine. The periodic tick is what
+					-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise
+					-- IRQ8 through the same status C/IRQF path.
+					if cmos then
+						if cmos:advance(ticks) and pic then
+							pic:raise(8)
+						end
+					end
+				end
+				-- Retire pending PIO write completions (BSY -> DRDY + INTRQ) so guest
+				-- drivers observe the device-busy commit period of a real device.
+				for _ = 1, pending do
+					if ide and ide.writeDoneCycles > 0 then
+						ide:advance()
+					end
+					if ide2 and ide2.writeDoneCycles > 0 then
+						ide2:advance()
+					end
+				end
+				if pic then
+					-- Each takeIrq is side-effect free unless its own pending/armed
+					-- field is set, so those fields are a cheap equivalent gate.
+					if kbc then
+						if kbc.irq1Armed and kbc:takeIrq1() then
+							pic:raise(1)
+						end
+						if kbc.irq12Armed and kbc:takeIrq12() then
+							pic:raise(12)
+						end
+					end
+					if ide and ide.irqPending and ide:takeIrq() then
+						pic:raise(14)
+					end
+					if ide2 and ide2.irqPending and ide2:takeIrq() then
+						pic:raise(15)
+					end
+					if ne2000 and (ne2000.irqLine or band(ne2000.isr, ne2000.imr) ~= 0) then
+						if ne2000:takeIrq() then
+							pic:raise(10)
+						end
+					end
+					if sb16 and sb16.irqPending and sb16:takeIrq() then
+						pic:raise(5)
+					end
+					if fdc and fdc.irqPending and fdc:takeIrq() then
+						pic:raise(6)
+					end
+					self.sb16Clock += pending
+					if sb16 and self.sb16Clock % 1024 < pending then
+						sb16:tick()
+					end
 				end
 			end
-			-- MC146818 clock and interrupt engine. The periodic tick is what
-			-- SeaBIOS INT 15h/AH=86h counts down; update/alarm events raise
-			-- IRQ8 through the same status C/IRQF path.
-			if cmos then
-				if cmos:advance(1) and pic then
-					pic:raise(8)
+			if cpu.halted then
+				-- The TSC is a free-running counter. BIOS timer waits (notably
+				-- INT 15h/AH=86h) use it to measure elapsed time; if it only
+				-- advanced on retired instructions, a halted CPU would make those
+				-- waits effectively infinite.
+				if cpu.tsc then
+					cpu.tsc += 1
 				end
-			end
-		end
-		-- Retire pending PIO write completions (BSY -> DRDY + INTRQ) so guest
-		-- drivers observe the device-busy commit period of a real device.
-		if ide and ide.writeDoneCycles > 0 then
-			ide:advance()
-		end
-		if ide2 and ide2.writeDoneCycles > 0 then
-			ide2:advance()
-		end
-		if pic then
-			-- Each takeIrq is side-effect free unless its own pending/armed
-			-- field is set, so those fields are a cheap equivalent gate.
-			if kbc then
-				if kbc.irq1Armed and kbc:takeIrq1() then
-					pic:raise(1)
-				end
-				if kbc.irq12Armed and kbc:takeIrq12() then
-					pic:raise(12)
-				end
-			end
-			if ide and ide.irqPending and ide:takeIrq() then
-				pic:raise(14)
-			end
-			if ide2 and ide2.irqPending and ide2:takeIrq() then
-				pic:raise(15)
-			end
-			if ne2000 and (ne2000.irqLine or band(ne2000.isr, ne2000.imr) ~= 0) then
-				if ne2000:takeIrq() then
-					pic:raise(10)
-				end
-			end
-			if sb16 and sb16.irqPending and sb16:takeIrq() then
-				pic:raise(5)
-			end
-			if fdc and fdc.irqPending and fdc:takeIrq() then
-				pic:raise(6)
-			end
-			self.sb16Clock += 1
-			if sb16 and self.sb16Clock % 1024 == 0 then
-				sb16:tick()
-			end
-		end
-		if cpu.halted then
-			-- The TSC is a free-running counter. BIOS timer waits (notably
-			-- INT 15h/AH=86h) use it to measure elapsed time; if it only
-			-- advanced on retired instructions, a halted CPU would make those
-			-- waits effectively infinite.
-			if cpu.tsc then
-				cpu.tsc += 1
-			end
-			if not self:deliverInterrupt() then
-				idle += 1
-				-- A halted CPU waits for the next timer tick; give a full 8254
-				-- period (up to 65536 counts) before declaring the machine dead.
-				if idle > 200000 then
-					break
+				if not self:deliverInterrupt() then
+					idle += 1
+					-- A halted CPU waits for the next timer tick; give a full 8254
+					-- period (up to 65536 counts) before declaring the machine dead.
+					if idle > 200000 then
+						break
+					end
+				else
+					idle = 0
 				end
 			else
+				if pic and band(cpu.flags, 0x200) ~= 0 and cpu.irqDelay == 0 then
+					self:deliverInterrupt()
+				end
+				-- step() only wraps executeStep in tracing/paging support; skip the
+				-- extra call in the common unpaged, untraced case.
+				if not cpu.traceEnabled then
+					cpu:executeStep()
+				else
+					cpu:step()
+				end
 				idle = 0
 			end
-		else
-			if pic and band(cpu.flags, 0x200) ~= 0 and cpu.irqDelay == 0 then
-				self:deliverInterrupt()
+			-- A guest warm boot can re-enter the BIOS via INT 19h or the reset
+			-- vector without asserting IDE SRST. Reset the channels so a stale
+			-- OAKCDROM probe error cannot hide the HDD from the next boot's
+			-- SeaBIOS drive scan.
+			if devPhase == 0 then
+				-- Only just serviced: INT 19h is rare, so sample it per device pass.
+				const int19 = cpu.intCounts[0x19] or 0
+				if int19 > self.int19Count then
+					self.int19Count = int19
+					resetIdeChannels(self)
+				end
 			end
-			-- step() only wraps executeStep in tracing/paging support; skip the
-			-- extra call in the common unpaged, untraced case.
-			if not cpu.traceEnabled and band(cpu.cr0, 0x80000001) == 0 then
-				cpu:executeStep()
-			else
-				cpu:step()
+			const atResetVector = cpu.ip == 0xFFF0 and cpu.cs == 0xF000
+			if atResetVector or self.atResetVector then
+				if self.booted and atResetVector and not self.atResetVector then
+					resetIdeChannels(self)
+				end
+				self.atResetVector = atResetVector
 			end
-			idle = 0
+			if not self.booted and not atResetVector then
+				self.booted = true
+			end
+			steps += 1
 		end
-		-- A guest warm boot can re-enter the BIOS via INT 19h or the reset
-		-- vector without asserting IDE SRST. Reset the channels so a stale
-		-- OAKCDROM probe error cannot hide the HDD from the next boot's
-		-- SeaBIOS drive scan.
-		const int19 = cpu.intCounts[0x19] or 0
-		if int19 > self.int19Count then
-			self.int19Count = int19
-			resetIdeChannels(self)
+	end
+	while true do
+		const ok, err = pcall(stepLoop)
+		if ok then
+			break
 		end
-		const atResetVector = cpu.cs == 0xF000 and cpu.ip == 0xFFF0
-		if self.booted and atResetVector and not self.atResetVector then
-			resetIdeChannels(self)
+		if err ~= abortToken then
+			error(err, 0)
 		end
-		self.atResetVector = atResetVector
-		if not self.booted and not atResetVector then
-			self.booted = true
-		end
+		cpu.aborting = false
 		steps += 1
+		idle = 0
+	end
+	-- Flush steps still pending since the last device pass so the timers stay
+	-- exact at every run() boundary (IRQs raised here deliver on the next step).
+	if devPhase > 0 then
+		timerPhase += devPhase
+		devPhase = 0
+		if timerPhase >= timerDivisor then
+			const ticks = timerPhase // timerDivisor
+			timerPhase -= ticks * timerDivisor
+			if pit and pit:advance(ticks) and pic then
+				pic:raise(0)
+			end
+			if cmos and cmos:advance(ticks) and pic then
+				pic:raise(8)
+			end
+		end
 	end
 	self.timerPhase = timerPhase
+	self.devPhase = devPhase
 	return steps
 end
 

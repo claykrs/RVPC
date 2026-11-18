@@ -137,6 +137,7 @@ export type Cpu = {
 	inPageFault: boolean,
 	aborting: boolean,
 	inSegFault: boolean?,
+	abortToken: any,
 	-- Start of the instruction currently executing (architectural fault EIP) and
 	-- the pending fault context used when a #PF or synchronous exception frame
 	-- is built.
@@ -362,6 +363,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.lastPageFault = nil
 	self.inPageFault = false
 	self.aborting = false
+	self.abortToken = ABORT_INSTRUCTION
 	self.opIP = 0
 	self.opSP = 0
 	self.opCS = 0

@@ -77,24 +77,23 @@ end
 function Pit.advance(self: Pit, cycles: number): boolean
 	local irq = false
 	const channels = self.channels
-	local skipChannel0 = false
+	-- Channel 0 sees one count per `channel0Divisor` guest steps; batched calls
+	-- (cycles > 1) carry the remainder in channel0Phase.
+	local channel0Cycles = cycles
 	if self.channel0Divisor > 1 then
-		const phase = self.channel0Phase + 1
-		if phase >= self.channel0Divisor then
-			self.channel0Phase = 0
-		else
-			self.channel0Phase = phase
-			skipChannel0 = true
-		end
+		const total = self.channel0Phase + cycles
+		channel0Cycles = total // self.channel0Divisor
+		self.channel0Phase = total - channel0Cycles * self.channel0Divisor
 	end
 	for index = 0, CHANNELS - 1 do
-		if index == 0 and skipChannel0 then
+		const ticks = if index == 0 then channel0Cycles else cycles
+		if ticks == 0 then
 			continue
 		end
 		const channel = channels[index + 1]
 		-- Inline reloadValue: advance runs once per guest instruction.
 		const period = if channel.reload == 0 then 0x10000 else channel.reload
-		local remaining = channel.counter - cycles
+		local remaining = channel.counter - ticks
 		while remaining <= 0 do
 			remaining += period
 			if index == 0 then
