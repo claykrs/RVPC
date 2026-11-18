@@ -191,6 +191,17 @@ The 1438M call at `4974:6C77` (`nop; push cs; call F5AE`, same bytes from 192M o
 
 Reading: the loader computed the near-call target from a relocation record that does not belong to this segment (or segment 4974 was given a wrong size), so look at the segment-table/relocation read that feeds `02EF:7A1D` next. New tool: `tools/win98_run.lua --load SNAP --dump ADDR [--dump-len N]` prints physical bytes from a checkpoint and exits. Checkpoints `tools/out/w98b.snap191/192` bracket the load (ignored files).
 
+## Update (2026-11-18, later: the 4974 call is a symptom, the real derail is a stack-return chain in the HMA)
+
+Correction to the entry above. The call at `4974:6C77` is not the first bad event. Tracing from `tools/out/w98n_1437.snap` with the new `--ring-at CS:IP [--ring-len N]` option (prints the last N executed `cs:ip` and registers when that address is reached) shows:
+
+- The `call far [cs:241C]` at `1B9F:18E0` (an interrupt-hook chain) normally reaches `1B67:0104`. On its fourth execution the instruction bytes had become `2E FF 1E 1C 6E`: the displacement byte at `1B9F:18E4` went from `24` to `6E`, so the pointer read came from ASCII text (`ultIcon"` = `4974:6C75`). That is how execution reached `4974:6C75` and then `F5AE`.
+- The corruption is done by a zero sled: execution slides through `0575:0003..FFFF` (`add [bx+si],al` over zero bytes, hundreds of thousands of steps) and its writes damage nearby code. `--watch 0x1D2D3 --watch-step 1` names the writer as `0575:1D48`.
+- The sled starts from a bad return: DOS code in the HMA (`FE2E:` = linear `0x100000+`, A20 is on) runs the BCD date routine at `FE2E:288F` (`INT 1Ah AH=4`), then `ret`s along a chain `FE2E:295D -> BCA3 -> A324 -> A3E2 -> 1E8B -> 1EDA` and the last `ret` pops `0575:0002`. The stack is `1B9F:2679` (the word there is `BCA3` before the window starts, so it was pushed earlier than 1437M).
+- Nothing in the 4974 segment layout notes above needs fixing: segment 1 of that NE module is `C571` bytes with calls beyond it (those are the linker's `push cs; call` thunks into the module's other segments), and the data at `5896:0` is seg 2 loaded by the DOSX real-mode copier `1B9F:0479`.
+
+Next step: find which `call`/`ret` pair on this chain is unbalanced, i.e. who pushed `BCA3` at `1B9F:2679` and why the chain from `A324` returns into `1E8B`. Take a checkpoint before 1437M (`tools/out/w98n.snap.1400m`) and `--ring-at FE2E:288F --ring-len 400` to see the entry. Tools added this pass: `--dump ADDR [--dump-len N]`, `--ring-at CS:IP [--ring-len N]`, and `--watch-step` now prints the pre-instruction `ecx/esi/edi/ds/es`.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).

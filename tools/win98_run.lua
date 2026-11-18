@@ -279,14 +279,22 @@ if watchAddr and opts.watchStep then
 	m.cpu.executeStep = function(self)
 		local pc = ("%04X:%X"):format(self.cs, self.ip)
 		local before = watchBytes()
+		local pre = ("pre ecx=%X esi=%X edi=%X ds=%04X es=%04X"):format(
+			self:rr32(1),
+			self:rr32(6),
+			self:rr32(7),
+			self.ds,
+			self.es
+		)
 		local r = orig(self)
 		if watchHits < 40 then
 			local after = watchBytes()
 			if after ~= before then
 				watchHits += 1
 				print(
-					("WATCH written by %s cr0=%X ds=%04X es=%04X ss=%04X eax=%X ecx=%X esi=%X edi=%X: %s -> %s"):format(
+					("WATCH written by %s %s cr0=%X ds=%04X es=%04X ss=%04X eax=%X ecx=%X esi=%X edi=%X: %s -> %s"):format(
 						pc,
+						pre,
 						self.cr0,
 						self.ds,
 						self.es,
@@ -302,6 +310,47 @@ if watchAddr and opts.watchStep then
 			end
 		end
 		return r
+	end
+end
+
+-- --ring-at CS:IP [--ring-len N]: print the last N executed cs:ip (with registers)
+-- when CS:IP is reached, plus the code bytes there, A20 and SS:SP, then exit.
+if opts.ringAt then
+	local wantCs, wantIp = string.match(opts.ringAt, "^(%x+):(%x+)$")
+	local rcs, rip = tonumber(wantCs, 16), tonumber(wantIp, 16)
+	local ringLen = tonumber(opts.ringLen) or 64
+	local ring, rpos = {}, 0
+	local orig2 = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if self.cs == rcs and self.ip == rip then
+			for k = 1, ringLen do
+				local e = ring[(rpos + k - 1) % ringLen + 1]
+				if e then
+					print(e)
+				end
+			end
+			print(("HIT %04X:%X"):format(rcs, rip))
+			local cb = self.cs * 16 + self.ip
+			local bt = {}
+			for q = -8, 24 do
+				table.insert(bt, ("%02X"):format(m.mem:read8(cb + q)))
+			end
+			print("CODE(-8..+24): " .. table.concat(bt, " "))
+			print(("A20=%s SS=%04X SP=%X"):format(tostring(m.mem.a20), self.ss, self:rr32(4)))
+			process.exit(0)
+		end
+		ring[rpos % ringLen + 1] = ("%04X:%04X cr0=%X ax=%X bx=%X cx=%X dx=%X sp=%X"):format(
+			self.cs,
+			self.ip,
+			self.cr0,
+			self:rr32(0),
+			self:rr32(3),
+			self:rr32(1),
+			self:rr32(2),
+			self:rr32(4)
+		)
+		rpos += 1
+		return orig2(self)
 	end
 end
 
