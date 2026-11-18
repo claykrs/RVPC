@@ -127,6 +127,18 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	-- --dump ADDR [--dump-len N]: print physical bytes of the loaded checkpoint and exit.
+	if opts.dump then
+		local a, n = tonumber(opts.dump), tonumber(opts.dumpLen) or 64
+		for row = 0, n - 1, 16 do
+			local t = {}
+			for k = row, math.min(row + 15, n - 1) do
+				table.insert(t, ("%02X"):format(m.mem:read8(a + k)))
+			end
+			print(("%X: %s"):format(a + row, table.concat(t, " ")))
+		end
+		process.exit(0)
+	end
 end
 
 local function checkpoint(path)

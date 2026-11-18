@@ -180,6 +180,17 @@ empty IDE device positions now float the ISA bus (0xFF reads, lost writes,
 no phantom ATAPI signatures), matching real hardware; Win98 SETUP passes CD
 detection and reaches the CAB-copy blocker.
 
+## Update (2026-11-18, module layout at 4974)
+
+The 1438M call at `4974:6C77` (`nop; push cs; call F5AE`, same bytes from 192M on) targets the middle of a lookup table, 0x12 below the function at `F5C0`. The module is real-mode segment `4974` (phys `0x49740`); the loader (PM code at `02EF:7A1D`, step 191M-192M) writes the patched call. Memory layout at 192M, identical to 250M, so nothing overwrites it before the 382M fill:
+
+- `4974:F500..F542` is the last function of a code segment ending in `pop bp; dec bp; retf`; it still holds an unresolved far call (`9A FFFF 0000`).
+- `F544..F58E` is an NE relocation table (count 9, 8-byte records), then zeros, then a 32-byte lookup table at `F5A0`, then real functions from `F5C0` (a keyboard-controller poll routine).
+- Unresolved `9A FFFF 0000` fixups exist only at `F52F`, `FA23`, `FAA4`: everything from F500 up is raw, unrelocated data, so the code segment is only `F543` bytes and the callers' target `F5AE` is outside it.
+- Seven callers share target `F5AE`; every other call target below F500 lands on a prologue.
+
+Reading: the loader computed the near-call target from a relocation record that does not belong to this segment (or segment 4974 was given a wrong size), so look at the segment-table/relocation read that feeds `02EF:7A1D` next. New tool: `tools/win98_run.lua --load SNAP --dump ADDR [--dump-len N]` prints physical bytes from a checkpoint and exits. Checkpoints `tools/out/w98b.snap191/192` bracket the load (ignored files).
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
