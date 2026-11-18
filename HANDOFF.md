@@ -216,6 +216,10 @@ Further narrowing of the 1438M derail (all from `tools/out/w98n.snap.1400m`, run
 
 Root cause of the 1438M failure: the real-mode INT hook wrapper at `4689:06F4..071C` switches stacks with `mov ss,[24C0]` / `mov sp,[24C2]` (and `pop ss` / `mov sp,[100]`). x86 holds interrupts off for one instruction after `MOV SS`/`POP SS` (and `LSS`) so SS:SP loads as a pair; the CPU only had that shadow after STI, POPF and IRET. A timer IRQ landing between the two instructions pushed its frame on the old stack with the new SS, the saved SS:SP slot was clobbered, and the wrapper later returned onto a stack inside the code of segment `1B9F` (`sp=8C4`), whose `and [bp+0Ah],300h` flag merge then overwrote code (`1B9F:08CC`), sending execution into the zero sled. Fix: `core/Cpu.lua` sets `irqDelay = 1` after POP SS, MOV SS and LSS; tests `mov_ss_inhibits_interrupts_for_one_instruction`, `pop_ss_...`, `mov_ds_does_not_inhibit_interrupts`. From `tools/out/w98n.snap.1400m` SETUP now runs past 1438M with no fault (1500M reached, VGA 640x480, IRQs flowing). Earlier entries about the 4974 call and the HMA return chain were symptoms of this single bug.
 
+## Update (2026-11-18, 1641M fault fixed: segment limit violations are guest #GP/#SS)
+
+SETUP's DOSX pointer validator (`0367:4B62`, `les bx,[bp+8]` then `mov al,es:[bx]`) probes a possibly null selector and relies on the #GP handler to resume it. `Cpu.linear` raised a host error for a limit violation, so the run died at 1641M (`#GP: es selector 0000`). It now delivers #GP(0) (#SS(0) for SS) through the IDT and unwinds the instruction with the existing abort sentinel; because that unwind needs a pcall, `Cpu.step` and `Machine.run` use it whenever CR0.PE or PG is set (about 25% slower in protected mode). SETUP now passes 1641M and reached 1700M from `w98f.snap.1500m`.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).

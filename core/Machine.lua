@@ -1107,7 +1107,7 @@ function Machine.run(self: Machine, maxSteps: number?): number
 			end
 			-- step() only wraps executeStep in tracing/paging support; skip the
 			-- extra call in the common unpaged, untraced case.
-			if not cpu.traceEnabled and band(cpu.cr0, 0x80000000) == 0 then
+			if not cpu.traceEnabled and band(cpu.cr0, 0x80000001) == 0 then
 				cpu:executeStep()
 			else
 				cpu:step()

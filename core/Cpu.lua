@@ -136,6 +136,7 @@ export type Cpu = {
 	lastPageFault: { addr: number, errorCode: number, write: boolean, user: boolean }?,
 	inPageFault: boolean,
 	aborting: boolean,
+	inSegFault: boolean?,
 	-- Start of the instruction currently executing (architectural fault EIP) and
 	-- the pending fault context used when a #PF or synchronous exception frame
 	-- is built.
@@ -1522,17 +1523,39 @@ function Cpu.linear(self: Cpu, reg: string, off: number, size: number): number
 	if band(self.cr0, 1) ~= 0 and size > 0 then
 		const limit = self.segLimit[reg]
 		if off + size - 1 > limit then
-			const kind = if reg == "ss" then "#SS" else "#GP"
-			error(
-				("%s: %s selector %04X offset %04X size %d exceeds limit %04X"):format(
-					kind,
-					reg,
-					selector,
-					off,
-					size,
-					limit
+			-- Segment limit violation (and null/unusable selectors, which carry
+			-- limit 0): a guest-visible #GP(0)/#SS(0), not a host error. Windows'
+			-- pointer validators (e.g. the DOSX probe at 0367:4B62) rely on the
+			-- fault handler resuming them after a bad selector.
+			if self.inSegFault then
+				error(
+					("#GP: %s selector %04X offset %04X size %d exceeds limit %04X"):format(
+						reg,
+						selector,
+						off,
+						size,
+						limit
+					)
 				)
-			)
+			end
+			self.inSegFault = true
+			const ok = pcall(function()
+				self:fault(if reg == "ss" then 12 else 13, 0)
+			end)
+			self.inSegFault = false
+			if not ok then
+				error(
+					("#GP: %s selector %04X offset %04X size %d exceeds limit %04X"):format(
+						reg,
+						selector,
+						off,
+						size,
+						limit
+					)
+				)
+			end
+			self.aborting = true
+			error(ABORT_INSTRUCTION, 0)
 		end
 	end
 	return base + off
@@ -4690,7 +4713,7 @@ function Cpu.step(self: Cpu): number
 			self.badCsTrace = self:traceDump(40)
 		end
 	end
-	if band(self.cr0, CR0_PG) == 0 then
+	if band(self.cr0, bor(CR0_PG, CR0_PE)) == 0 then
 		return (self :: any):executeStep()
 	end
 	-- pcall(f, self) instead of a wrapping closure: no allocation per
