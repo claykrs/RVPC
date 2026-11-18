@@ -248,6 +248,51 @@ local verifySpan = (opts.verifySpan or 20) * 1_000_000
 local stopReason = "budget"
 local startedAt = os.clock()
 
+-- --watch ADDR [--watch-len N] [--watch-step 1]: stop when physical bytes change.
+-- Chunk mode names the 1M-step window; step mode wraps Cpu.executeStep and prints
+-- the writing instruction (run it from a checkpoint just before the window).
+local watchAddr = if opts.watch then tonumber(opts.watch) else nil
+local watchLen = tonumber(opts.watchLen) or 8
+local function watchBytes()
+	local t = table.create(watchLen)
+	for k = 0, watchLen - 1 do
+		t[k + 1] = ("%02X"):format(m.mem:read8(watchAddr + k))
+	end
+	return table.concat(t, " ")
+end
+local watchLast = if watchAddr then watchBytes() else nil
+local watchHits = 0
+if watchAddr and opts.watchStep then
+	local orig = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		local pc = ("%04X:%X"):format(self.cs, self.ip)
+		local before = watchBytes()
+		local r = orig(self)
+		if watchHits < 40 then
+			local after = watchBytes()
+			if after ~= before then
+				watchHits += 1
+				print(
+					("WATCH written by %s cr0=%X ds=%04X es=%04X ss=%04X eax=%X ecx=%X esi=%X edi=%X: %s -> %s"):format(
+						pc,
+						self.cr0,
+						self.ds,
+						self.es,
+						self.ss,
+						self:rr32(0),
+						self:rr32(1),
+						self:rr32(6),
+						self:rr32(7),
+						before,
+						after
+					)
+				)
+			end
+		end
+		return r
+	end
+end
+
 local function advance(limit)
 	-- Runs until st.executed reaches `limit`; returns a stop reason or nil.
 	while st.executed < limit do
@@ -259,6 +304,23 @@ local function advance(limit)
 			return "fault"
 		end
 		st.executed += result
+		if watchAddr then
+			local now = watchBytes()
+			if now ~= watchLast then
+				print(
+					("WATCH %s changed in the chunk ending at %d: %s -> %s"):format(
+						opts.watch,
+						st.executed,
+						watchLast,
+						now
+					)
+				)
+				watchLast = now
+				if opts.watchStop then
+					return "watch"
+				end
+			end
+		end
 		if m.irqCount ~= st.irqSeen then
 			st.irqSeen = m.irqCount
 			st.irqAt = st.executed
