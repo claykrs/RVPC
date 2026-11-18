@@ -138,6 +138,7 @@ export type Cpu = {
 	aborting: boolean,
 	inSegFault: boolean?,
 	abortToken: any,
+	descCache: { [number]: any },
 	-- Start of the instruction currently executing (architectural fault EIP) and
 	-- the pending fault context used when a #PF or synchronous exception frame
 	-- is built.
@@ -364,6 +365,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.inPageFault = false
 	self.aborting = false
 	self.abortToken = ABORT_INSTRUCTION
+	self.descCache = {}
 	self.opIP = 0
 	self.opSP = 0
 	self.opCS = 0
@@ -918,6 +920,52 @@ local function readDescriptor(cpu: any, selector: number): Descriptor?
 	}
 end
 
+-- Segment-register loads dominate 16-bit protected-mode code (MOV ES,r in tight
+-- loops). With paging off, validate a cached parse by re-reading the two raw
+-- descriptor words so guest edits to the GDT/LDT are still seen immediately.
+local function loadDescriptor(cpu: any, selector: number): Descriptor?
+	if band(cpu.cr0, CR0_PG) ~= 0 or band(selector, 0xFFFC) == 0 then
+		return readDescriptor(cpu, selector)
+	end
+	const index = rshift(band(selector, 0xFFF8), 3)
+	local base, limit = cpu.gdtr.base, cpu.gdtr.limit
+	if band(selector, 4) ~= 0 then
+		base, limit = cpu.ldtrBase, cpu.ldtrLimit
+	end
+	if index * 8 + 7 > limit then
+		return nil
+	end
+	const addr = base + index * 8
+	const mem = cpu.mem
+	const lo = mem:read32(addr)
+	const hi = mem:read32(addr + 4)
+	const cache = cpu.descCache
+	local c = cache[selector]
+	if c and c.addr == addr and c.lo == lo and c.hi == hi then
+		return c
+	end
+	const flags = band(rshift(hi, 16), 0xFF)
+	local descLimit = bor(band(lo, 0xFFFF), lshift(band(flags, 0x0F), 16))
+	if band(flags, 0x80) ~= 0 then
+		descLimit = bor(lshift(descLimit, 12), 0xFFF)
+	end
+	c = {
+		addr = addr,
+		lo = lo,
+		hi = hi,
+		base = bor(rshift(lo, 16), lshift(band(hi, 0xFF), 16), lshift(rshift(hi, 24), 24)),
+		limit = descLimit,
+		access = band(rshift(hi, 8), 0xFF),
+		flags = flags,
+		raw0 = band(lo, 0xFFFF),
+		raw2 = rshift(lo, 16),
+		raw4 = band(hi, 0xFF),
+		raw6 = band(rshift(hi, 16), 0xFFFF),
+	}
+	cache[selector] = c
+	return c
+end
+
 -- Refresh a cache if host/test code assigned the segment register directly.
 -- Real mode is always a plain paragraph; PM validates through the GDT/LDT.
 function Cpu.ensureSeg(self: Cpu, reg: string)
@@ -952,7 +1000,7 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number): boolean
 		self.segSel[reg] = 0
 		return true
 	end
-	const desc = readDescriptor(self, selector)
+	const desc = loadDescriptor(self, selector)
 	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
 		-- Present bit clear on a real descriptor: #NP (#SS for SS), restartable.
 		-- DOS extenders lazily populate LDT slots from their handlers.

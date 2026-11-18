@@ -1122,7 +1122,12 @@ function Machine.run(self: Machine, maxSteps: number?): number
 					idle = 0
 				end
 			else
-				if pic and band(cpu.flags, 0x200) ~= 0 and cpu.irqDelay == 0 then
+				if
+					pic
+					and pic.master.irr ~= 0
+					and band(cpu.flags, 0x200) ~= 0
+					and cpu.irqDelay == 0
+				then
 					self:deliverInterrupt()
 				end
 				-- step() only wraps executeStep in tracing/paging support; skip the

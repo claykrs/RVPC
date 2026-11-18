@@ -428,12 +428,23 @@ end
 if opts.bench then
 	local n = tonumber(opts.bench) :: number
 	local t0 = os.clock()
-	local cpu = m.cpu
-	for _ = 1, n do
-		cpu:step()
+	if opts.benchRun then
+		m:run(n)
+	else
+		local cpu = m.cpu
+		for _ = 1, n do
+			cpu:step()
+		end
 	end
 	local dt = os.clock() - t0
-	print(("bench: %d steps in %.2fs = %.2f M/s"):format(n, dt, n / dt / 1e6))
+	print(
+		("bench%s: %d steps in %.2fs = %.2f M/s"):format(
+			if opts.benchRun then " (m:run)" else " (raw step)",
+			n,
+			dt,
+			n / dt / 1e6
+		)
+	)
 	process.exit(0)
 end
 
