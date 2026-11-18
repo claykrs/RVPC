@@ -671,7 +671,8 @@ function Vga.new(mem: Memory): Vga
 	const self = setmetatable({}, Vga) :: any
 	self.mem = mem
 	self.modeNumber = 0x03
-	self.info = MODES[0x03] :: ModeInfo
+	-- Cloned: a mode record shared across machines would be mutated by checkpoint restore.
+	self.info = table.clone(MODES[0x03] :: ModeInfo)
 	self.crtc = table.create(25, 0) :: { number }
 	self.crtcIndex = 0
 	self.crtcProtected = false
@@ -1070,7 +1071,7 @@ function Vga.setMode(self: Vga, mode: number): boolean
 	self.vbeInfo = nil
 	self.dac8 = false
 	self.modeNumber = key
-	self.info = info
+	self.info = table.clone(info)
 	self.crtcProtected = false
 	for index = 0, 24 do
 		self.crtc[index] = registers.crtc[index + 1] or 0
@@ -1327,7 +1328,7 @@ function Vga.syncLegacyMode(self: Vga)
 		then
 			return
 		end
-		self.info = textInfo
+		self.info = table.clone(textInfo)
 		self.modeNumber = textInfo.mode
 		self.widthPx = textInfo.width
 		self.heightPx = textInfo.height

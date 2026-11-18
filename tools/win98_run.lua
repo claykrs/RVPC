@@ -115,6 +115,9 @@ local function newState()
 		lastGuiAct = 0,
 		guiShot = 0,
 		statusAt = 0,
+		irqSeen = 0,
+		irqAt = 0,
+		stallReported = false,
 	}
 end
 
@@ -256,6 +259,21 @@ local function advance(limit)
 			return "fault"
 		end
 		st.executed += result
+		if m.irqCount ~= st.irqSeen then
+			st.irqSeen = m.irqCount
+			st.irqAt = st.executed
+			st.stallReported = false
+		elseif st.executed - st.irqAt >= 12_000_000 and not st.stallReported then
+			st.stallReported = true
+			print(
+				([[IRQSTALL since %d (now %d) IF=%s pc=%s]]):format(
+					st.irqAt,
+					st.executed,
+					tostring(bit32.band(m.cpu.flags, 0x200) ~= 0),
+					m:bootPc()
+				)
+			)
+		end
 		if st.executed >= 500_000_000 and m.pit.channel0Divisor ~= 1 then
 			m.pit.channel0Divisor = 1
 		end

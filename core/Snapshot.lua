@@ -283,7 +283,15 @@ function Snapshot.apply(target: any, data: string): any
 			pos += 8
 			local b = parent[key]
 			if typeof(b) ~= "buffer" or buffer.len(b) ~= len then
-				error("snapshot: buffer mismatch against the fresh machine")
+				error(
+					"snapshot: buffer mismatch against the fresh machine at "
+						.. table.concat(path, ".")
+						.. " (len "
+						.. tostring(len)
+						.. " vs "
+						.. (if typeof(b) == "buffer" then tostring(buffer.len(b)) else typeof(b))
+						.. ")"
+				)
 			end
 			for _ = 1, count do
 				local idx = unpack("<I4", data, pos)
