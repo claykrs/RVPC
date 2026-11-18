@@ -4,6 +4,32 @@ Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
 ## Current state (2026-11-18) - read this first
 
+## Update (later 2026-11-18): the IRQ0 stall is explained and fixed; a new derail follows it
+
+**Root cause of the IRQ0 stall (fixed in `fa8e0d0`):** `IRQSTALL` starts at 1438M steps. The machine is in protected mode at
+CPL 3 (selector 03A7, DPL 3) with IOPL=2 and a 16-bit TSS, so `out 0x20,al` (the extender's PIC EOI) raises #GP forever
+(INT 0Dh at 03A7:287, about 220 per 100k steps) and IF stays 0. IOPL had been clobbered because POPF/IRET let ring-3 code
+overwrite IOPL and IF. They now follow x86: only CPL 0 changes IOPL, IF changes only when CPL <= IOPL (`privilegedFlags`
+in `core/Cpu.lua`, tests in `tests/Cpu386Tests.lua`).
+
+**Checkpoint bug fixed (`cbb47f1`):** `vga.info` aliased the shared `MODES[3]` table, so restoring a checkpoint mutated a
+module constant and every later fresh machine inherited the mode (a checkpoint saved from an already-loaded machine could not
+be loaded). `vga.info` is now a per-machine copy. Checkpoints taken before this change and saved from loaded machines are
+unusable; `win98.snap.*` from the original driver run are fine to load. `win98_run` now prints `IRQSTALL since N`.
+
+**New failure after the fix (not understood yet):** from the corrected checkpoints SETUP now faults at 1438M instead
+(`bad FF /7 at 06DF:8492`). Straight-line execution runs through DOS data (the CDS/directory cache) because a `retf` at
+`4974:E27B` returns to `0000:0000` (a null far pointer; the IVT is then executed as code for ~1400 steps, then a DOS INT 21
+return lands in 06DF:817B). So the question is where that null far pointer on the stack/table comes from (the routine at
+4974:E246-E27B and its caller around 4974:CCA..F873). Reproduce in about 50 s: `lune run tools/win98_run.lua --load
+tools/out/w98n.snap.1400m --budget 1440` (make `w98n.snap.1400m` with `--load tools/out/win98.snap.1250m --save-every 100
+--save tools/out/w98n.snap --budget 1400`).
+
+**Probing technique that worked:** load a checkpoint, wrap `m.cpu.executeStep` with a function that records `cs:ip` into a
+ring buffer, then call `m:run(1000000)` twice. Results depend on the `m:run` chunk size (IRQ delivery granularity), so use
+the same 1M chunks as `win98_run` or the failure does not reproduce. Keys are injected by the driver every 80M steps after
+580M; a bare probe misses those and diverges.
+
 **Win98 SETUP is past the old faults but hangs at the graphical wizard.** The fix `7e17181` (retf #NP) is confirmed:
 SETUP no longer Bad-Faults at 2761M steps. The wizard ("Preparing to run Windows 98 Setup", progress 100%) draws at about
 580M steps and then nothing advances through 4.5B (`END budget`, no reboot). Evidence: `irqCount` is frozen at 12186 from
