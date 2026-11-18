@@ -220,6 +220,15 @@ Root cause of the 1438M failure: the real-mode INT hook wrapper at `4689:06F4..0
 
 SETUP's DOSX pointer validator (`0367:4B62`, `les bx,[bp+8]` then `mov al,es:[bx]`) probes a possibly null selector and relies on the #GP handler to resume it. `Cpu.linear` raised a host error for a limit violation, so the run died at 1641M (`#GP: es selector 0000`). It now delivers #GP(0) (#SS(0) for SS) through the IDT and unwinds the instruction with the existing abort sentinel; because that unwind needs a pcall, `Cpu.step` and `Machine.run` use it whenever CR0.PE or PG is set (about 25% slower in protected mode). SETUP now passes 1641M and reached 1700M from `w98f.snap.1500m`.
 
+## Update (2026-11-18, Win98 SETUP now copies files; the blocker is run time)
+
+State after the CPU fixes above (IOPL in POPF/IRET, MOV SS/POP SS interrupt shadow, guest #GP for limit and selector violations) and a 1.4x faster `Machine.run` (device pass every 8 steps, one pcall per run loop):
+
+- SETUP boots from the CD, runs its real graphical wizard in 640x480x16, finishes "Collecting information" and is in "Copying Windows 98 files": "File copy progress" 7% at about 8.9B steps (`tools/out/w98j.snap.*`, `w98i.snap.*`; 223 minutes remaining on SETUP's own estimate). No fault since 4300M.
+- It is CPU-bound (CAB decompression and INF parsing; hot spots are spread over many loops, no single routine). Progress is roughly 1% per 2B steps, so the copy phase needs on the order of 150-200B steps. At about 0.7M steps/s that is days of wall time, not a CPU bug. Resume with `tools/bin/lune.exe run tools/win98_run.lua --load tools/out/<latest>.snap.NNNNm --budget 400000 --save tools/out/w98k.snap --save-every 500` and watch for `FAULT`.
+- To finish in reasonable time the interpreter needs a large speed-up (decoded-instruction/basic-block cache, cheaper segment and memory paths). `win98_run --bench N` measures the raw core (about 0.86M steps/s) and `--hist N` prints the hottest `cs:ip`.
+- Open cosmetic defect: every `W`/`w` glyph in SETUP's text is blank while the advance width is kept ("indo s 98"). Not yet traced; the font bitmap for those two characters may be zero in memory or the planar write path may drop them.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
