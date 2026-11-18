@@ -25,6 +25,8 @@ return lands in 06DF:817B). So the question is where that null far pointer on th
 tools/out/w98n.snap.1400m --budget 1440` (make `w98n.snap.1400m` with `--load tools/out/win98.snap.1250m --save-every 100
 --save tools/out/w98n.snap --budget 1400`).
 
+Narrowed further: the routine at 4974:E260 is an INT 10h hook (IVT[10h]=1B9F:191C) whose tail chains to the previous handler with `push [040F:010A]; push [040F:0108]; ... retf 2`. That slot (physical 0x41F8) is 0000:0000 for as long as I looked (since at least 1300M), so the first INT 10h the hook does not handle itself jumps to 0:0. The failing call is DOS's console output (INT 29h at FE2E:25A6 -> INT 10h at FFFF:6C8 in the HMA). Open question: who should have stored the old INT 10h vector in that slot (the hook's install code, or memory that was zeroed/overwritten afterwards)? Watch physical 0x41F8 from the start of the extender's load.
+
 **Probing technique that worked:** load a checkpoint, wrap `m.cpu.executeStep` with a function that records `cs:ip` into a
 ring buffer, then call `m:run(1000000)` twice. Results depend on the `m:run` chunk size (IRQ delivery granularity), so use
 the same 1M chunks as `win98_run` or the failure does not reproduce. Keys are injected by the driver every 80M steps after
