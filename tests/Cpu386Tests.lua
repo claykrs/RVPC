@@ -942,4 +942,40 @@ T("pm_double_address_prefix_jump_table", function(expect)
 	)
 end)
 
+-- POPFD privilege: only CPL 0 may change IOPL, and IF changes only when
+-- CPL <= IOPL (otherwise the old bits are kept silently).
+local function popfdAt(cplBits, oldFlags, popped)
+	const m = freshMachine()
+	flat32(m)
+	m.cpu.cs = bor(8, cplBits)
+	m.cpu.flags = oldFlags
+	putCode(m, 0x1000, {
+		0x68,
+		band(popped, 0xFF),
+		band(rshift(popped, 8), 0xFF),
+		0,
+		0, -- push imm32
+		0x9D, -- popfd
+	})
+	m:run(2)
+	return m.cpu.flags
+end
+
+T("popfd_at_cpl3_keeps_iopl_but_sets_if_when_iopl_allows", function(expect)
+	const flags = popfdAt(3, 0x3002, 0x0202)
+	expect(band(flags, 0x3000) == 0x3000, "IOPL kept, flags=" .. string.format("%X", flags))
+	expect(band(flags, 0x200) ~= 0, "IF set because CPL <= IOPL")
+end)
+
+T("popfd_at_cpl3_below_iopl_keeps_if_and_iopl", function(expect)
+	const flags = popfdAt(3, 0x2002, 0x0202)
+	expect(band(flags, 0x3000) == 0x2000, "IOPL kept, flags=" .. string.format("%X", flags))
+	expect(band(flags, 0x200) == 0, "IF unchanged because CPL > IOPL")
+end)
+
+T("popfd_at_cpl0_changes_iopl", function(expect)
+	const flags = popfdAt(0, 0x3002, 0x0202)
+	expect(band(flags, 0x3000) == 0, "IOPL cleared, flags=" .. string.format("%X", flags))
+end)
+
 return TESTS

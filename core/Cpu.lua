@@ -2530,6 +2530,24 @@ H[0x9C] = function(cpu: any) -- PUSHF / PUSHFD
 		cpu:push16(cpu.flags)
 	end
 end
+-- POPF/IRET privilege rules in protected mode: only CPL 0 changes IOPL, and IF
+-- changes only when CPL <= IOPL; otherwise those bits keep their old value
+-- (no fault). Real mode and V86 are handled by the callers' own checks.
+local function privilegedFlags(cpu: any, newFlags: number): number
+	if not cpu:isProtected() or cpu:isV86() then
+		return newFlags
+	end
+	const cpl = cpu:cpl()
+	const old = cpu.flags
+	if cpl > 0 then
+		newFlags = bor(band(newFlags, bnot(0x3000)), band(old, 0x3000))
+	end
+	if cpl > band(rshift(old, 12), 3) then
+		newFlags = bor(band(newFlags, bnot(0x200)), band(old, 0x200))
+	end
+	return newFlags
+end
+
 H[0x9D] = function(cpu: any) -- POPF / POPFD
 	const wasEnabled = cpu:getF(IFF)
 	local value
@@ -2538,7 +2556,7 @@ H[0x9D] = function(cpu: any) -- POPF / POPFD
 	else
 		value = cpu:pop16()
 	end
-	cpu.flags = bor(band(value, cpu.flagMask), cpu.fixedFlags)
+	cpu.flags = bor(band(privilegedFlags(cpu, value), cpu.flagMask), cpu.fixedFlags)
 	if not wasEnabled and cpu:getF(IFF) then
 		cpu.irqDelay = 1 -- interrupt shadow after POPF
 	end
@@ -2882,7 +2900,7 @@ H[0xCF] = function(cpu: any) -- IRET / IRETD
 		outerSp = cpu:popValue(width)
 		outerSs = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	end
-	cpu.flags = bor(band(newFlags, cpu.flagMask), cpu.fixedFlags)
+	cpu.flags = bor(band(privilegedFlags(cpu, newFlags), cpu.flagMask), cpu.fixedFlags)
 	cpu.ip = ip
 	cpu:loadSeg("cs", csSel)
 	if outerSegs then
