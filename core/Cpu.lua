@@ -959,13 +959,28 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number): boolean
 		return false -- faulted: callers must not touch SP/IP after this
 	end
 	if not desc or band(desc.access, 0x80) == 0 then
-		error(
-			("#GP: %s selector %04X: absent or outside %s limit"):format(
-				reg,
-				selector,
-				if band(selector, 4) ~= 0 then "LDT" else "GDT"
+		-- Selector outside the table limit or an empty slot: guest #GP(selector).
+		-- DOSX probes selectors on purpose (validators resume after the fault).
+		if self.inSegFault then
+			error(
+				("#GP: %s selector %04X: absent or outside %s limit"):format(
+					reg,
+					selector,
+					if band(selector, 4) ~= 0 then "LDT" else "GDT"
+				)
 			)
-		)
+		end
+		self.r[5] = self.opSP
+		self.inSegFault = true
+		const ok = pcall(function()
+			self:fault(if reg == "ss" then 12 else 13, band(selector, 0xFFFC))
+		end)
+		self.inSegFault = false
+		if not ok then
+			error(("#GP: %s selector %04X: absent or outside table limit"):format(reg, selector))
+		end
+		self.aborting = true
+		error(ABORT_INSTRUCTION, 0)
 	end
 	if reg == "cs" and band(desc.access, 0x18) ~= 0x18 then
 		error(
