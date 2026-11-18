@@ -397,6 +397,46 @@ if opts.ringAt then
 	end
 end
 
+-- --hist N: after loading, count executed cs:ip for N steps, print the 25 hottest, exit.
+if opts.hist then
+	local limit = tonumber(opts.hist) :: number
+	local counts: { [string]: number } = {}
+	local seen = 0
+	local origH = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		local key = ("%04X:%04X"):format(self.cs, self.ip)
+		counts[key] = (counts[key] or 0) + 1
+		seen += 1
+		if seen >= limit then
+			local list = {}
+			for k, v in counts do
+				table.insert(list, { k = k, v = v })
+			end
+			table.sort(list, function(a, b)
+				return a.v > b.v
+			end)
+			for i = 1, math.min(25, #list) do
+				print(("%s %d"):format(list[i].k, list[i].v))
+			end
+			process.exit(0)
+		end
+		return origH(self)
+	end
+end
+
+-- --bench N: time N raw executeStep calls (no device/IRQ loop) and exit.
+if opts.bench then
+	local n = tonumber(opts.bench) :: number
+	local t0 = os.clock()
+	local cpu = m.cpu
+	for _ = 1, n do
+		cpu:step()
+	end
+	local dt = os.clock() - t0
+	print(("bench: %d steps in %.2fs = %.2f M/s"):format(n, dt, n / dt / 1e6))
+	process.exit(0)
+end
+
 local function advance(limit)
 	-- Runs until st.executed reaches `limit`; returns a stop reason or nil.
 	while st.executed < limit do
