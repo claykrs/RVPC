@@ -11,7 +11,8 @@
 --   lune run tools/win98_run.lua --load tools/out/w98.snap --budget 3500
 --   lune run tools/win98_run.lua --verify 40 --verify-span 20   (determinism proof)
 --
--- Options (millions of steps): --budget, --save-at, --verify, --verify-span.
+-- Options (millions of steps): --budget, --save-at, --save-every (rolling
+-- checkpoints named <save>.<N>m), --verify, --verify-span.
 -- Paths: --iso, --hdd, --boot, --save, --load. The HDD/ISO/boot images are the
 -- same ones the probes use and must be the same ones a checkpoint was taken on.
 
@@ -238,6 +239,8 @@ end
 local budget = opts.budget * 1_000_000
 local saveAt = if opts.saveAt then opts.saveAt * 1_000_000 else nil
 local verifyAt = if opts.verify then opts.verify * 1_000_000 else nil
+local saveEvery = if opts.saveEvery then opts.saveEvery * 1_000_000 else nil
+local nextSave = if saveEvery then (st.executed // saveEvery + 1) * saveEvery else nil
 local verifySpan = (opts.verifySpan or 20) * 1_000_000
 local stopReason = "budget"
 local startedAt = os.clock()
@@ -274,6 +277,10 @@ local function advance(limit)
 					os.clock() - startedAt
 				)
 			)
+		end
+		if nextSave and st.executed >= nextSave then
+			checkpoint(("%s.%dm"):format(opts.save, nextSave // 1_000_000))
+			nextSave += saveEvery
 		end
 		local screen = m:outputText()
 		if screen ~= st.lastScreen then
