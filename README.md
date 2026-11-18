@@ -54,6 +54,8 @@ keyboard/mouse input.
 lune run tools/check.lua           # the CI gate
 lune run tools/harness.lua         # boot SeaBIOS headless and watch the screen
 lune run tools/harness.lua 40      # step budget in millions
+lune run tools/win98_run.lua --budget 3500 --save-at 2700   # Win98 Setup with a checkpoint (core/Snapshot.lua)
+lune run tools/win98_run.lua --load tools/out/win98.snap       # resume from it in minutes
 ```
 
 ## Firmware and media (not committed)

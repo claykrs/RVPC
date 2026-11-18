@@ -43,6 +43,7 @@ local fdcTests = require("../tests/FdcTests")
 local platformTests = require("../tests/PlatformTests")
 local vgaMode12Tests = require("../tests/VgaMode12Tests")
 local inputMapTests = require("../tests/InputMapTests")
+local snapshotTests = require("../tests/SnapshotTests")
 
 const deps = {
 	Memory = Memory,
@@ -127,6 +128,7 @@ runDirectSuite("fdc", fdcTests)
 runDirectSuite("platform", platformTests)
 runDirectSuite("vga12", vgaMode12Tests)
 runDirectSuite("inputmap", inputMapTests)
+runDirectSuite("snapshot", snapshotTests)
 
 print(("passed assertions: %d"):format(passed))
 if #failures > 0 then
