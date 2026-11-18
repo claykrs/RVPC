@@ -317,12 +317,16 @@ end
 -- when CS:IP is reached, plus the code bytes there, A20 and SS:SP, then exit.
 if opts.ringAt then
 	local wantCs, wantIp = string.match(opts.ringAt, "^(%x+):(%x+)$")
-	local rcs, rip = tonumber(wantCs, 16), tonumber(wantIp, 16)
+	local rcs, rip = tonumber(wantCs or "0", 16), tonumber(wantIp or "0", 16)
+	local rlin = if wantCs then nil else tonumber(opts.ringAt)
 	local ringLen = tonumber(opts.ringLen) or 64
 	local ring, rpos = {}, 0
 	local orig2 = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
-		if self.cs == rcs and self.ip == rip then
+		if
+			(rlin and self.cs * 16 + self.ip == rlin)
+			or (not rlin and self.cs == rcs and self.ip == rip)
+		then
 			for k = 1, ringLen do
 				local e = ring[(rpos + k - 1) % ringLen + 1]
 				if e then

@@ -202,6 +202,16 @@ Correction to the entry above. The call at `4974:6C77` is not the first bad even
 
 Next step: find which `call`/`ret` pair on this chain is unbalanced, i.e. who pushed `BCA3` at `1B9F:2679` and why the chain from `A324` returns into `1E8B`. Take a checkpoint before 1437M (`tools/out/w98n.snap.1400m`) and `--ring-at FE2E:288F --ring-len 400` to see the entry. Tools added this pass: `--dump ADDR [--dump-len N]`, `--ring-at CS:IP [--ring-len N]`, and `--watch-step` now prints the pre-instruction `ecx/esi/edi/ds/es`.
 
+## Update (2026-11-18, later still: the bad return chain is DOS console output via INT 29h)
+
+Further narrowing of the 1438M derail (all from `tools/out/w98n.snap.1400m`, run with the driver):
+
+- The HMA code involved is the DOS console path: `FE2E:259E` is a `les/mov al,es:[di]; int 29h; loop` string writer, `FFFF:06C0..06CE` is the INT 29h/INT 10h shim (`lcall [40h]`, `pop ds,bx,bp,di,si,ax; iret`), and `FE2E:E2A2..E430` is the I/O buffer routine that calls it.
+- The INT 29h `iret` lands correctly at `FE2E:25A6`. The failure is the next `ret` at `25A9`, which pops `259A` (the middle of an instruction), then `259D` pops `E3D1` (also mid-instruction; the instruction there is the 5-byte `mov cx,ss:[607]` at `E3CE`). After that the chain `E430 -> 878B -> 252C -> 28A3` follows, then the zero sled.
+- So the two words at `1B9F:2661..2664` hold `259A`/`E3D1` instead of a valid return address. The first writer from 1400M is `FE2E:E420` (`call E2A2`, pushes `E423`); later writers are `4689:074B/0750`, `FE2E:E2A2/E2A3` and SeaBIOS `F000:FE75/D378/D40D`. The next step is to watch `0x1E051` only inside the last pass (checkpoint just before the final INT 29h) to see which of those leaves `259A` there; compare with `1B9F:2663`.
+- A reference emulator is not installed (no qemu/bochs/dosbox); nothing was downloaded.
+- Tools: `--ring-at` also accepts a linear address (no colon), `tools/dis16.py SNAP SEG START LEN` disassembles 16-bit code straight from a checkpoint.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
