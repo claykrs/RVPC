@@ -4667,9 +4667,9 @@ function Cpu.step(self: Cpu): number
 	if band(self.cr0, CR0_PG) == 0 then
 		return (self :: any):executeStep()
 	end
-	const ok, result = pcall(function()
-		return (self :: any):executeStep()
-	end)
+	-- pcall(f, self) instead of a wrapping closure: no allocation per
+	-- instruction while paging is on.
+	const ok, result = pcall((self :: any).executeStep, self)
 	self.aborting = false
 	if not ok then
 		if result == ABORT_INSTRUCTION then

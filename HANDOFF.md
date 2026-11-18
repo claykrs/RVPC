@@ -2,6 +2,56 @@
 
 Windows 98 SE on a real 486/Pentium-class PC inside Roblox.
 
+## Current state (2026-11-18) - read this first
+
+**Win98 SETUP is past the old faults but hangs at the graphical wizard.** The fix `7e17181` (retf #NP) is confirmed:
+SETUP no longer Bad-Faults at 2761M steps. The wizard ("Preparing to run Windows 98 Setup", progress 100%) draws at about
+580M steps and then nothing advances through 4.5B (`END budget`, no reboot). Evidence: `irqCount` is frozen at 12186 from
+~1.5B on (no further IRQs, so no timer ticks), the screen text never changes, and the machine sits in a ~450 instruction
+loop: PM<->RM switches via selectors 0053/0070/0078 (DOS extender), lots of `mov sreg`, `66`/`67` prefixes, `cr0` flips to 0
+(checkpoint 4000m shows `cr0=0`, cs:ip 024C:17D). **First thing to find:** why IRQ0 stops. Check PIC IMR / the PIT channel-0
+state at checkpoints 1500m vs 2000m (`probe_vga_inspect.lua` shows how to load one), whether `channel0Divisor` (set to 1 at
+500M by the driver) or the guest masks IRQ0, and whether the extender's wait loop needs an RTC/IRQ8 tick instead.
+
+**Tooling added this session (all committed, gate green):**
+- `core/Snapshot.lua` + `tests/SnapshotTests.lua`: delta checkpoints of a whole Machine against a freshly built one.
+  Verified identical resume at 150M steps. Not captured: functions/closures state, metatables.
+- `tools/win98_run.lua`: headless Win98 SETUP driver. `--budget M`, `--save-every M --save path`, `--save-at M`,
+  `--load path`, `--verify M --verify-span M`. Needs `media/win98se-ide.iso`, `media/win98-hdd-xms.img`,
+  `media/win98-boot.img`, `roms/` (all git-ignored). Writes `tools/out/w98_NNN.ppm` every 80M steps after 580M.
+- Checkpoints from the last run are in `tools/out/win98.snap.<N>m` (every 250M to 4500m, ~20 MiB each, git-ignored). Resume
+  any of them in about 15 s instead of replaying: `lune run tools/win98_run.lua --load tools/out/win98.snap.2250m`.
+- Local, git-ignored probes (names match `probe_*`): `probe_bench.lua` (steps/sec + register fingerprint from a checkpoint,
+  `--span M`), `probe_hist.lua` (address/opcode histogram), `probe_micro.lua`/`probe_micro2.lua` (synthetic loops),
+  `probe_vga_inspect.lua` (CRTC dump). Recreate from `win98_run.lua`'s `build()` if they are missing.
+- Use `tools/bin/lune.exe` (the Downloads copy of lune was deleted). Never `taskkill /IM lune.exe`: it kills other jobs.
+
+**Rendering defects seen in the headless screenshots (not fixed):** (1) the first ~32 scanlines show stable stale
+text-mode-looking junk (identical in every shot; CRTC line compare is 0x3FF so it is not split screen; start address 0);
+(2) wide glyphs `W`/`w` render blank ("Windows" -> "jndo  s"), 'i' looks like 'j'; suspect a guest font-blit path or an
+emulated instruction, not the host presenter. RVPC has never been visually verified in Studio.
+
+**Performance (measured, details for whoever picks this up):** about 0.64-0.9M emulated steps/s in Lune (a real 486 is 50x+
+faster). Findings so far:
+- Per-step cost is dominated by `Cpu.executeStep` itself, not `Machine.run` (synthetic NOP loop: executeStep alone ~= through
+  `run`). `fetch8` is only ~0.12 us.
+- `Cpu.step` (used when CR0.PG is set) allocated a closure per instruction for `pcall`; now `pcall(executeStep, self)`
+  (committed; no measurable effect on the real-mode checkpoints because none has paging on).
+- In a minimal-config machine, assigning `nil` to the absent fields `oseg`/`osegReg`/`rep`/`faultIP`/`faultCS` at the top of
+  `executeStep` triggered a Luau table rehash every instruction (~2 us of ~2.5 us; synthetic loops ran 3.5-5.7x faster when
+  guarded with read-before-write). **On the real Win98 machine that change was 6-10% SLOWER** (best-of-3 at checkpoint
+  500m: old ~830k, nil-guard ~700-780k), so it was reverted. The cliff depends on how full the `Cpu` table is; do not
+  assume it applies. A prefix-byte lookup table (`PREFIX_BYTES[op]`) looked neutral-to-positive (within noise).
+- Benchmark protocol that works: `probe_bench.lua --load <snap> --span 4`, best of 3, nothing else running; compare the
+  printed `FINGERPRINT` line between old and new code (must be identical) before trusting a speedup. Single runs vary +-10%.
+- Untested ideas: decoded-instruction cache, cheaper segment-register loads (the hang loop is dominated by them), cache the
+  per-instruction `baseOperand32` state, hoist the per-step device polling in `Machine.run`.
+
+**Repo state:** `master` and `main` pushed. `.mcp.json` has an uncommitted local change (GitHub MCP entry removed): leave it.
+`gh` is logged in as `claykrs`. Rules: no Co-Authored-By trailers, never commit media/ROMs/ISOs, gate must print CHECK PASSED,
+`main` is a single squash commit refreshed with `git commit-tree master^{tree}` and pushed by commit id (the branch is checked out
+in another worktree, so do not `branch -f` it).
+
 ## Win98 SETUP phase-2 temp-write error — RESOLVED (cpu: CMPS/SCAS flag width)
 
 **Root cause (fixed in `core/Cpu.lua`):** `stringOp` passed its raw byte-count
