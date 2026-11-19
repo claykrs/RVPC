@@ -1009,4 +1009,33 @@ T("mov_ds_does_not_inhibit_interrupts", function(expect)
 	expect(cpu.irqDelay == 0, "irqDelay after MOV DS = " .. tostring(cpu.irqDelay))
 end)
 
+-- MOV CR0, r32 moves all 32 bits even without a 0x66 prefix in real mode
+-- (WIN.COM enables PE|PG|WP this way with EAX = 805B0001h).
+T("mov_cr0_from_eax_without_operand_prefix_reads_all_32_bits", function(expect)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = 2
+	cpu:wr32(0, 0x00010001)
+	putCode(m, 0x1000, { 0x0F, 0x22, 0xC0 }) -- mov cr0, eax
+	cpu:executeStep()
+	expect(cpu.cr0 == 0x00010001, "cr0 = " .. string.format("%X", cpu.cr0))
+end)
+
+T("mov_eax_from_cr0_writes_all_32_bits", function(expect)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = 2
+	cpu.cr0 = 0x00010000
+	cpu:wr32(0, 0xFFFFFFFF)
+	putCode(m, 0x1000, { 0x0F, 0x20, 0xC0 }) -- mov eax, cr0
+	cpu:executeStep()
+	expect(cpu:rr32(0) == 0x00010000, "eax = " .. string.format("%X", cpu:rr32(0)))
+end)
+
 return TESTS

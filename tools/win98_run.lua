@@ -366,6 +366,17 @@ if opts.ringAt then
 				table.insert(bt, ("%02X"):format(m.mem:read8(cb + q)))
 			end
 			print("CODE(-8..+24): " .. table.concat(bt, " "))
+			if opts.ringGdt then
+				local g = self.gdtr
+				print(("GDTR base=%X limit=%X"):format(g.base, g.limit))
+				for idx = 0, math.min(7, bit32.rshift(g.limit, 3)) do
+					local d = {}
+					for q = 0, 7 do
+						table.insert(d, ("%02X"):format(m.mem:read8(g.base + idx * 8 + q)))
+					end
+					print(("GDT[%d]: %s"):format(idx, table.concat(d, " ")))
+				end
+			end
 			if opts.ringMem then
 				local ma = tonumber(opts.ringMem)
 				print(
@@ -568,6 +579,35 @@ if opts.hook then
 	end
 end
 
+-- --ring-fault N: keep the last N executed cs:ip with registers and print them when the run faults.
+local faultRing: { string }? = nil
+local faultRingLen = 0
+local faultRingPos = 0
+if opts.ringFault then
+	faultRingLen = tonumber(opts.ringFault) :: number
+	faultRing = {}
+	local origF = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		faultRing[faultRingPos % faultRingLen + 1] = ("%04X:%08X cr0=%X eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X esp=%X ds=%04X es=%04X ss=%04X"):format(
+			self.cs,
+			self.ip,
+			self.cr0,
+			self:rr32(0),
+			self:rr32(3),
+			self:rr32(1),
+			self:rr32(2),
+			self:rr32(6),
+			self:rr32(7),
+			self:rr32(4),
+			self.ds,
+			self.es,
+			self.ss
+		)
+		faultRingPos += 1
+		return origF(self)
+	end
+end
+
 local function advance(limit)
 	-- Runs until st.executed reaches `limit`; returns a stop reason or nil.
 	while st.executed < limit do
@@ -576,6 +616,14 @@ local function advance(limit)
 		end)
 		if not ok then
 			print(("FAULT after %d steps: %s"):format(st.executed, tostring(result)))
+			if faultRing then
+				for q = 1, faultRingLen do
+					local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+					if e then
+						print("RF " .. e)
+					end
+				end
+			end
 			return "fault"
 		end
 		st.executed += result

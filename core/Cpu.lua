@@ -4011,13 +4011,12 @@ local function movControl(cpu: any, op: number)
 		else
 			value = cpu.dr[e.reg] or 0
 		end
-		if cpu.operand32 then
-			cpu:wr32(e.rm, value :: number)
-		else
-			cpu:wr(e.rm, band(value :: number, 0xFFFF))
-		end
+		-- MOV from CRn/DRn always moves the full 32-bit register, with or without 0x66.
+		cpu:wr32(e.rm, value :: number)
 	else
-		const value = if cpu.operand32 then cpu:rr32(e.rm) else cpu:rr(e.rm)
+		-- MOV to CRn/DRn reads the full 32-bit register regardless of operand size
+		-- (WIN.COM writes CR0 = 805B0001h from real mode with no 0x66 prefix).
+		const value = cpu:rr32(e.rm)
 		if op == 0x22 then
 			if e.reg == 0 then
 				local oldCr0 = cpu.cr0
