@@ -3285,9 +3285,8 @@ local function ioAllowed(cpu: any, port: number, width: number): boolean
 	end
 	const iopl = band(rshift(cpu.flags, 12), 3)
 	if cpu:isV86() then
-		if iopl == 3 then
-			return true
-		end
+		-- V86 ignores IOPL for IN/OUT: the permission bitmap is always consulted,
+		-- which is how the Win9x VMM traps and virtualizes device ports.
 	elseif cpu:cpl() <= iopl then
 		return true
 	end
