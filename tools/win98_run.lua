@@ -127,6 +127,20 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	-- --pte LINEAR: print CR3 and the PDE/PTE for a linear address of the loaded checkpoint.
+	if opts.pte then
+		local la = tonumber(opts.pte) :: number
+		local cr3 = bit32.band(m.cpu.cr3, 0xFFFFF000)
+		local pde = m.mem:read32(cr3 + bit32.rshift(la, 22) * 4)
+		local pte = 0
+		if bit32.band(pde, 1) ~= 0 and bit32.band(pde, 0x80) == 0 then
+			pte = m.mem:read32(
+				bit32.band(pde, 0xFFFFF000) + bit32.band(bit32.rshift(la, 12), 0x3FF) * 4
+			)
+		end
+		print(("CR3=%X PDE=%X PTE=%X cr0=%X cr4?"):format(cr3, pde, pte, m.cpu.cr0))
+		process.exit(0)
+	end
 	-- --dump ADDR [--dump-len N]: print physical bytes of the loaded checkpoint and exit.
 	if opts.dump then
 		local a, n = tonumber(opts.dump), tonumber(opts.dumpLen) or 64
@@ -135,7 +149,10 @@ if opts.load then
 			for k = row, math.min(row + 15, n - 1) do
 				local pa = a + k
 				if opts.dumpLin then
-					pa = m.cpu:translatePage(a + k, false, false)
+					local okP, phys = pcall(function()
+						return m.cpu:translatePage(a + k, false, false)
+					end)
+					pa = if okP then phys else 0xFFFFFFFF
 				end
 				table.insert(t, ("%02X"):format(m.mem:read8(pa)))
 			end
@@ -328,6 +345,7 @@ if opts.ringAt then
 	local ring, rpos = {}, 0
 	local lastCs, lastIp = 0, 0
 	local traceLeft = 0
+	local ringHits = 0
 	local orig2 = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
 		if traceLeft > 0 then
@@ -357,6 +375,10 @@ if opts.ringAt then
 				or (not rlin and self.cs == rcs and self.ip == rip)
 			) and (opts.ringSp == nil or self:rr32(4) == tonumber(opts.ringSp))
 		then
+			ringHits += 1
+			if ringHits < (tonumber(opts.ringNth) or 1) then
+				return orig2(self)
+			end
 			for k = 1, ringLen do
 				local e = ring[(rpos + k - 1) % ringLen + 1]
 				if e then
@@ -674,6 +696,104 @@ if opts.ringFault then
 			process.exit(0)
 		end
 	end
+end
+
+-- --fault-log N [--fault-vec V]: print the first N hardware/guest exceptions (vector,
+-- error code, faulting cs:ip, V86 flag, eax/ebx/esp) as they are delivered.
+if opts.faultLog then
+	local want = tonumber(opts.faultLog) :: number
+	local onlyVec = tonumber(opts.faultVec)
+	local seen = 0
+	local origI = m.cpu.interrupt
+	m.cpu.interrupt = function(self, n, errorCode, soft)
+		if not soft and (onlyVec == nil or onlyVec == n) and seen < want then
+			seen += 1
+			print(
+				("FAULT#%d vec=%X err=%s at %04X:%X v86=%s cr0=%X eax=%X ebx=%X ecx=%X esp=%X fl=%X"):format(
+					seen,
+					n,
+					tostring(errorCode),
+					self.opCS or self.cs,
+					self.opIP or self.ip,
+					tostring(self:isV86()),
+					self.cr0,
+					self:rr32(0),
+					self:rr32(3),
+					self:rr32(1),
+					self:rr32(4),
+					self.flags
+				)
+			)
+		end
+		return origI(self, n, errorCode, soft)
+	end
+end
+
+-- --v86ret N: print the first N protected-mode IRETD instructions whose popped EFLAGS
+-- has VM set (the VMM resuming V86 code), with the EIP/CS/EFLAGS image on the stack.
+if opts.v86ret then
+	local want = tonumber(opts.v86ret) :: number
+	local seen = 0
+	local origR = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if seen < want and bit32.band(self.cr0, 1) ~= 0 and not self:isV86() then
+			local okT, lin = pcall(function()
+				return self:translatePage(self.segBase.cs + self.ip, false, false)
+			end)
+			if okT and m.mem:read8(lin) == 0xCF then
+				local okS, a, b, c = pcall(function()
+					local sp = self.segBase.ss + self:rr32(4)
+					return self:read32(sp, true),
+						self:read32(sp + 4, true),
+						self:read32(sp + 8, true)
+				end)
+				if okS and bit32.band(c, 0x20000) ~= 0 then
+					seen += 1
+					print(
+						("V86RET#%d esp=%X phys=%X from %04X:%X -> %04X:%X eflags=%X"):format(
+							seen,
+							self:rr32(4),
+							self:translatePage(self.segBase.ss + self:rr32(4) + 8, false, false),
+							self.cs,
+							self.ip,
+							bit32.band(b, 0xFFFF),
+							a,
+							c
+						)
+					)
+				end
+			end
+		end
+		return origR(self)
+	end
+end
+
+-- --dr-log N: print the first N MOV DRn writes with cs:ip.
+if opts.drLog then
+	local want = tonumber(opts.drLog) :: number
+	local seen = 0
+	local real = m.cpu.dr :: { [number]: number }
+	m.cpu.dr = setmetatable({}, {
+		__index = function(_, k)
+			return real[k]
+		end,
+		__newindex = function(_, k, v)
+			if seen < want then
+				seen += 1
+				print(
+					("DRWRITE#%d dr%d=%X at %04X:%X cr0=%X"):format(
+						seen,
+						k,
+						v,
+						m.cpu.cs,
+						m.cpu.ip,
+						m.cpu.cr0
+					)
+				)
+			end
+			real[k] = v
+		end,
+	}) :: any
 end
 
 -- --vxdlog DEVICE [--vxdlog-service S]: print every `int 20h` dynamic link call to the VxD

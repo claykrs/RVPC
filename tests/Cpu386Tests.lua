@@ -345,6 +345,100 @@ T("tlb_walk_sets_accessed_and_dirty_bits", function(expect)
 	expect(band(pte, 0x60) == 0x60, string.format("PTE A/D bits=%X", pte))
 end)
 
+-- IRETD into V86 loads all 32 bits of ESP from the frame, so the monitor's
+-- old upper half cannot leak into V86 code that addresses through ESP.
+T("iretd_to_v86_clears_the_upper_half_of_esp", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.mem.a20 = true
+	const cpu = m.cpu
+	cpu:wr32(4, 0x00019000)
+	putCode(m, 0x1000, { 0xCF }) -- IRETD
+	cpu:push32(0)
+	cpu:push32(0)
+	cpu:push32(0)
+	cpu:push32(0)
+	cpu:push32(0x2000) -- SS
+	cpu:push32(0x0FFA) -- ESP
+	cpu:push32(bor(0x202, VM))
+	cpu:push32(0x1000) -- CS
+	cpu:push32(0x0100) -- EIP
+	cpu:executeStep()
+	expect(cpu:isV86(), "entered V86")
+	expect(cpu:rr32(4) == 0x0FFA, string.format("ESP=%X", cpu:rr32(4)))
+end)
+
+-- CLI/STI/PUSHF/POPF/INT n/IRET raise #GP(0) in V86 at IOPL < 3: the VMM relies on
+-- the trap to virtualize them. The frame carries the faulting instruction's EIP.
+local function v86TrapSetup(m, flags: number)
+	flat32(m)
+	const cpu = m.cpu
+	cpu.tr = 0x18
+	cpu.trBase = 0x4000
+	cpu.trLimit = 0x67
+	cpu.tr32 = true
+	m.mem:write32(0x4004, 0x9000)
+	m.mem:write16(0x4008, 0x10)
+	installGate(m, 13, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, { 0xEB, 0xFE }) -- #GP handler: JMP $
+	cpu.cs, cpu.ss, cpu.ds, cpu.es = 0x1000, 0x2000, 0, 0
+	cpu.segBase.cs, cpu.segBase.ss, cpu.segBase.ds, cpu.segBase.es = 0x10000, 0x20000, 0, 0
+	cpu.segSel.cs, cpu.segSel.ss = 0x1000, 0x2000
+	cpu.segLimit.cs, cpu.segLimit.ss, cpu.segLimit.ds, cpu.segLimit.es =
+		0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+	cpu.segFlags.cs, cpu.segFlags.ss = 0, 0
+	cpu.flags = bor(flags, VM)
+	cpu.ip = 0x0100
+	cpu:wr32(4, 0x800)
+	putCode(m, 0x10100, { 0xFA }) -- CLI
+end
+
+T("arpl_raises_rpl_in_protected_mode", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	cpu:wr32(0, 0x10)
+	cpu:wr32(3, 0x03)
+	putCode(m, 0x1000, { 0x63, 0xD8 }) -- ARPL AX, BX
+	cpu:executeStep()
+	expect(cpu:rr(0) == 0x13, string.format("AX=%X", cpu:rr(0)))
+	expect(band(cpu.flags, 0x40) ~= 0, "ZF set when RPL was raised")
+end)
+
+T("arpl_is_undefined_in_real_mode", function(expect)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = 2
+	cpu:wr32(4, 0x8000)
+	m.mem:write16(6 * 4, 0x2000) -- IVT[6] -> 0000:2000
+	m.mem:write16(6 * 4 + 2, 0)
+	putCode(m, 0x1000, { 0x63, 0x38 }) -- would be JNB +38h if aliased
+	cpu:executeStep()
+	expect(cpu.ip == 0x2000, string.format("IP=%X, #UD vectors through IVT[6]", cpu.ip))
+end)
+
+T("v86_cli_traps_to_gp_at_iopl_0", function(expect)
+	const m = freshMachine()
+	v86TrapSetup(m, 0x202)
+	m.cpu:executeStep()
+	expect(not m.cpu:isV86(), "#GP left V86 for the monitor")
+	expect(
+		m.cpu.cs == 8 and m.cpu.ip == 0x6000,
+		string.format("handler %04X:%X", m.cpu.cs, m.cpu.ip)
+	)
+end)
+
+T("v86_cli_executes_at_iopl_3", function(expect)
+	const m = freshMachine()
+	v86TrapSetup(m, 0x3202)
+	m.cpu:executeStep()
+	expect(m.cpu:isV86(), "still V86")
+	expect(band(m.cpu.flags, 0x200) == 0, "IF cleared by CLI")
+end)
+
 T("v86_interrupt_frame_and_iret", function(expect)
 	const m = freshMachine()
 	flat32(m)
@@ -438,7 +532,7 @@ T("v86_interrupt_frame_and_iret", function(expect)
 	cpu:push32(0)
 	cpu:push32(0x2000)
 	cpu:push32(0x800)
-	cpu:push32(bor(0x202, VM))
+	cpu:push32(bor(0x3202, VM)) -- IOPL 3: INT n/IRET are not trapped
 	cpu:push32(0x1000)
 	cpu:push32(0)
 	m:run(40)

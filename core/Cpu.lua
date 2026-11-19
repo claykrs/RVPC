@@ -1487,7 +1487,8 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		-- delivery is a nested task switch to the gate's TSS selector.
 		const gateDpl = band(rshift(access, 5), 3)
 		if software and gateDpl < self:cpl() then
-			error(("#GP: INT %02X task gate DPL%d below CPL%d"):format(n, gateDpl, self:cpl()))
+			self:fault(13, bor(lshift(n, 3), 2)) -- #GP(vector*8+2): IDT-referenced
+			return
 		end
 		self:taskSwitch(targetSelector, "int")
 		return
@@ -1500,7 +1501,10 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 	const cpl = self:cpl()
 	const gateDpl = band(rshift(access, 5), 3)
 	if software and gateDpl < cpl then
-		error(("#GP: INT %02X gate DPL%d below CPL%d"):format(n, gateDpl, cpl))
+		-- INT n through a gate whose DPL is below CPL is a guest #GP, which the
+		-- Win9x VMM relies on to trap and reflect V86 interrupts at IOPL 3.
+		self:fault(13, bor(lshift(n, 3), 2))
+		return
 	end
 	const targetDesc = readDescriptor(self, targetSelector)
 	if not targetDesc or band(targetDesc.access, 0x80) == 0 then
@@ -2682,7 +2686,35 @@ H[0x9B] = function(cpu: any) -- WAIT/FWAIT observes a pending x87 #MF
 		cpu.fpu:wait(cpu)
 	end
 end
+-- IOPL-sensitive instructions (CLI, STI, PUSHF, POPF, INT n, IRET). In V86 mode
+-- they raise #GP(0) unless IOPL is 3, which is how the Win9x VMM traps and
+-- virtualizes them; in protected mode only CLI/STI check CPL against IOPL.
+local function v86Sensitive(cpu: any): boolean
+	if cpu:isV86() and band(rshift(cpu.flags, 12), 3) < 3 then
+		cpu:fault(13, 0)
+		return true
+	end
+	return false
+end
+
+local function ifChangeDenied(cpu: any): boolean
+	if not cpu:isProtected() then
+		return false
+	end
+	if cpu:isV86() then
+		return v86Sensitive(cpu)
+	end
+	if cpu:cpl() > band(rshift(cpu.flags, 12), 3) then
+		cpu:fault(13, 0)
+		return true
+	end
+	return false
+end
+
 H[0x9C] = function(cpu: any) -- PUSHF / PUSHFD
+	if v86Sensitive(cpu) then
+		return
+	end
 	if cpu.operand32 then
 		cpu:push32(bor(cpu.flags, ALWAYS))
 	else
@@ -2708,6 +2740,9 @@ local function privilegedFlags(cpu: any, newFlags: number): number
 end
 
 H[0x9D] = function(cpu: any) -- POPF / POPFD
+	if v86Sensitive(cpu) then
+		return
+	end
 	const wasEnabled = cpu:getF(IFF)
 	local value
 	if cpu.operand32 then
@@ -2990,7 +3025,14 @@ local function retf(cpu: any, extra: number)
 	end
 	if outerSs then
 		cpu:loadSeg("ss", outerSs)
-		cpu:setSP(outerSp :: number)
+		if width == 4 then
+			-- IRETD loads all of ESP even when SS is a 16-bit stack (V86, 16-bit
+			-- PM): the upper half must not keep the monitor's old value, or
+			-- 32-bit addressing off ESP in the returned-to code leaves the limit.
+			cpu:wr32(4, outerSp :: number)
+		else
+			cpu:setSP(outerSp :: number)
+		end
 	end
 	if extra ~= 0 then
 		const mask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
@@ -3009,7 +3051,11 @@ H[0xCC] = function(cpu: any)
 	cpu:interrupt(3, nil, true)
 end
 H[0xCD] = function(cpu: any)
-	cpu:interrupt(cpu:fetch8(), nil, true)
+	const vector = cpu:fetch8()
+	if v86Sensitive(cpu) then
+		return
+	end
+	cpu:interrupt(vector, nil, true)
 end
 H[0xCE] = function(cpu: any)
 	if cpu:getF(OFLG) then
@@ -3017,6 +3063,9 @@ H[0xCE] = function(cpu: any)
 	end
 end
 H[0xCF] = function(cpu: any) -- IRET / IRETD
+	if v86Sensitive(cpu) then
+		return
+	end
 	if cpu:isProtected() and not cpu:isV86() and band(cpu.flags, NT) ~= 0 then
 		-- Nested-task return: no frame is popped; the switch follows the
 		-- back-link stored at offset 0 of the current task's TSS.
@@ -3079,7 +3128,11 @@ H[0xCF] = function(cpu: any) -- IRET / IRETD
 	end
 	if outerSs then
 		cpu:loadSeg("ss", outerSs)
-		cpu:setSP(outerSp :: number)
+		if width == 4 then
+			cpu:wr32(4, outerSp :: number) -- IRETD loads all of ESP (see RETF)
+		else
+			cpu:setSP(outerSp :: number)
+		end
 	end
 	if not wasEnabled and cpu:getF(IFF) then
 		cpu.irqDelay = 1 -- interrupt shadow after IRET
@@ -3640,9 +3693,15 @@ H[0xF9] = function(cpu: any)
 	cpu:setbits(CF, true)
 end
 H[0xFA] = function(cpu: any)
+	if ifChangeDenied(cpu) then
+		return
+	end
 	cpu:setbits(IFF, false)
 end
 H[0xFB] = function(cpu: any)
+	if ifChangeDenied(cpu) then
+		return
+	end
 	cpu:setbits(IFF, true)
 	cpu.irqDelay = 1 -- 8086 interrupt shadow after STI
 end
@@ -3838,6 +3897,27 @@ H[0x62] = function(cpu: any)
 		bound(cpu)
 	else
 		jccShort(cpu, 2)
+	end
+end
+-- ARPL r/m16, r16: adjust the RPL of a selector. Protected mode only; real mode
+-- and V86 raise #UD, which the Win9x VMM uses as a trap marker in ROM.
+H[0x63] = function(cpu: any)
+	if cpu.level < CPU_286 then
+		jccShort(cpu, 3)
+		return
+	end
+	if not cpu:isProtected() or cpu:isV86() then
+		cpu:fault(6, nil)
+		return
+	end
+	const e = cpu:modrm()
+	const dest = cpu:readRM16(e)
+	const src = cpu:rr(e.reg)
+	if band(dest, 3) < band(src, 3) then
+		cpu:writeRM16(e, bor(band(dest, 0xFFFC), band(src, 3)))
+		cpu:setbits(ZF, true)
+	else
+		cpu:setbits(ZF, false)
 	end
 end
 H[0x68] = function(cpu: any)
