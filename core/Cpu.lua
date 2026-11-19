@@ -232,6 +232,7 @@ export type Cpu = {
 	reset: (self: Cpu) -> (),
 	tripleFault: (self: Cpu) -> (),
 	loadSeg: (self: Cpu, reg: string, selector: number) -> boolean,
+	farTransferFault: (self: Cpu, code: number, what: string) -> (),
 	farCall: (self: Cpu, selector: number, offset: number, isCall: boolean) -> (),
 	taskSwitch: (self: Cpu, newSelector: number, kind: string) -> (),
 	baseOf: (self: Cpu, reg: string) -> number,
@@ -1098,6 +1099,25 @@ local function descriptorIsWritableData(desc: Descriptor): boolean
 	return band(desc.access, 0x18) == 0x10 and band(desc.access, 2) ~= 0
 end
 
+-- A far CALL/JMP through a null, empty or out-of-limit selector raises a guest
+-- #GP(selector) and abandons the instruction; Win98's VMM provokes these on
+-- purpose and its #GP handler repairs the state.
+function Cpu.farTransferFault(self: Cpu, code: number, what: string)
+	if self.inSegFault then
+		error("#GP: " .. what)
+	end
+	self.inSegFault = true
+	const ok = pcall(function()
+		self:fault(13, code)
+	end)
+	self.inSegFault = false
+	if not ok then
+		error("#GP: " .. what)
+	end
+	self.aborting = true
+	error(ABORT_INSTRUCTION, 0)
+end
+
 -- Far CALL/JMP, including 286/386 call gates. Ring changes use the TSS
 -- SS0:SP0 stack, copy gate parameters, and build the nested frame that the
 -- outer IRET path unwinds.
@@ -1125,7 +1145,8 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 		return
 	end
 	if selector == 0 then
-		error("#GP: far transfer with null selector")
+		self:farTransferFault(0, "far transfer with null selector")
+		return
 	end
 	const desc = readDescriptor(self, selector)
 	if desc and band(desc.access, 0x80) == 0 and band(desc.access, 0x1F) ~= 0 then
@@ -1137,7 +1158,11 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 		return
 	end
 	if not desc or band(desc.access, 0x80) == 0 then
-		error(("#GP: far transfer selector %04X absent or outside GDT/LDT limit"):format(selector))
+		self:farTransferFault(
+			band(selector, 0xFFFC),
+			("far transfer selector %04X absent or outside GDT/LDT limit"):format(selector)
+		)
+		return
 	end
 	const gateType = band(desc.access, 0x1F)
 	if gateType == 0x01 or gateType == 0x03 or gateType == 0x09 or gateType == 0x0B then
@@ -2687,8 +2712,13 @@ H[0x9D] = function(cpu: any) -- POPF / POPFD
 	local value
 	if cpu.operand32 then
 		value = cpu:pop32()
+		-- POPFD never changes VM, RF, VIF or VIP.
+		value = bor(band(value, bnot(0x1B0000)), band(cpu.flags, 0x1B0000))
 	else
 		value = cpu:pop16()
+		-- A 16-bit POPF leaves the upper half (VM, RF, AC...) alone: V86 code
+		-- that runs POPF must not drop out of virtual-8086 mode.
+		value = bor(band(cpu.flags, 0xFFFF0000), band(value, 0xFFFF))
 	end
 	cpu.flags = bor(band(privilegedFlags(cpu, value), cpu.flagMask), cpu.fixedFlags)
 	if not wasEnabled and cpu:getF(IFF) then
@@ -2997,7 +3027,7 @@ H[0xCF] = function(cpu: any) -- IRET / IRETD
 	const width = if cpu.operand32 then 4 else 2
 	const ip = if width == 4 then cpu:pop32() else cpu:pop16()
 	const csSel = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
-	const newFlags = if width == 4 then cpu:pop32() else cpu:pop16()
+	local newFlags = if width == 4 then cpu:pop32() else cpu:pop16()
 	if cpu.traceEnabled then
 		const ssBase = cpu:baseOf("ss")
 		const sp = cpu:getSP()
@@ -3012,6 +3042,10 @@ H[0xCF] = function(cpu: any) -- IRET / IRETD
 			s2 = cpu.mem:read16(ssBase + band(sp + 4, 0xFFFF)),
 			s3 = cpu.mem:read16(ssBase + band(sp + 6, 0xFFFF)),
 		}
+	end
+	if width == 2 then
+		-- A 16-bit IRET only replaces the low half of EFLAGS.
+		newFlags = bor(band(cpu.flags, 0xFFFF0000), band(newFlags, 0xFFFF))
 	end
 	const wasEnabled = cpu:getF(IFF)
 	const targetV86 = band(newFlags, VM) ~= 0

@@ -400,7 +400,7 @@ if opts.ringAt then
 				print(("MEM %X: %s"):format(ma, table.concat(words, " ")))
 			end
 			print(
-				("A20=%s SS=%04X SP=%X DS=%04X ES=%04X SI=%X DI=%X BX=%X"):format(
+				("A20=%s SS=%04X SP=%X DS=%04X ES=%04X SI=%X DI=%X BX=%X FL=%X"):format(
 					tostring(m.mem.a20),
 					self.ss,
 					self:rr32(4),
@@ -408,7 +408,8 @@ if opts.ringAt then
 					self.es,
 					self:rr32(6),
 					self:rr32(7),
-					self:rr32(3)
+					self:rr32(3),
+					self.flags
 				)
 			)
 			if opts.traceAfter then
@@ -611,6 +612,9 @@ local faultRingPos = 0
 if opts.ringFault then
 	faultRingLen = tonumber(opts.ringFault) :: number
 	faultRing = {}
+	-- --pe-stop N: stop at the Nth CR0.PE 1->0 transition and print the ring.
+	local peStop = tonumber(opts.peStop)
+	local peLast, peStopSeen = bit32.band(m.cpu.cr0, 1), 0
 	local origF = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
 		faultRing[faultRingPos % faultRingLen + 1] = ("%04X:%08X cr0=%X eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X esp=%X ds=%04X es=%04X ss=%04X"):format(
@@ -629,6 +633,32 @@ if opts.ringFault then
 			self.ss
 		)
 		faultRingPos += 1
+		if peStop then
+			const pe = bit32.band(self.cr0, 1)
+			if peLast == 1 and pe == 0 then
+				peStopSeen += 1
+				if peStopSeen >= peStop then
+					print(
+						("PE CLEARED at %04X:%08X (transition %d)"):format(
+							self.cs,
+							self.ip,
+							peStopSeen
+						)
+					)
+					if opts.save then
+						checkpoint(opts.save)
+					end
+					for q = 1, faultRingLen do
+						local e = (faultRing :: { string })[(faultRingPos + q - 1) % faultRingLen + 1]
+						if e then
+							print(e)
+						end
+					end
+					process.exit(0)
+				end
+			end
+			peLast = pe
+		end
 		return origF(self)
 	end
 	-- --triple-stop 1: print the ring and exit at the first triple fault instead of resetting.

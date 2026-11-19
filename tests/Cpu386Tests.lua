@@ -1059,6 +1059,23 @@ T("push_ds_with_operand_prefix_pushes_a_dword_and_pop_ds_consumes_one", function
 	expect(cpu:rr32(4) == 0x8000, "sp after 32-bit pop ds = " .. string.format("%X", cpu:rr32(4)))
 end)
 
+-- A 16-bit POPF must not clear VM: V86 code runs POPF all the time and the
+-- Win98 VMM expects to stay in virtual-8086 mode.
+T("popf_16bit_preserves_vm_and_upper_flag_bits", function(expect)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = bor(2, 0x20000)
+	cpu:wr32(4, 0x8000)
+	m.mem:write16(0x8000, 0x0202)
+	putCode(m, 0x1000, { 0x9D }) -- popf
+	cpu:executeStep()
+	expect(band(cpu.flags, 0x20000) ~= 0, "VM kept: flags=" .. string.format("%X", cpu.flags))
+	expect(band(cpu.flags, 0x200) ~= 0, "IF set from the popped word")
+end)
+
 -- MOV CR0, r32 moves all 32 bits even without a 0x66 prefix in real mode
 -- (WIN.COM enables PE|PG|WP this way with EAX = 805B0001h).
 T("mov_cr0_from_eax_without_operand_prefix_reads_all_32_bits", function(expect)
