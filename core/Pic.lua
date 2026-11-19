@@ -22,6 +22,7 @@ type Chip = {
 	single: boolean,
 	readIsr: boolean,
 	level: boolean,
+	poll: boolean,
 }
 
 export type Pic = typeof(setmetatable(
@@ -52,6 +53,7 @@ local function newChip(vectorBase: number): Chip
 		single = false,
 		readIsr = false,
 		level = false,
+		poll = false,
 	}
 end
 
@@ -221,8 +223,14 @@ local function writeChip(self: Pic, chip: Chip, port: number, value: number)
 			return
 		end
 		if band(value, 0x08) ~= 0 then
-			-- OCW3: select the next read register, poll mode is not modelled.
-			chip.readIsr = band(value, 0x02) ~= 0
+			-- OCW3: RR (bit 1) selects the register the next command-port read
+			-- returns and RIS (bit 0) picks ISR over IRR; a write with RR clear leaves
+			-- the selection alone. P (bit 2) makes the next read a poll command.
+			-- Win98's VPICD reads IRR with 0Ah and polls during init.
+			if band(value, 0x02) ~= 0 then
+				chip.readIsr = band(value, 0x01) ~= 0
+			end
+			chip.poll = band(value, 0x04) ~= 0
 			return
 		end
 		-- OCW2: end-of-interrupt (specific when bit 6 is set).
@@ -279,6 +287,19 @@ function Pic.in8(self: Pic, port: number): number
 	end
 	if not isCommand then
 		return chip.imr
+	end
+	if chip.poll then
+		-- Poll command: acknowledge the highest pending request like INTA would and
+		-- return bit 7 plus its level; 0 when nothing is pending.
+		chip.poll = false
+		const irq = bestIrq(chip)
+		if irq == nil then
+			return 0
+		end
+		chip.irr = setBit(chip.irr, irq, false)
+		chip.isr = setBit(chip.isr, irq, true)
+		self:syncCascade()
+		return bor(0x80, irq)
 	end
 	return if chip.readIsr then chip.isr else chip.irr
 end

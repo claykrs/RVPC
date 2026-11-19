@@ -242,6 +242,13 @@ Tools added: `--vgalog LO HI N [--vgalog-hist 1]` (who writes aperture offsets),
 
 Progress check: file copy 22% at 14.7B steps (191 minutes left on SETUP's own estimate).
 
+## Update (2026-11-19, SETUP copy finished; Win98's own boot reached)
+
+- The file copy ran to 100% at about 43.5B steps (about 9.5 hours of wall time at 0.5-0.7M steps/s), Setup rebooted (SeaBIOS ran again at 43.9B), DOS booted and `WIN.COM` started the real Windows 98 kernel. Checkpoints: `tools/out/w98k.snap.NNNNNm` (44000m is just before the kernel start).
+- Fixed on the way: `MOV CRn, r32` / `MOV r32, CRn` always use the full 32-bit register (WIN.COM writes CR0 = 805B0001h from real mode without a 0x66 prefix; the emulator read AX only, never enabled paging and executed the DOS device header table as code). PIC OCW3 now follows the datasheet: RR selects the register and RIS picks ISR vs IRR (0Ah previously selected ISR), and the poll command (P bit) is implemented.
+- Current frontier: at about 44.078B steps the kernel prints "Invalid VxD dynamic link call to device number 3, service B. Your Windows configuration is invalid. Run the Windows Setup program again to correct this problem." (device 3 = VPICD, service 0Bh = Force_Default_Behavior) and the machine resets. The text goes out through the VGA BIOS teletype (`C000:1AE6`); no `int 20h` dynamic link is executed in the window (`--vxdlog any` logs none), so the message comes from the VMM's own import resolution or fault path, not from a plain VxD call. Next steps: find the VMM code that prints it (watch the text cells with `--watch 0xB8000 --watch-step 1`, then walk back with `--ring-at`/`--ring-fault`), check the VxD load order and whether VPICD (a static VxD in VMM32.VXD) initialises (PIC probes, `Sys_Critical_Init`), and compare with SYSTEM.INI/registry data on the C: image.
+- New tools: `--ring-fault N` (last N instructions printed on a fault), `--ring-gdt 1`, `--vxdlog DEV|any`, `--hook-stack 1`, `--end-text 1` (text screen at the end of a run), `tools/dis32.py` (32-bit disassembly from a checkpoint). The long run and its monitors were stopped at 51B steps (it was looping in BIOS after the reset).
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).

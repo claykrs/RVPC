@@ -247,6 +247,26 @@ T("vga_modes_12_13_and_text", function(expect)
 	expect(m.mem:read8(0xB8000) == string.byte("R"), "text cell")
 end)
 
+T("pic_ocw3_selects_irr_or_isr_and_polls", function(expect)
+	const pic = Pic.new()
+	pic:out8(0x20, 0x11)
+	pic:out8(0x21, 0x20)
+	pic:out8(0x21, 0x04)
+	pic:out8(0x21, 0x01)
+	pic:out8(0x21, 0x00) -- unmask everything
+	pic:raise(3)
+	pic:out8(0x20, 0x0A) -- OCW3: read IRR
+	expect(pic:in8(0x20) == 0x08, "IRR read after OCW3 0Ah")
+	pic:out8(0x20, 0x0B) -- OCW3: read ISR
+	expect(pic:in8(0x20) == 0x00, "ISR read after OCW3 0Bh")
+	pic:out8(0x20, 0x0C) -- OCW3: poll
+	expect(pic:in8(0x20) == 0x83, "poll returns 80h | level")
+	pic:out8(0x20, 0x0B)
+	expect(pic:in8(0x20) == 0x08, "poll acknowledged the request")
+	pic:out8(0x20, 0x0C)
+	expect(pic:in8(0x20) == 0x00, "poll with nothing pending")
+end)
+
 T("pic_program_and_eoi", function(expect)
 	const pic = Pic.new()
 	-- Master: ICW1 edge, ICW2 base 0x20, ICW3 cascade IRQ2, ICW4 8086 mode.

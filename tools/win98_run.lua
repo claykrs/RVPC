@@ -570,6 +570,21 @@ if opts.hook then
 						table.concat(bt, " ")
 					)
 				)
+				if opts.hookStack then
+					local sp = bit32.band(self:rr32(4), 0xFFFF)
+					local words = {}
+					for q = 0, 11 do
+						table.insert(
+							words,
+							("%04X"):format(
+								m.mem:read16(self.ss * 16 + bit32.band(sp + q * 2, 0xFFFF))
+							)
+						)
+					end
+					print(
+						("  STACK ss=%04X sp=%X: %s"):format(self.ss, sp, table.concat(words, " "))
+					)
+				end
 				if got >= want then
 					process.exit(0)
 				end
@@ -605,6 +620,48 @@ if opts.ringFault then
 		)
 		faultRingPos += 1
 		return origF(self)
+	end
+end
+
+-- --vxdlog DEVICE [--vxdlog-service S]: print every `int 20h` dynamic link call to the VxD
+-- DEVICE (hex) with cs:ip and the other registers; stops after --vxdlog-n hits.
+if opts.vxdlog then
+	local dev = if opts.vxdlog == "any" then nil else tonumber(opts.vxdlog, 16)
+	local svc = if opts.vxdlogService then tonumber(opts.vxdlogService, 16) else nil
+	local want = tonumber(opts.vxdlogN) or 20
+	local got = 0
+	local origV = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		do
+			local lin = self.segBase.cs + self.ip
+			if m.mem:read8(lin) == 0xCD and m.mem:read8(lin + 1) == 0x20 then
+				local service = m.mem:read16(lin + 2)
+				local device = m.mem:read16(lin + 4)
+				if (dev == nil or device == dev) and (svc == nil or service == svc) then
+					got += 1
+					print(
+						("VXD#%d %04X:%X call dev=%X svc=%X eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X esp=%X"):format(
+							got,
+							self.cs,
+							self.ip,
+							device,
+							service,
+							self:rr32(0),
+							self:rr32(3),
+							self:rr32(1),
+							self:rr32(2),
+							self:rr32(6),
+							self:rr32(7),
+							self:rr32(4)
+						)
+					)
+					if got >= want then
+						process.exit(0)
+					end
+				end
+			end
+		end
+		return origV(self)
 	end
 end
 
@@ -744,6 +801,10 @@ if vgaHistRef then
 	for k, v in vgaHistRef do
 		print(("HIST %s %d"):format(k, v))
 	end
+end
+if opts.endText then
+	print("-- text screen at end --")
+	print(m:outputText())
 end
 print(
 	("END %s at %d steps pc=%s elapsed=%.0fs"):format(
