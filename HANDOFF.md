@@ -249,6 +249,22 @@ Progress check: file copy 22% at 14.7B steps (191 minutes left on SETUP's own es
 - Current frontier: at about 44.078B steps the kernel prints "Invalid VxD dynamic link call to device number 3, service B. Your Windows configuration is invalid. Run the Windows Setup program again to correct this problem." (device 3 = VPICD, service 0Bh = Force_Default_Behavior) and the machine resets. The text goes out through the VGA BIOS teletype (`C000:1AE6`); no `int 20h` dynamic link is executed in the window (`--vxdlog any` logs none), so the message comes from the VMM's own import resolution or fault path, not from a plain VxD call. Next steps: find the VMM code that prints it (watch the text cells with `--watch 0xB8000 --watch-step 1`, then walk back with `--ring-at`/`--ring-fault`), check the VxD load order and whether VPICD (a static VxD in VMM32.VXD) initialises (PIC probes, `Sys_Critical_Init`), and compare with SYSTEM.INI/registry data on the C: image.
 - New tools: `--ring-fault N` (last N instructions printed on a fault), `--ring-gdt 1`, `--vxdlog DEV|any`, `--hook-stack 1`, `--end-text 1` (text screen at the end of a run), `tools/dis32.py` (32-bit disassembly from a checkpoint). The long run and its monitors were stopped at 51B steps (it was looping in BIOS after the reset).
 
+## Update (2026-11-19, Win98 VMM starts and keeps running)
+
+The "Invalid VxD dynamic link" message was a symptom. Real causes, all fixed (gate green):
+
+- 32-bit `PUSH/POP ES/DS/CS/SS` (operand size) pushed words, misaligning the VMM's interrupt stubs.
+- Paged 16/32-bit reads/writes that straddle a 4 KiB boundary used physically contiguous bytes (the `int 20h` link word crosses pages).
+- Far CALL/JMP through a bad selector is now a guest #GP, not a host error.
+- 16-bit `POPF`/`IRET` keep the upper EFLAGS half (VM!); `POPFD` keeps VM/RF/VIF/VIP; `IRETD` loads all of ESP (V86 code addresses through ESP).
+- V86 at IOPL<3 traps CLI/STI/PUSHF/POPF/INT n/IRET with #GP(0); software INT through a gate with DPL<CPL is a guest #GP(vector*8+2) (the VMM reflects V86 ints this way at IOPL 3).
+- `ARPL` (0x63) is implemented; in real/V86 it is #UD. The VMM uses a `63` byte in ROM as the return marker of Simulate_Int (it was being executed as the 8086 `JNB` alias).
+
+Frontier: the VMM now boots into Windows (Sys_VM running); long run from `tools/out/w98pm.snap`
+(44.0779B steps, just before PM entry) with `--save-every 250`. Tools added: `--fault-log N [--fault-vec V]`,
+`--v86ret N`, `--dr-log N`, `--pe-stop N`, `--triple-stop 1`, `--pte LINEAR`, `--ring-nth N`, `--ring-save PATH`,
+`--ring-mem esp|ebp --ring-lin 1`, `--dump-lin 1`; `vxdlog` and `dis32.py` (set `LIN=1`) now read through paging.
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
