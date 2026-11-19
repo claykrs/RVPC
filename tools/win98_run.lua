@@ -127,6 +127,20 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	if opts.pic then
+		local pc = m.pic
+		print(
+			("PIC master imr=%02X irr=%02X isr=%02X | slave imr=%02X irr=%02X isr=%02X"):format(
+				pc.master.imr,
+				pc.master.irr,
+				pc.master.isr,
+				pc.slave.imr,
+				pc.slave.irr,
+				pc.slave.isr
+			)
+		)
+		process.exit(0)
+	end
 	-- --pte LINEAR: print CR3 and the PDE/PTE for a linear address of the loaded checkpoint.
 	if opts.pte then
 		local la = tonumber(opts.pte) :: number
@@ -628,6 +642,7 @@ if opts.hook then
 end
 
 -- --ring-fault N: keep the last N executed cs:ip with registers and print them when the run faults.
+local ioHistRef: { [string]: number }? = nil
 local faultRing: { string }? = nil
 local faultRingLen = 0
 local faultRingPos = 0
@@ -794,6 +809,24 @@ if opts.drLog then
 			real[k] = v
 		end,
 	}) :: any
+end
+
+-- --io-hist 1: count port reads/writes (8-bit paths) and print them when the run ends.
+if opts.ioHist then
+	local cnt: { [string]: number } = {}
+	local io = m.cpu.io :: any
+	local oi, oo = io.in8, io.out8
+	io.in8 = function(port)
+		local k = ("in  %04X"):format(port)
+		cnt[k] = (cnt[k] or 0) + 1
+		return oi(port)
+	end
+	io.out8 = function(port, v)
+		local k = ("out %04X"):format(port)
+		cnt[k] = (cnt[k] or 0) + 1
+		return oo(port, v)
+	end
+	ioHistRef = cnt
 end
 
 -- --vxdlog DEVICE [--vxdlog-service S]: print every `int 20h` dynamic link call to the VxD
@@ -975,6 +1008,18 @@ if saveAt and st.executed < saveAt then
 end
 if stopReason == "budget" then
 	stopReason = advance(budget) or "budget"
+end
+if ioHistRef then
+	local keys = {}
+	for k in ioHistRef do
+		table.insert(keys, k)
+	end
+	table.sort(keys, function(a, b)
+		return (ioHistRef :: any)[a] > (ioHistRef :: any)[b]
+	end)
+	for i = 1, math.min(20, #keys) do
+		print(("IO %s %d"):format(keys[i], (ioHistRef :: any)[keys[i]]))
+	end
 end
 if vgaHistRef then
 	for k, v in vgaHistRef do
