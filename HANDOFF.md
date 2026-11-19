@@ -229,6 +229,19 @@ State after the CPU fixes above (IOPL in POPF/IRET, MOV SS/POP SS interrupt shad
 - To finish in reasonable time the interpreter needs a large speed-up (decoded-instruction/basic-block cache, cheaper segment and memory paths). `win98_run --bench N` measures the raw core (about 0.86M steps/s) and `--hist N` prints the hottest `cs:ip`.
 - Open cosmetic defect: every `W`/`w` glyph in SETUP's text is blank while the advance width is kept ("indo s 98"). Not yet traced; the font bitmap for those two characters may be zero in memory or the planar write path may drop them.
 
+## Update (2026-11-18, W/w/M glyph defect: where it is and where it is not)
+
+Symptom: in SETUP's GDI text every `W`, `w` and `M` (the widest glyphs) comes out blank or as a white diagonal blob; the advance width is kept ("indo s 98"). What was ruled out and what is known:
+
+- Not the CPU shift/rotate group: a brute-force check of SHL/SHR/SAR/ROL/ROR by CL (8/16-bit) and SHLD/SHRD (16/32-bit) against reference arithmetic found no mismatch. ROL/ROR/RCL/RCR/shift flag handling was also read.
+- Not the VGA planar write path for the fills: dither and rectangle fills (`043F:C7C`, `043F:11AC`, `043F:E7C`) draw correctly.
+- The text pixels are drawn by the VGA driver's monochrome-to-planar blitter at `043F:B99..C34` (`ror`/`and`/`or`/`stosw` loop at `043F:BD3`, plane select via `3C5`, colour via `3CE`). Its source rows already contain the blob (for example `00 00 .. F0 FF 0F FF` for a `w`), so the corruption is produced upstream, in the DIB engine that renders the glyph into a memory bitmap (selector `14FF`, base `0x580280`). The bytes of that bitmap are written by DIB-engine code at `0AE7:8219..83B6`, a byte-pipeline routine that looks like generated ("compiled blt") code.
+- Next step: capture one full `w` glyph through `0AE7:8219..83B6` (`--hook 0AE7:8378 --hook-n ...` prints registers and source bytes; `--watch ADDR --watch-step 1` names writers) and compare with a hand-computed expected row; suspect an instruction used by that generated code (string ops with segment overrides, `66`-prefixed ops in 16-bit code, flags after `adc/sbb`).
+
+Tools added: `--vgalog LO HI N [--vgalog-hist 1]` (who writes aperture offsets), `--hook CS:IP [--hook-di LO HI] [--hook-n N] [--hook-bytes B]` (regs plus DS:SI bytes at each hit), `--trace-after N` with `--ring-at` (instruction trace after a hit), `--ops N` (opcode histogram).
+
+Progress check: file copy 22% at 14.7B steps (191 minutes left on SETUP's own estimate).
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).

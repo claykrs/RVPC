@@ -323,8 +323,30 @@ if opts.ringAt then
 	local ringLen = tonumber(opts.ringLen) or 64
 	local ring, rpos = {}, 0
 	local lastCs, lastIp = 0, 0
+	local traceLeft = 0
 	local orig2 = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
+		if traceLeft > 0 then
+			traceLeft -= 1
+			print(
+				("T %04X:%04X eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X fl=%04X"):format(
+					self.cs,
+					self.ip,
+					self:rr32(0),
+					self:rr32(3),
+					self:rr32(1),
+					self:rr32(2),
+					self:rr32(6),
+					self:rr32(7),
+					self:rr32(5),
+					self.flags
+				)
+			)
+			if traceLeft == 0 then
+				process.exit(0)
+			end
+			return orig2(self)
+		end
 		if
 			(
 				(rlin and self.cs * 16 + self.ip == rlin)
@@ -368,7 +390,11 @@ if opts.ringAt then
 					self:rr32(3)
 				)
 			)
-			process.exit(0)
+			if opts.traceAfter then
+				traceLeft = tonumber(opts.traceAfter) :: number
+			else
+				process.exit(0)
+			end
 		end
 		local jump = opts.ringXfer == nil
 			or self.cs ~= lastCs
@@ -446,6 +472,100 @@ if opts.bench then
 		)
 	)
 	process.exit(0)
+end
+
+local vgaHistRef: { [string]: number }? = nil
+-- --vgalog LO HI N: print the first N writes to aperture offsets LO..HI (decimal or 0x)
+-- with the writing cs:ip, then exit. Use --vgalog-skip K to ignore the first K hits.
+if opts.vgalog then
+	local lo = tonumber(opts.vgalog) :: number
+	local hi = tonumber(opts.vgalogHi) :: number
+	local want = tonumber(opts.vgalogN) or 40
+	local skip = tonumber(opts.vgalogSkip) or 0
+	local seen, shown = 0, 0
+	local vga = m.vga
+	local origW = vga.write8
+	local hist: { [string]: number } = {}
+	vgaHistRef = hist
+	vga.write8 = function(self, addr, value)
+		local off = bit32.band(addr, 0xFFFF)
+		if off >= lo and off <= hi then
+			seen += 1
+			if seen > skip then
+				shown += 1
+				local c = m.cpu
+				if opts.vgalogHist then
+					local key = ("%04X:%X wm=%d"):format(c.cs, c.ip, bit32.band(self.gfx[5], 3))
+					hist[key] = (hist[key] or 0) + 1
+				else
+					print(
+						("VGAW off=%04X val=%02X by %04X:%X (mode wm=%d)"):format(
+							off,
+							value,
+							c.cs,
+							c.ip,
+							bit32.band(self.gfx[5], 3)
+						)
+					)
+				end
+				if shown >= want then
+					for k, v in hist do
+						print(("HIST %s %d"):format(k, v))
+					end
+					process.exit(0)
+				end
+			end
+		end
+		return origW(self, addr, value)
+	end
+end
+
+-- --hook CS:IP [--hook-di LO HI] [--hook-n N] [--hook-bytes B]: print regs and B bytes at DS:SI
+-- every time CS:IP is reached (optionally only when DI is in LO..HI), stop after N hits.
+if opts.hook then
+	local hcs, hip = string.match(opts.hook, "^(%x+):(%x+)$")
+	local hcsN, hipN = tonumber(hcs, 16), tonumber(hip, 16)
+	local diLo, diHi = tonumber(opts.hookDi or "0"), tonumber(opts.hookDiHi or "65535")
+	local want = tonumber(opts.hookN) or 20
+	local nbytes = tonumber(opts.hookBytes) or 16
+	local got = 0
+	local origHook = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if self.cs == hcsN and self.ip == hipN then
+			local di = bit32.band(self:rr32(7), 0xFFFF)
+			if di >= diLo and di <= diHi then
+				got += 1
+				local si = self:rr32(6)
+				local bt = {}
+				for q = 0, nbytes - 1 do
+					table.insert(
+						bt,
+						("%02X"):format(
+							m.mem:read8(self:linear("ds", bit32.band(si + q, 0xFFFF), 1))
+						)
+					)
+				end
+				print(
+					("HOOK#%d ds=%04X dsbase=%X si=%X di=%X cx=%X bx=%X dx=%X ax=%X: %s"):format(
+						got,
+						self.ds,
+						self.segBase.ds,
+						si,
+						di,
+						self:rr32(1),
+						self:rr32(3),
+						self:rr32(2),
+						self:rr32(0),
+						table.concat(bt, " ")
+					)
+				)
+				if got >= want then
+					process.exit(0)
+				end
+			end
+		end
+		return origHook(self)
+	end
 end
 
 local function advance(limit)
@@ -571,6 +691,11 @@ if saveAt and st.executed < saveAt then
 end
 if stopReason == "budget" then
 	stopReason = advance(budget) or "budget"
+end
+if vgaHistRef then
+	for k, v in vgaHistRef do
+		print(("HIST %s %d"):format(k, v))
+	end
 end
 print(
 	("END %s at %d steps pc=%s elapsed=%.0fs"):format(
