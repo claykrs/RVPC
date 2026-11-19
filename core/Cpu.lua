@@ -715,6 +715,14 @@ function Cpu.read16(self: Cpu, addr: number, supervisor: boolean?): number
 	if band(self.cr0, CR0_PG) == 0 then
 		return self.mem:read16(addr)
 	end
+	if band(addr, 0xFFF) == 0xFFF then
+		-- Crosses a page boundary: each byte translates on its own.
+		const lo = self:read8(addr, supervisor)
+		if self.aborting then
+			return 0
+		end
+		return lo + self:read8(addr + 1, supervisor) * 256
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
@@ -726,6 +734,13 @@ end
 function Cpu.read32(self: Cpu, addr: number, supervisor: boolean?): number
 	if band(self.cr0, CR0_PG) == 0 then
 		return self.mem:read32(addr)
+	end
+	if band(addr, 0xFFF) > 0xFFC then
+		const lo = self:read16(addr, supervisor)
+		if self.aborting then
+			return 0
+		end
+		return lo + self:read16(addr + 2, supervisor) * 65536
 	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, false, user, false)
@@ -756,6 +771,13 @@ function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean
 		self.mem:write16(addr, value)
 		return
 	end
+	if band(addr, 0xFFF) == 0xFFF then
+		self:write8(addr, band(value, 0xFF), supervisor)
+		if not self.aborting then
+			self:write8(addr + 1, band(rshift(value, 8), 0xFF), supervisor)
+		end
+		return
+	end
 	const user = not supervisor and self:cpl() == 3
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
@@ -770,6 +792,13 @@ end
 function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean?): ()
 	if band(self.cr0, CR0_PG) == 0 then
 		self.mem:write32(addr, value)
+		return
+	end
+	if band(addr, 0xFFF) > 0xFFC then
+		self:write16(addr, band(value, 0xFFFF), supervisor)
+		if not self.aborting then
+			self:write16(addr + 2, band(rshift(value, 16), 0xFFFF), supervisor)
+		end
 		return
 	end
 	const user = not supervisor and self:cpl() == 3
@@ -2264,15 +2293,27 @@ for aluOp = 0, 7 do
 	end
 end
 
--- segment push/pop
+-- segment push/pop: with a 32-bit operand size the push writes a full dword (the
+-- selector zero-extended) and the pop consumes one, so protected-mode 32-bit
+-- code that saves DS/ES around a handler keeps its stack aligned.
+local function pushSeg(cpu: any, value: number)
+	if cpu.operand32 then
+		cpu:push32(value)
+	else
+		cpu:push16(value)
+	end
+end
+local function popSeg(cpu: any): number
+	return if cpu.operand32 then cpu:pop32() else cpu:pop16()
+end
 H[0x06] = function(cpu: any)
-	cpu:push16(cpu.es)
+	pushSeg(cpu, cpu.es)
 end
 H[0x07] = function(cpu: any)
-	cpu:loadSeg("es", cpu:pop16())
+	cpu:loadSeg("es", popSeg(cpu))
 end
 H[0x0E] = function(cpu: any)
-	cpu:push16(cpu.cs)
+	pushSeg(cpu, cpu.cs)
 end
 H[0x0F] = function(cpu: any)
 	if cpu.config.popCS == false then
@@ -2281,18 +2322,18 @@ H[0x0F] = function(cpu: any)
 	cpu.cs = cpu:pop16()
 end
 H[0x16] = function(cpu: any)
-	cpu:push16(cpu.ss)
+	pushSeg(cpu, cpu.ss)
 end
 H[0x17] = function(cpu: any)
-	if cpu:loadSeg("ss", cpu:pop16()) then
+	if cpu:loadSeg("ss", popSeg(cpu)) then
 		cpu.irqDelay = 1 -- POP SS inhibits interrupts for one instruction
 	end
 end
 H[0x1E] = function(cpu: any)
-	cpu:push16(cpu.ds)
+	pushSeg(cpu, cpu.ds)
 end
 H[0x1F] = function(cpu: any)
-	cpu:loadSeg("ds", cpu:pop16())
+	cpu:loadSeg("ds", popSeg(cpu))
 end
 
 -- BCD adjust

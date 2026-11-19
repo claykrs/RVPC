@@ -3,7 +3,7 @@ import os, subprocess, sys
 import capstone
 snap, addr, n = sys.argv[1], int(sys.argv[2], 16), int(sys.argv[3], 16)
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-res = subprocess.run([os.path.join(root, "tools", "bin", "lune.exe"), "run", "tools/win98_run.lua", "--load", snap, "--dump", hex(addr), "--dump-len", hex(n)], capture_output=True, text=True, cwd=root)
+res = subprocess.run([os.path.join(root, "tools", "bin", "lune.exe"), "run", "tools/win98_run.lua", "--load", snap, "--dump", hex(addr), "--dump-len", hex(n)] + (["--dump-lin", "1"] if os.environ.get("LIN") else []), capture_output=True, text=True, cwd=root)
 data = bytearray()
 for line in res.stdout.splitlines():
     if ":" in line and not line.startswith("loaded"):

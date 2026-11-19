@@ -133,7 +133,11 @@ if opts.load then
 		for row = 0, n - 1, 16 do
 			local t = {}
 			for k = row, math.min(row + 15, n - 1) do
-				table.insert(t, ("%02X"):format(m.mem:read8(a + k)))
+				local pa = a + k
+				if opts.dumpLin then
+					pa = m.cpu:translatePage(a + k, false, false)
+				end
+				table.insert(t, ("%02X"):format(m.mem:read8(pa)))
 			end
 			print(("%X: %s"):format(a + row, table.concat(t, " ")))
 		end
@@ -360,6 +364,9 @@ if opts.ringAt then
 				end
 			end
 			print(("HIT %04X:%X"):format(rcs, rip))
+			if opts.ringSave then
+				checkpoint(opts.ringSave)
+			end
 			local cb = self.cs * 16 + self.ip
 			local bt = {}
 			for q = -8, 24 do
@@ -379,15 +386,18 @@ if opts.ringAt then
 			end
 			if opts.ringMem then
 				local ma = tonumber(opts.ringMem)
-				print(
-					("MEM %X: %04X %04X %04X %04X"):format(
-						ma,
-						m.mem:read16(ma),
-						m.mem:read16(ma + 2),
-						m.mem:read16(ma + 4),
-						m.mem:read16(ma + 6)
-					)
-				)
+				if opts.ringMem == "esp" then
+					ma = self:rr32(4)
+				elseif opts.ringMem == "ebp" then
+					ma = self:rr32(5)
+				end
+				local words = {}
+				for q = 0, 15 do
+					local la = ma + q * 4
+					local pa = if opts.ringLin then self:translatePage(la, false, false) else la
+					table.insert(words, ("%08X"):format(m.mem:read32(pa)))
+				end
+				print(("MEM %X: %s"):format(ma, table.concat(words, " ")))
 			end
 			print(
 				("A20=%s SS=%04X SP=%X DS=%04X ES=%04X SI=%X DI=%X BX=%X"):format(
@@ -621,6 +631,19 @@ if opts.ringFault then
 		faultRingPos += 1
 		return origF(self)
 	end
+	-- --triple-stop 1: print the ring and exit at the first triple fault instead of resetting.
+	if opts.tripleStop then
+		m.cpu.tripleFault = function(self)
+			print(("TRIPLE FAULT at %04X:%08X cr0=%X"):format(self.cs, self.ip, self.cr0))
+			for q = 1, faultRingLen do
+				local e = (faultRing :: { string })[(faultRingPos + q - 1) % faultRingLen + 1]
+				if e then
+					print(e)
+				end
+			end
+			process.exit(0)
+		end
+	end
 end
 
 -- --vxdlog DEVICE [--vxdlog-service S]: print every `int 20h` dynamic link call to the VxD
@@ -634,6 +657,12 @@ if opts.vxdlog then
 	m.cpu.executeStep = function(self)
 		do
 			local lin = self.segBase.cs + self.ip
+			local okT, phys = pcall(function()
+				return self:translatePage(lin, false, false)
+			end)
+			if okT then
+				lin = phys
+			end
 			if m.mem:read8(lin) == 0xCD and m.mem:read8(lin + 1) == 0x20 then
 				local service = m.mem:read16(lin + 2)
 				local device = m.mem:read16(lin + 4)

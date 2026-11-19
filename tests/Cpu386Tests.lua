@@ -123,6 +123,39 @@ T("far_call_retf_32_balances_stack", function(expect)
 	expect(m.cpu:getSP() == before, string.format("ESP=%08X want %08X", m.cpu:getSP(), before))
 end)
 
+-- A 16/32-bit access that straddles a 4 KiB page boundary must translate each
+-- page separately: the VMM reads `int 20h` link words across such boundaries.
+T("paged_accesses_crossing_a_page_boundary_use_both_pages", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.mem.a20 = true
+	m.mem:write32(0x2000, 0x00003003) -- PDE0 -> page table at 0x3000
+	m.mem:write32(0x3040, 0x00050003) -- virtual 0x10000 -> physical 0x50000
+	m.mem:write32(0x3044, 0x00070003) -- virtual 0x11000 -> physical 0x70000
+	m.mem:write8(0x50FFE, 0x11)
+	m.mem:write8(0x50FFF, 0x22)
+	m.mem:write8(0x70000, 0x33)
+	m.mem:write8(0x70001, 0x44)
+	const cpu = m.cpu
+	cpu.cr3 = 0x2000
+	cpu.cr[3] = 0x2000
+	cpu.cr0 = bor(1, 0x80000000)
+	cpu.cr[0] = cpu.cr0
+	expect(cpu:read32(0x10FFE) == 0x44332211, string.format("read32 = %X", cpu:read32(0x10FFE)))
+	expect(cpu:read16(0x10FFF) == 0x3322, string.format("read16 = %X", cpu:read16(0x10FFF)))
+	cpu:write32(0x10FFD, 0xDDCCBBAA)
+	expect(m.mem:read8(0x50FFD) == 0xAA and m.mem:read8(0x50FFE) == 0xBB, "write32 low bytes")
+	expect(
+		m.mem:read8(0x50FFF) == 0xCC and m.mem:read8(0x70000) == 0xDD,
+		"write32 crosses to second page"
+	)
+	cpu:write16(0x10FFF, 0x5566)
+	expect(
+		m.mem:read8(0x50FFF) == 0x66 and m.mem:read8(0x70000) == 0x55,
+		"write16 crosses to second page"
+	)
+end)
+
 T("page_fault_restarts_faulting_instruction", function(expect)
 	const m = freshMachine()
 	flat32(m)
@@ -1007,6 +1040,23 @@ end)
 T("mov_ds_does_not_inhibit_interrupts", function(expect)
 	const cpu = ssShadowCpu({ 0x8E, 0xD8 }) -- mov ds, ax
 	expect(cpu.irqDelay == 0, "irqDelay after MOV DS = " .. tostring(cpu.irqDelay))
+end)
+
+-- With a 32-bit operand size PUSH/POP of ES/DS move a full dword (the VMM's
+-- interrupt stubs save DS/ES this way in 32-bit code).
+T("push_ds_with_operand_prefix_pushes_a_dword_and_pop_ds_consumes_one", function(expect)
+	const m = freshMachine()
+	const cpu = m.cpu
+	cpu.cs, cpu.ds, cpu.es, cpu.ss = 0, 0, 0, 0
+	cpu.segBase.cs = 0
+	cpu.ip = 0x1000
+	cpu.flags = 2
+	cpu:wr32(4, 0x8000)
+	putCode(m, 0x1000, { 0x66, 0x1E, 0x66, 0x1F }) -- push ds ; pop ds (operand32)
+	cpu:executeStep()
+	expect(cpu:rr32(4) == 0x7FFC, "sp after 32-bit push ds = " .. string.format("%X", cpu:rr32(4)))
+	cpu:executeStep()
+	expect(cpu:rr32(4) == 0x8000, "sp after 32-bit pop ds = " .. string.format("%X", cpu:rr32(4)))
 end)
 
 -- MOV CR0, r32 moves all 32 bits even without a 0x66 prefix in real mode
