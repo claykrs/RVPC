@@ -855,6 +855,20 @@ if opts.ioHist then
 	ioHistRef = cnt
 end
 
+-- --ide-log N: print the first N IDE command-register writes (cmd, lba, count) and bus-master starts.
+if opts.ideLog and m.ide then
+	local left = tonumber(opts.ideLog) :: number
+	local ide = m.ide :: any
+	local o8 = ide.out8
+	ide.out8 = function(self, port, v)
+		if left > 0 and port - self.base == 7 then
+			left -= 1
+			print(("IDE cmd=%02X lba=%d cnt=%s step=%d"):format(v, self.lba or -1, tostring(self.sectorCount), st.executed))
+		end
+		return o8(self, port, v)
+	end
+end
+
 -- --irq-hist 1: count Pic:raise calls per IRQ and print at end.
 if opts.irqHist then
 	local rc: { [number]: number } = {}
@@ -1050,6 +1064,11 @@ if irqHistRef then
 	for irq, n in irqHistRef do
 		print(("IRQRAISE %d %d"):format(irq, n))
 	end
+end
+if opts.ideState and m.ide then
+	local ide = m.ide :: any
+	local t = ide.transfer
+	print(("IDEST status=%02X irqPending=%s devCtl=%02X lba=%s cnt=%s bmCmd=%s bmStatus=%s prdt=%s transfer=%s pos=%s len=%s"):format(ide.selected.status, tostring(ide.irqPending), ide.deviceControl, tostring(ide.lba), tostring(ide.sectorCount), tostring(ide.bmCmd), tostring(ide.bmStatus), tostring(ide.bmPrdt), tostring(t ~= nil), tostring(t and t.pos), tostring(t and t.length)))
 end
 if ioHistRef then
 	local keys = {}

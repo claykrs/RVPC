@@ -393,3 +393,8 @@ branch with natural lowercase messages.
 - No cycle accuracy requirement; compatibility and correctness win.
 - Do not commit Microsoft media, SeaBIOS binaries or disk images.
 - Every milestone must leave `lune run tools/check.lua` green.
+
+## Update (2026-11-23, idle is after a finished disk read)
+- From `w98a.snap` (44.106B) the guest writes FAT sector 7209 and directory sector 576 a few times (cmd 30), then reads 16 sectors at LBA 296976 (cmd 20, PIO), then issues no more IDE commands. The idle (`w98c.snap`) shows IDE status 50, no transfer pending, no bus-master activity; only IRQ14 stays latched in the slave PIC IRR (masked).
+- So the stall is not a failed or repeating disk read: the read completes and nothing consumes the result. The V86 loop seen with `--fault-log` (INT 2Fh 4300 / VDS 8103/8104) is one DOS-side cycle around that I/O.
+- New tools: `--ide-log N` (first N IDE command writes), `--ide-state 1` (IDE task-file and bus-master state at the end). Note `--budget` counts steps in thousands of the printed step number (1000 is a few steps; runs of several million take minutes).
