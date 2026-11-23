@@ -265,6 +265,14 @@ Frontier: the VMM now boots into Windows (Sys_VM running); long run from `tools/
 `--v86ret N`, `--dr-log N`, `--pe-stop N`, `--triple-stop 1`, `--pte LINEAR`, `--ring-nth N`, `--ring-save PATH`,
 `--ring-mem esp|ebp --ring-lin 1`, `--dump-lin 1`; `vxdlog` and `dis32.py` (set `LIN=1`) now read through paging.
 
+## Update (2026-11-23, Win98 VMM idles; nothing signals it)
+
+- After the V86/ARPL/IOPL fixes the VMM boots, runs DOS calls in the system VM (INT 21h via the HMA chain, VDS INT 4Bh, VMM reflecting INT 2Fh) and then idles from about 44.12B steps. A 70B-step run (to 114B) showed no change: same text screen, same scheduler PCs.
+- Idle state (checkpoints `tools/out/w98a.snap` 44.106B, `w98c.snap` 44.128B): the VMM scheduler (`C0003621..C00036F7`, `C000A700..C000A884`) finds no runnable work and executes its HLT idle loop; the VM is resumed at the ARPL return marker (`FCB2:2FF7`) with stale client regs (AX=3DA0, an open of `C:\WINDOWS\KRNL386.EXE` that is never issued: `Simulate_Int` at `C022029D` is not called). A semaphore/event wait (`C000A4C0`, `C0032xxx`) is never signalled. Only IRQ0 fires; RTC regB=02 (no periodic IRQ); IRQ14 is pending in the slave IRR but masked.
+- Ruled out by experiment: InDOS flag (`00C9:0321`) forced to 0; IRQ14 unmasked. Neither changes the idle.
+- Next: identify the semaphore at `[esi+0x70]`-indexed table `C00351DA` and its Signal_Semaphore call sites; check why the VM_Event that should start the nested `Simulate_Int(21h, AX=3DA0)` is never queued (look at the previous call, AX=DC00, and `C0003995`/`C000A0EC` event queue code).
+- New tools: `--poke LINEAR=BYTE`, `--unmask IRQ`, `--rtc 1`, `--irq-hist 1`, `--pic 1`, `--io-hist 1`; `tools/live_viewer.py` (serves `tools/out` on 127.0.0.1:8791 with `viewer.html`) and `tools/keep_running.sh` (self-resuming run, log only).
+
 ## Decisions
 
 - **Target:** Windows 98 SE only (not 95, not 98 Gold).
