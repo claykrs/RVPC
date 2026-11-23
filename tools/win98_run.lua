@@ -127,6 +127,11 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	if opts.rtc then
+		local r = m.rtcState
+		print(("RTC regA=%02X regB=%02X regC=%02X"):format(r.regA or -1, r.regB, r.regC or -1))
+		process.exit(0)
+	end
 	if opts.pic then
 		local pc = m.pic
 		print(
@@ -174,6 +179,26 @@ if opts.load then
 		end
 		process.exit(0)
 	end
+end
+
+-- --poke LINEAR=BYTE: write a byte through paging after loading (experiments only).
+if opts.poke and opts.load then
+	local la, val = string.match(opts.poke, "^(%x+)=(%x+)$")
+	local pa = m.cpu:translatePage(tonumber(la, 16) :: number, true, false)
+	m.mem:write8(pa, tonumber(val, 16) :: number)
+	print(("poked %s at phys %X"):format(opts.poke, pa))
+end
+
+-- --unmask IRQ: clear an IRQ mask bit after loading (diagnostic experiment).
+if opts.unmask and opts.load then
+	local irq = tonumber(opts.unmask) :: number
+	if irq >= 8 then
+		m.pic.slave.imr = bit32.band(m.pic.slave.imr, bit32.bnot(bit32.lshift(1, irq - 8)))
+		m.pic:syncCascade()
+	else
+		m.pic.master.imr = bit32.band(m.pic.master.imr, bit32.bnot(bit32.lshift(1, irq)))
+	end
+	print("unmasked irq " .. irq)
 end
 
 local function checkpoint(path)
@@ -642,6 +667,7 @@ if opts.hook then
 end
 
 -- --ring-fault N: keep the last N executed cs:ip with registers and print them when the run faults.
+local irqHistRef: { [number]: number }? = nil
 local ioHistRef: { [string]: number }? = nil
 local faultRing: { string }? = nil
 local faultRingLen = 0
@@ -829,6 +855,17 @@ if opts.ioHist then
 	ioHistRef = cnt
 end
 
+-- --irq-hist 1: count Pic:raise calls per IRQ and print at end.
+if opts.irqHist then
+	local rc: { [number]: number } = {}
+	local origRaise = m.pic.raise
+	m.pic.raise = function(self, irq)
+		rc[irq] = (rc[irq] or 0) + 1
+		return origRaise(self, irq)
+	end
+	irqHistRef = rc
+end
+
 -- --vxdlog DEVICE [--vxdlog-service S]: print every `int 20h` dynamic link call to the VxD
 -- DEVICE (hex) with cs:ip and the other registers; stops after --vxdlog-n hits.
 if opts.vxdlog then
@@ -1008,6 +1045,11 @@ if saveAt and st.executed < saveAt then
 end
 if stopReason == "budget" then
 	stopReason = advance(budget) or "budget"
+end
+if irqHistRef then
+	for irq, n in irqHistRef do
+		print(("IRQRAISE %d %d"):format(irq, n))
+	end
 end
 if ioHistRef then
 	local keys = {}
