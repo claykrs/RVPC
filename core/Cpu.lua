@@ -175,6 +175,13 @@ export type Cpu = {
 	address32: boolean,
 	modrmScratch: ModRM,
 	halted: boolean,
+	-- One-page code-fetch cache for paged mode: the TLB entry it was filled
+	-- from, so any TLB change (flush, epoch bump, dirty/PTE invalidation) misses.
+	fetchPage: number,
+	fetchPhys: number,
+	fetchEntry: number,
+	fetchEpoch: number,
+	fetchKey: number,
 	-- 8086 STI/POPF/IRET interrupt shadow: no hardware IRQ is recognized until
 	-- the instruction after the flag change has executed.
 	irqDelay: number,
@@ -352,6 +359,11 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.baseAddress32 = false
 	self.modrmScratch = { mod = 0, reg = 0, rm = 0, off = nil, addr = nil, seg = nil }
 	self.halted = false
+	self.fetchPage = -1
+	self.fetchPhys = 0
+	self.fetchEntry = -1
+	self.fetchEpoch = -1
+	self.fetchKey = -1
 	self.irqDelay = 0
 	self.oseg = nil
 	self.osegReg = nil
@@ -700,11 +712,20 @@ end
 -- and interrupt-table reads.
 -- Paging-off is the common case (real mode, DOS extenders, most of SeaBIOS
 -- POST). Skip the CPL and page-walk calls entirely when CR0.PG is clear.
+-- cpl() == 3 without the three method calls; the paged memory helpers ask this
+-- on every access.
+local function isUser(self: Cpu): boolean
+	if band(self.cr0, CR0_PE) == 0 then
+		return false
+	end
+	return band(self.flags, VM) ~= 0 or band(self.cs, 3) == 3
+end
+
 function Cpu.read8(self: Cpu, addr: number, supervisor: boolean?): number
 	if band(self.cr0, CR0_PG) == 0 then
 		return self.mem:read8(addr)
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
 		return 0
@@ -724,7 +745,7 @@ function Cpu.read16(self: Cpu, addr: number, supervisor: boolean?): number
 		end
 		return lo + self:read8(addr + 1, supervisor) * 256
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
 		return 0
@@ -743,7 +764,7 @@ function Cpu.read32(self: Cpu, addr: number, supervisor: boolean?): number
 		end
 		return lo + self:read16(addr + 2, supervisor) * 65536
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, false, user, false)
 	if self.aborting then
 		return 0
@@ -756,7 +777,7 @@ function Cpu.write8(self: Cpu, addr: number, value: number, supervisor: boolean?
 		self.mem:write8(addr, value)
 		return
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
 		return
@@ -779,7 +800,7 @@ function Cpu.write16(self: Cpu, addr: number, value: number, supervisor: boolean
 		end
 		return
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
 		return
@@ -802,7 +823,7 @@ function Cpu.write32(self: Cpu, addr: number, value: number, supervisor: boolean
 		end
 		return
 	end
-	const user = not supervisor and self:cpl() == 3
+	const user = not supervisor and isUser(self)
 	const phys = self:translatePage(addr, true, user, false)
 	if self.aborting then
 		return
@@ -858,6 +879,11 @@ local function cacheReal(self: any, reg: string, selector: number)
 end
 
 function Cpu.reset(self: Cpu)
+	self.fetchPage = -1
+	self.fetchPhys = 0
+	self.fetchEntry = -1
+	self.fetchEpoch = -1
+	self.fetchKey = -1
 	self.cr0 = 0
 	self.cr3 = 0
 	self.tlb = nil
@@ -1722,6 +1748,42 @@ function Cpu.wr32(self: Cpu, i: number, v: number)
 	self.rHi[i + 1] = band(rshift(v, 16), 0xFFFF)
 end
 
+-- Paged code fetch through a one-page cache. Returns the physical address of
+-- linear `lin`, or nil when the cache cannot answer (the caller then takes the
+-- full linear/translate path, which raises any #PF and refills the cache).
+-- The key holds CS and the VM flag, so a privilege change misses; the stored
+-- TLB entry and epoch catch every flush and invalidation.
+local function codePhys(self: Cpu, lin: number): number?
+	const tlb = self.tlb
+	if band(self.cr0, CR0_PG) == 0 or tlb == nil then
+		return nil
+	end
+	const page = rshift(lin, 12)
+	const key = bor(self.cs, band(self.flags, VM))
+	if
+		page == self.fetchPage
+		and key == self.fetchKey
+		and self.fetchEpoch == self.tlbEpoch
+		and tlb[page] == self.fetchEntry
+	then
+		return self.fetchPhys + band(lin, 0xFFF)
+	end
+	const user = self:cpl() == 3
+	const phys = self:translatePage(lin, false, user, false)
+	if self.aborting then
+		return nil
+	end
+	const entry = tlb[page]
+	if entry ~= nil and entry ~= 0 then
+		self.fetchPage = page
+		self.fetchKey = key
+		self.fetchEpoch = self.tlbEpoch
+		self.fetchEntry = entry
+		self.fetchPhys = phys - band(lin, 0xFFF)
+	end
+	return phys
+end
+
 function Cpu.fetch8(self: Cpu): number
 	local ip = self.ip
 	-- Unpaged code fetch: avoid the generic segment/page/abort wrappers. The
@@ -1735,6 +1797,14 @@ function Cpu.fetch8(self: Cpu): number
 				else 0xFFFF
 			self.ip = band(ip + 1, mask)
 			return b
+		end
+	end
+	if self.segSel.cs == self.cs and ip <= self.segLimit.cs then
+		const phys = codePhys(self, self.segBase.cs + ip)
+		if phys then
+			const mask = if band(self.segFlags.cs or 0, 0x40) ~= 0 then 0xFFFFFFFF else 0xFFFF
+			self.ip = band(ip + 1, mask)
+			return self.mem:read8(phys)
 		end
 	end
 	local b = self:read8(self:linear("cs", ip, 1))
@@ -1758,6 +1828,17 @@ function Cpu.fetch16(self: Cpu): number
 			return value
 		end
 	end
+	if self.segSel.cs == self.cs and ip + 1 <= self.segLimit.cs then
+		const lin = self.segBase.cs + ip
+		if band(lin, 0xFFF) < 0xFFF then
+			const mask = if band(self.segFlags.cs or 0, 0x40) ~= 0 then 0xFFFFFFFF else 0xFFFF
+			const phys = if ip + 1 <= mask then codePhys(self, lin) else nil
+			if phys then
+				self.ip = band(ip + 2, mask)
+				return self.mem:read16(phys)
+			end
+		end
+	end
 	const lo = self:fetch8()
 	return bor(lo, lshift(self:fetch8(), 8))
 end
@@ -1773,6 +1854,17 @@ function Cpu.fetch32(self: Cpu): number
 			const value = self.mem:read32(self.segBase.cs + ip)
 			self.ip = band(ip + 4, mask)
 			return value
+		end
+	end
+	if self.segSel.cs == self.cs and ip + 3 <= self.segLimit.cs then
+		const lin = self.segBase.cs + ip
+		if band(lin, 0xFFF) <= 0xFFC then
+			const mask = if band(self.segFlags.cs or 0, 0x40) ~= 0 then 0xFFFFFFFF else 0xFFFF
+			const phys = if ip + 3 <= mask then codePhys(self, lin) else nil
+			if phys then
+				self.ip = band(ip + 4, mask)
+				return self.mem:read32(phys)
+			end
 		end
 	end
 	const lo = self:fetch16()
@@ -4842,6 +4934,22 @@ function Cpu.interrupt(self: Cpu, n: number, errorCode: number?, software: boole
 	end
 end
 
+-- Prefix bytes; any other opcode leaves the prefix loop after one lookup
+-- instead of a dozen comparisons.
+const IS_PREFIX: { [number]: boolean } = {
+	[0x26] = true,
+	[0x2E] = true,
+	[0x36] = true,
+	[0x3E] = true,
+	[0x64] = true,
+	[0x65] = true,
+	[0x66] = true,
+	[0x67] = true,
+	[0xF0] = true,
+	[0xF2] = true,
+	[0xF3] = true,
+}
+
 function Cpu.executeStep(self: Cpu): number
 	if self.halted then
 		return 0
@@ -4866,6 +4974,9 @@ function Cpu.executeStep(self: Cpu): number
 	local op = 0
 	while true do
 		op = self:fetch8()
+		if not IS_PREFIX[op] then
+			break
+		end
 		if op == 0x26 then
 			self.oseg, self.osegReg = self.es, "es"
 		elseif op == 0x2E then

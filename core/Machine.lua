@@ -1113,6 +1113,20 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				end
 				if not self:deliverInterrupt() then
 					idle += 1
+					-- Nothing can wake the CPU before the next timer edge: skip to
+					-- just before it in one go. Device service treats the skipped
+					-- steps as one pending batch, exactly as it does for 8 steps.
+					if pit then
+						const leap = math.min(pit:stepsToIrq0() - 1, budget - steps - 1, 65535)
+						if leap > 0 then
+							steps += leap
+							devPhase += leap
+							idle += leap
+							if cpu.tsc then
+								cpu.tsc += leap
+							end
+						end
+					end
 					-- A halted CPU waits for the next timer tick; give a full 8254
 					-- period (up to 65536 counts) before declaring the machine dead.
 					if idle > 200000 then

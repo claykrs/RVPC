@@ -116,6 +116,17 @@ function Pit.advance(self: Pit, cycles: number): boolean
 	return irq
 end
 
+-- Guest steps until channel 0 next reaches terminal count (its IRQ0 edge), so
+-- a halted CPU can skip straight to it.
+function Pit.stepsToIrq0(self: Pit): number
+	const channel = self.channels[1]
+	const counts = math.max(1, channel.counter)
+	if self.channel0Divisor > 1 then
+		return math.max(1, counts * self.channel0Divisor - self.channel0Phase)
+	end
+	return counts
+end
+
 function Pit.out8(self: Pit, port: number, value: number)
 	value = band(value, 0xFF)
 	if port == 0x43 then

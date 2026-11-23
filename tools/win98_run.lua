@@ -11,7 +11,7 @@
 --   lune run tools/win98_run.lua --load tools/out/w98.snap --budget 3500
 --   lune run tools/win98_run.lua --verify 40 --verify-span 20   (determinism proof)
 --
--- Options (millions of steps): --budget, --save-at, --save-every (rolling
+-- Options (millions of steps): --budget (absolute), --steps (relative to --load), --save-at, --save-every (rolling
 -- checkpoints named <save>.<N>m), --verify, --verify-span.
 -- Paths: --iso, --hdd, --boot, --save, --load. The HDD/ISO/boot images are the
 -- same ones the probes use and must be the same ones a checkpoint was taken on.
@@ -311,7 +311,8 @@ local function react(screen)
 	return nil
 end
 
-local budget = opts.budget * 1_000_000
+-- --steps N: run N million steps past the loaded checkpoint (relative; --budget is absolute).
+local budget = if opts.steps then st.executed + opts.steps * 1_000_000 else opts.budget * 1_000_000
 local saveAt = if opts.saveAt then opts.saveAt * 1_000_000 else nil
 local verifyAt = if opts.verify then opts.verify * 1_000_000 else nil
 local saveEvery = if opts.saveEvery then opts.saveEvery * 1_000_000 else nil
@@ -900,6 +901,18 @@ if opts.picLog then
 	end
 end
 
+-- --exec-count 1: count retired executeStep calls (vs. steps) to measure HLT idle.
+local execCountRef: { n: number }? = nil
+if opts.execCount then
+	local c = { n = 0 }
+	local oe = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		c.n += 1
+		return oe(self)
+	end
+	execCountRef = c
+end
+
 -- --irq-hist 1: count Pic:raise calls per IRQ and print at end.
 if opts.irqHist then
 	local rc: { [number]: number } = {}
@@ -1136,6 +1149,9 @@ if opts.bt then
 			table.concat(out, " ")
 		)
 	)
+end
+if execCountRef then
+	print(("EXEC %d instructions"):format(execCountRef.n))
 end
 if ioHistRef then
 	local keys = {}
