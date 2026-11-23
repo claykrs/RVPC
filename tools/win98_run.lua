@@ -863,7 +863,14 @@ if opts.ideLog and m.ide then
 	ide.out8 = function(self, port, v)
 		if left > 0 and port - self.base == 7 then
 			left -= 1
-			print(("IDE cmd=%02X lba=%d cnt=%s step=%d"):format(v, self.lba or -1, tostring(self.sectorCount), st.executed))
+			print(
+				("IDE cmd=%02X lba=%d cnt=%s step=%d"):format(
+					v,
+					self.lba or -1,
+					tostring(self.sectorCount),
+					st.executed
+				)
+			)
 		end
 		return o8(self, port, v)
 	end
@@ -1068,7 +1075,43 @@ end
 if opts.ideState and m.ide then
 	local ide = m.ide :: any
 	local t = ide.transfer
-	print(("IDEST status=%02X irqPending=%s devCtl=%02X lba=%s cnt=%s bmCmd=%s bmStatus=%s prdt=%s transfer=%s pos=%s len=%s"):format(ide.selected.status, tostring(ide.irqPending), ide.deviceControl, tostring(ide.lba), tostring(ide.sectorCount), tostring(ide.bmCmd), tostring(ide.bmStatus), tostring(ide.bmPrdt), tostring(t ~= nil), tostring(t and t.pos), tostring(t and t.length)))
+	print(
+		("IDEST status=%02X irqPending=%s devCtl=%02X lba=%s cnt=%s bmCmd=%s bmStatus=%s prdt=%s transfer=%s pos=%s len=%s"):format(
+			ide.selected.status,
+			tostring(ide.irqPending),
+			ide.deviceControl,
+			tostring(ide.lba),
+			tostring(ide.sectorCount),
+			tostring(ide.bmCmd),
+			tostring(ide.bmStatus),
+			tostring(ide.bmPrdt),
+			tostring(t ~= nil),
+			tostring(t and t.pos),
+			tostring(t and t.length)
+		)
+	)
+end
+if opts.bt then
+	local cpu = m.cpu :: any
+	local esp = cpu:rr32(4)
+	local base = cpu.segBase.ss
+	local out = {}
+	for i = 0, tonumber(opts.bt) :: number do
+		local ok, v = pcall(function()
+			return cpu:read32(base + esp + i * 4, true)
+		end)
+		if ok and v >= 0xC0000000 and v < 0xC1000000 then
+			table.insert(out, ("%X:%08X"):format(i * 4, v))
+		end
+	end
+	print(
+		("BT esp=%08X eip=%08X ebp=%08X: %s"):format(
+			esp,
+			cpu.ip,
+			cpu:rr32(5),
+			table.concat(out, " ")
+		)
+	)
 end
 if ioHistRef then
 	local keys = {}

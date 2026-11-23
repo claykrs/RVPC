@@ -1531,6 +1531,9 @@ function Ide.takeIrq(self: Ide): boolean
 		return false
 	end
 	self.irqPending = false
+	-- PIIX: the bus-master interrupt-status bit follows every IDE interrupt,
+	-- PIO ones included; Win9x's IDE driver tests it to claim the IRQ.
+	self.bmStatus = bor(self.bmStatus, BM_STATUS_INT)
 	return true
 end
 
