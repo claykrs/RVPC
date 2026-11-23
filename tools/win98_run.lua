@@ -864,15 +864,39 @@ if opts.ideLog and m.ide then
 		if left > 0 and port - self.base == 7 then
 			left -= 1
 			print(
-				("IDE cmd=%02X lba=%d cnt=%s step=%d"):format(
+				("IDE cmd=%02X lba=%d cnt=%s dc=%02X cs:eip=%04X:%X"):format(
 					v,
 					self.lba or -1,
 					tostring(self.sectorCount),
-					st.executed
+					self.deviceControl,
+					m.cpu.cs,
+					m.cpu.ip
 				)
 			)
 		end
 		return o8(self, port, v)
+	end
+end
+
+-- --pic-log N: print the first N writes to the slave PIC mask/command ports (A0/A1) with the guest eip.
+if opts.picLog then
+	local left = tonumber(opts.picLog) :: number
+	local io = m.cpu.io :: any
+	local oo = io.out8
+	io.out8 = function(port, v)
+		if left > 0 and (port == 0xA1 or port == 0xA0) then
+			left -= 1
+			print(
+				("PICW %02X=%02X cs:eip=%04X:%X irr=%02X"):format(
+					port,
+					v,
+					m.cpu.cs,
+					m.cpu.ip,
+					m.pic.slave and m.pic.slave.irr or -1
+				)
+			)
+		end
+		return oo(port, v)
 	end
 end
 

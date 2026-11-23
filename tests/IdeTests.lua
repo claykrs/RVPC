@@ -1057,6 +1057,17 @@ T("ata_identify_checksum_and_extended_words", function(expect)
 	expect(words[61] == 2048 and words[62] == 0, "1 MiB LBA capacity changed")
 end)
 
+T("polled_status_read_clears_masked_interrupt", function(expect)
+	const hdd = buffer.create(1024 * 1024)
+	const ide = Ide.new({ hdd = hdd })
+	-- a BIOS-style polled write: nIEN set, completion found by reading Status
+	ide:out8(0x3F6, 0x0A)
+	writeSectors(ide, 5, 1, 0x1234)
+	ide:in8(0x1F7)
+	ide:out8(0x3F6, 0x08)
+	expect(not ide:takeIrq(), "a status read must drop the interrupt that nIEN was holding back")
+end)
+
 T("ata_high_lba_pio_and_dirty_range", function(expect)
 	const hdd = buffer.create(4 * 1024 * 1024)
 	const ide = Ide.new({ hdd = hdd })

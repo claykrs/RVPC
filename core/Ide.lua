@@ -1402,6 +1402,12 @@ function Ide.in8(self: Ide, port: number): number
 	elseif offset == 6 then
 		return self.driveHead
 	elseif offset == 7 or port == self.altBase then
+		-- Reading the Status register (not Alternate Status) clears INTRQ: a
+		-- polled command (SeaBIOS runs with nIEN set) must not leave a stale
+		-- interrupt that fires when the guest later enables the line.
+		if port ~= self.altBase and band(self.deviceControl, 0x02) ~= 0 then
+			self.irqPending = false
+		end
 		return self.selected.status
 	end
 	return 0xFF
