@@ -813,6 +813,11 @@ T("piix3_pci_topology_and_bar_sizing", function(expect)
 	expect(pciRead32(m, 1, 1, 0x00) == 0x70108086, "IDE ID")
 	expect(pciRead32(m, 1, 1, 0x08) == 0x01018000, "IDE class/prog_if")
 	expect(pciRead32(m, 1, 1, 0x3C) == 0x0000010E, "IDE IRQ14/INTA#")
+	-- IDETIM keeps both words: Win98 reads bit 15 of each as the channel's
+	-- decode enable, and with it clear runs every drive in compatibility mode.
+	expect(pciRead32(m, 1, 1, 0x40) == 0x80008000, "IDETIM decode enables after POST")
+	pciWrite32(m, 1, 1, 0x40, 0xA307E307)
+	expect(pciRead32(m, 1, 1, 0x40) == 0xA307E307, "IDETIM keeps the secondary word")
 
 	const bars = { 0x1F0, 0x3F6, 0x170, 0x376, 0xC000 }
 	const masks = { 0xFFFFFFF9, 0xFFFFFFFF, 0xFFFFFFF9, 0xFFFFFFFF, 0xFFFFFFF1 }

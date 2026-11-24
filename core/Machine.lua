@@ -111,6 +111,10 @@ export type Machine = typeof(setmetatable(
 		ideBarProbe: { boolean },
 		ideCommand: number,
 		ideLatency: number,
+		-- PIIX3 IDETIM (0x40 primary, 0x42 secondary) and SIDETIM (0x44): bit 15
+		-- of each IDETIM word is the channel's IDE decode enable.
+		ideTiming: number,
+		ideSlaveTiming: number,
 		isaConfig: { [number]: number },
 		isaCommand: number,
 		elcrMaster: number,
@@ -257,7 +261,9 @@ local function ideDword(machine: any, offset: number): number
 	elseif offset == 0x3C then
 		return 0x0000010E -- interrupt line 14, INTA#
 	elseif offset == 0x40 then
-		return band(machine.ideLatency or 0, 0xFF)
+		return machine.ideTiming or 0
+	elseif offset == 0x44 then
+		return band(machine.ideSlaveTiming or 0, 0xFF)
 	end
 	return 0
 end
@@ -354,7 +360,9 @@ local function pciWrite(machine: any, address: number, value: number)
 			return
 		end
 		if offset == 0x40 then
-			machine.ideLatency = band(value, 0xFF)
+			machine.ideTiming = band(value, 0xFFFFFFFF)
+		elseif offset == 0x44 then
+			machine.ideSlaveTiming = band(value, 0xFF)
 		end
 		return
 	end
@@ -491,6 +499,12 @@ function Machine.new(deps: Deps, config: Config?): Machine
 	self.ideBarProbe = { false, false, false, false, false }
 	self.ideCommand = 0x00000007
 	self.ideLatency = 0
+	-- Both channels decode, as SeaBIOS programs them (and as checkpoints taken
+	-- after POST need): Win98 reads the enables to decide which channels the
+	-- protected-mode IDE driver gets; with them clear it falls back to
+	-- MS-DOS compatibility mode for every drive.
+	self.ideTiming = 0x80008000
+	self.ideSlaveTiming = 0
 	self.vgaCommand = 0x00000007
 	self.vgaLatency = 0
 	self.vgaRomBar = 0x000C0001 -- 32 KiB option ROM in the C0000 shadow window
