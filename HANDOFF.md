@@ -424,3 +424,8 @@ branch with natural lowercase messages.
 - After the fix, device init continues through VCOMM, VCOND, VTDAPI, VDMAD, V86MMGR, SPOOLER, UDF, VFAT, VDEF.
 - New tools: `--ring-jumps 1` (ring records only non-sequential steps, i.e. control flow), `--port-log 60,64 [--port-log-n N]`, `--dos-write 1` (prints BOOTLOG.TXT lines as the VMM writes them).
 - Long run: `tools/out/w98k.log`, checkpoints `tools/out/w98k.snap.<N>m` every 250M steps.
+- Next two CPU bugs after CR2, both hit right after device init:
+  - Expand-down data segments were treated as expand-up (`ba278d7`). KRNL386's flat selector 16F is base 0, limit EE60, access F6, B=1, so `cmp [BFF71000],'KEXP'` faulted (fatal exception 0D at 0147:7F21).
+  - `POP m` with an ESP base used the pre-pop ESP (`bdd3f42`). The 16->32 thunk at 0147:65xx does `pop dword [esp+8]` then `o32 retf`, so it overwrote the CS slot (fatal exception 0D at 0147:656A, error 53CC).
+- With those fixed, Win98 reaches the GUI: 640x480, hourglass on blue, by 44.18B (`tools/out/w98_546.ppm`). Checkpoint `tools/out/w98k.snap.44200m`.
+- Note: the runner presses Enter and takes a PPM shot every 80M steps after 580M (`tools/win98_run.lua` ~line 1271), and forces `pit.channel0Divisor = 1` after 500M.
