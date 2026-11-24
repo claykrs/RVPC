@@ -319,6 +319,93 @@ end
 local budget = if opts.steps then st.executed + opts.steps * 1_000_000 else opts.budget * 1_000_000
 local saveAt = if opts.saveAt then opts.saveAt * 1_000_000 else nil
 local verifyAt = if opts.verify then opts.verify * 1_000_000 else nil
+-- --keys "Text{TAB}{ENTER}" [--keys-at M] [--keys-gap M]: type a key script
+-- (set-1 make codes; uppercase and !@ etc. use Shift) starting at absolute step
+-- M million, one key every gap million steps (default 2). --no-auto-enter 1
+-- stops the periodic Enter the GUI loop otherwise sends.
+local SCAN: { [string]: number } = {}
+do
+	local rows = {
+		{ "1234567890-=", 0x02 },
+		{ "qwertyuiop[]", 0x10 },
+		{ "asdfghjkl;'`", 0x1E },
+		{ "zxcvbnm,./", 0x2C },
+	}
+	for _, r in rows do
+		for i = 1, #r[1] do
+			SCAN[string.sub(r[1], i, i)] = r[2] + i - 1
+		end
+	end
+	SCAN["\\"] = 0x2B
+	SCAN[" "] = 0x39
+end
+local SHIFTED = {
+	["!"] = "1",
+	["@"] = "2",
+	["#"] = "3",
+	["$"] = "4",
+	["%"] = "5",
+	["^"] = "6",
+	["&"] = "7",
+	["*"] = "8",
+	["("] = "9",
+	[")"] = "0",
+	["_"] = "-",
+	["+"] = "=",
+	[":"] = ";",
+	['"'] = "'",
+	["<"] = ",",
+	[">"] = ".",
+	["?"] = "/",
+}
+local NAMED = {
+	ENTER = 0x1C,
+	TAB = 0x0F,
+	SPACE = 0x39,
+	ESC = 0x01,
+	BKSP = 0x0E,
+	UP = 0x48,
+	DOWN = 0x50,
+	LEFT = 0x4B,
+	RIGHT = 0x4D,
+	ALT = 0x38,
+	SHIFT = 0x2A,
+	CTRL = 0x1D,
+	F1 = 0x3B,
+	F8 = 0x42,
+}
+local keyQueue: { { number } } = {}
+if opts.keys then
+	local text = tostring(opts.keys)
+	local i = 1
+	while i <= #text do
+		local c = string.sub(text, i, i)
+		if c == "{" then
+			local j = string.find(text, "}", i, true) :: number
+			local name = string.sub(text, i + 1, j - 1)
+			local alt = string.match(name, "^ALT%+(%w)$")
+			if alt then
+				table.insert(keyQueue, { 0x38, SCAN[string.lower(alt)] })
+			else
+				table.insert(keyQueue, { NAMED[name] })
+			end
+			i = j + 1
+		else
+			local lower = string.lower(c)
+			if SHIFTED[c] then
+				table.insert(keyQueue, { 0x2A, SCAN[SHIFTED[c]] })
+			elseif lower ~= c then
+				table.insert(keyQueue, { 0x2A, SCAN[lower] })
+			else
+				table.insert(keyQueue, { SCAN[c] })
+			end
+			i += 1
+		end
+	end
+end
+local keysAt = if opts.keysAt then opts.keysAt * 1_000_000 else 0
+local keysGap = (opts.keysGap or 2) * 1_000_000
+local keyIndex = 1
 local saveEvery = if opts.saveEvery then opts.saveEvery * 1_000_000 else nil
 local nextSave = if saveEvery then (st.executed // saveEvery + 1) * saveEvery else nil
 local verifySpan = (opts.verifySpan or 20) * 1_000_000
@@ -1268,11 +1355,28 @@ local function advance(limit)
 		if st.executed >= 500_000_000 and m.pit.channel0Divisor ~= 1 then
 			m.pit.channel0Divisor = 1
 		end
+		if keyIndex <= #keyQueue and st.executed >= keysAt then
+			local combo = keyQueue[keyIndex]
+			for _, code in combo do
+				m:pressKey(code)
+			end
+			for k = #combo, 1, -1 do
+				m:releaseKey(combo[k])
+			end
+			print(("KEY %d/%d at %d"):format(keyIndex, #keyQueue, st.executed))
+			keyIndex += 1
+			keysAt = st.executed + keysGap
+			if keyIndex > #keyQueue then
+				shot()
+			end
+		end
 		if st.executed >= 580_000_000 and st.executed - st.lastGuiAct >= 80_000_000 then
 			st.lastGuiAct = st.executed
 			shot()
-			m:pressKey(0x1C)
-			m:releaseKey(0x9C)
+			if not opts.noAutoEnter then
+				m:pressKey(0x1C)
+				m:releaseKey(0x9C)
+			end
 		end
 		if st.executed - st.statusAt >= 100_000_000 then
 			st.statusAt = st.executed - st.executed % 100_000_000
