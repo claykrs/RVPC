@@ -418,3 +418,9 @@ branch with natural lowercase messages.
 - Now: from `w98pm.snap` Windows reaches "While initializing device VKD: Windows protection error" at about 44.1059B. The last guest fault before it is a V86 #PF (err 6, CR2=A0000) at `C000:0833` (VGA BIOS `rep movsb` font load into A000:0000, ECX=10h), which VDD should handle by mapping video memory; the VMM then exits to real mode. Checkpoint `w98j.snap.44100m` is 6M steps before it.
 - `--fault-log` now prints CR2 (last #PF address), DS:SI and ES:DI.
 - IOS map from this hunt: IOS DDB `C0034F88`; request entry `C0032205` (`call [eax]`); per-device queue `C00316CC`/`C003172F` (busy slot `[dcb+107h]`); calldown `C003175F`; completion `C00316F2`; RMM.PDR (real-mode mapper) loaded at `C142B000` (request `C142B2C0`, restricted event `VMM 15Ah`, callback `C142B374`).
+
+## Update (2026-11-24, VKD "protection error" was CR2)
+- Root cause: `Cpu.pageFault` never loaded CR2, so `MOV r32,CR2` always read 0. VKD's init does INT 16h AH=0 to flush the BIOS key buffer; DOS's INT 16h hook removes the boot logo (INT 10h mode 3), the VGA BIOS font load faults on A0000 in V86, and the VMM's V86 #PF handler (`C0009748`, `mov esi,cr2`) looked up page 0, found no hook and declared a protection error. Fixed in `783c928` with a CR2 assert in `page_fault_restarts_faulting_instruction`.
+- After the fix, device init continues through VCOMM, VCOND, VTDAPI, VDMAD, V86MMGR, SPOOLER, UDF, VFAT, VDEF.
+- New tools: `--ring-jumps 1` (ring records only non-sequential steps, i.e. control flow), `--port-log 60,64 [--port-log-n N]`, `--dos-write 1` (prints BOOTLOG.TXT lines as the VMM writes them).
+- Long run: `tools/out/w98k.log`, checkpoints `tools/out/w98k.snap.<N>m` every 250M steps.
