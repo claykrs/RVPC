@@ -787,6 +787,9 @@ if opts.faultLog then
 				)
 			)
 		end
+		if opts.faultTrace and errorCode and errorCode > 0xFFFF then
+			print(debug.traceback())
+		end
 		if opts.faultCode and not soft and (onlyVec == nil or onlyVec == n) and seen <= want then
 			local t = {}
 			local base = self.segBase.cs + (self.opIP or self.ip)
@@ -1134,6 +1137,14 @@ if opts.pcLog then
 						if okc then ("%08X"):format(atc) else "?"
 					)
 				)
+				if faultRing then
+					for q = 1, faultRingLen do
+						local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+						if e then
+							print(e)
+						end
+					end
+				end
 				if opts.pcSave then
 					checkpoint(opts.pcSave)
 					process.exit(0)

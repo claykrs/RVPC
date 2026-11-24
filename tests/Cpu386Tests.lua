@@ -263,6 +263,20 @@ T("expand_down_segment_accepts_offsets_above_limit", function(expect)
 	expect(m.mem:read32(0x6004) == 0xDEADBEEF, "in-limit offset did not #GP")
 end)
 
+-- POP m with an ESP base computes the address after ESP is incremented.
+T("pop_to_esp_based_memory_uses_incremented_esp", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.mem:write32(0x8000, 0x11111111)
+	m.mem:write32(0x8004, 0x22222222)
+	m.mem:write32(0x8008, 0x33333333)
+	putCode(m, 0x1000, { 0x8F, 0x44, 0x24, 0x04, 0xF4 }) -- POP DWORD [ESP+4]; HLT
+	m:run(2)
+	expect(m.cpu:rr32(4) == 0x8004, string.format("ESP=%X", m.cpu:rr32(4)))
+	expect(m.mem:read32(0x8008) == 0x11111111, string.format("[8008]=%08X", m.mem:read32(0x8008)))
+	expect(m.mem:read32(0x8004) == 0x22222222, "wrote the pre-pop slot")
+end)
+
 T("page_fault_write_protection_error_code", function(expect)
 	const m = freshMachine()
 	flat32(m)

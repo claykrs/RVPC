@@ -70,6 +70,7 @@ export type ModRM = {
 	off: number?,
 	addr: number?,
 	seg: string?,
+	spBase: boolean?, -- memory operand addressed through ESP (SIB base 4)
 }
 
 export type Descriptor = {
@@ -357,7 +358,8 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.address32 = false
 	self.baseOperand32 = false
 	self.baseAddress32 = false
-	self.modrmScratch = { mod = 0, reg = 0, rm = 0, off = nil, addr = nil, seg = nil }
+	self.modrmScratch =
+		{ mod = 0, reg = 0, rm = 0, off = nil, addr = nil, seg = nil, spBase = false }
 	self.halted = false
 	self.fetchPage = -1
 	self.fetchPhys = 0
@@ -1989,6 +1991,7 @@ function Cpu.modrm(self: Cpu): ModRM
 	e.mod = mod
 	e.reg = reg
 	e.rm = rm
+	e.spBase = false
 	if mod == 3 then
 		e.off = nil
 		e.addr = nil
@@ -2015,6 +2018,9 @@ function Cpu.modrm(self: Cpu): ModRM
 				base = self:rr32(baseField)
 				if baseField == 4 or baseField == 5 then
 					segReg = "ss"
+				end
+				if baseField == 4 then
+					e.spBase = true
 				end
 			end
 		elseif mod == 0 and rm == 5 then
@@ -2745,10 +2751,18 @@ H[0x8E] = function(cpu: any)
 end
 H[0x8F] = function(cpu: any)
 	local e = cpu:modrm()
-	if cpu.operand32 then
-		cpu:writeRM32(e, cpu:pop32())
+	const width = if cpu.operand32 then 4 else 2
+	const value = if width == 4 then cpu:pop32() else cpu:pop16()
+	if e.spBase then
+		-- POP m addressed through ESP uses ESP as it is after the pop
+		-- (Win98's 16->32 thunk does POP DWORD [ESP+8] before its RETF).
+		e.off = band((e.off :: number) + width, 0xFFFFFFFF)
+		e.addr = (e.addr :: number) + width
+	end
+	if width == 4 then
+		cpu:writeRM32(e, value)
 	else
-		cpu:writeRM16(e, cpu:pop16())
+		cpu:writeRM16(e, value)
 	end
 end
 
