@@ -787,6 +787,35 @@ if opts.faultLog then
 				)
 			)
 		end
+		if opts.faultCode and not soft and (onlyVec == nil or onlyVec == n) and seen <= want then
+			local t = {}
+			local base = self.segBase.cs + (self.opIP or self.ip)
+			for k = 0, 15 do
+				local okB, b = pcall(function()
+					return self.mem:read8(self:translatePage(base + k, false, false))
+				end)
+				table.insert(t, if okB then ("%02X"):format(b) else "??")
+			end
+			print(
+				("  ldt=%X fs=%X fsbase=%X fslim=%X dslim=%X sslim=%X"):format(
+					self.ldtrBase,
+					self.fs,
+					self.segBase.fs,
+					self.segLimit.fs,
+					self.segLimit.ds,
+					self.segLimit.ss
+				)
+			)
+			print(
+				("  csbase=%X dsbase=%X esbase=%X ssbase=%X code: %s"):format(
+					self.segBase.cs,
+					self.segBase.ds,
+					self.segBase.es,
+					self.segBase.ss,
+					table.concat(t, " ")
+				)
+			)
+		end
 		return origI(self, n, errorCode, soft)
 	end
 end
@@ -891,6 +920,48 @@ if opts.dosWrite then
 			print(("DOSWRITE h=%d %s"):format(bit32.band(self:rr32(3), 0xFFFF), table.concat(t)))
 		end
 		return origD(self)
+	end
+end
+
+-- --lwatch LINEAR [--lwatch-len N]: print each instruction that changes N bytes at a paged linear address.
+if opts.lwatch then
+	local la = tonumber(opts.lwatch) :: number
+	local n = tonumber(opts.lwatchLen) or 8
+	local function grab(cpu: any): string
+		local t = {}
+		for k = 0, n - 1 do
+			local okB, b = pcall(function()
+				return cpu.mem:read8(cpu:translatePage(la + k, false, false))
+			end)
+			t[k + 1] = if okB then ("%02X"):format(b) else "??"
+		end
+		return table.concat(t, " ")
+	end
+	local last = grab(m.cpu)
+	local hits = 0
+	local origW = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		local pc = ("%04X:%X"):format(self.cs, self.ip)
+		local r = origW(self)
+		local now = grab(self)
+		if now ~= last and hits < 60 then
+			hits += 1
+			print(
+				("LWATCH %s -> %s by %s eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X"):format(
+					last,
+					now,
+					pc,
+					self:rr32(0),
+					self:rr32(3),
+					self:rr32(1),
+					self:rr32(2),
+					self:rr32(6),
+					self:rr32(7)
+				)
+			)
+			last = now
+		end
+		return r
 	end
 end
 

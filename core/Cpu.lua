@@ -1673,7 +1673,14 @@ function Cpu.linear(self: Cpu, reg: string, off: number, size: number): number
 	end
 	if band(self.cr0, 1) ~= 0 and size > 0 then
 		const limit = self.segLimit[reg]
-		if off + size - 1 > limit then
+		local outside = off + size - 1 > limit
+		if band(self.segAccess[reg], 0x1C) == 0x14 then
+			-- Expand-down data segment: valid offsets run from limit+1 up to
+			-- FFFF, or FFFFFFFF with the B bit (Win9x flat selectors and stacks).
+			const upper = if band(self.segFlags[reg], 0x40) ~= 0 then 0xFFFFFFFF else 0xFFFF
+			outside = off <= limit or off + size - 1 > upper
+		end
+		if outside then
 			-- Segment limit violation (and null/unusable selectors, which carry
 			-- limit 0): a guest-visible #GP(0)/#SS(0), not a host error. Windows'
 			-- pointer validators (e.g. the DOSX probe at 0367:4B62) rely on the

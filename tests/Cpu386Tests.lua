@@ -220,6 +220,49 @@ T("page_fault_restarts_faulting_instruction", function(expect)
 	expect(m.mem:read32(0x00800004) == 0xAABBCCDD, "instruction did not restart")
 end)
 
+-- Expand-down data segments accept offsets above the limit (up to 4 GiB with
+-- B=1) and fault at or below it. Win98's KRNL386 probes KERNEL32 at BFF71000
+-- through such a selector (base 0, limit EE60).
+T("expand_down_segment_accepts_offsets_above_limit", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	writeDescriptor(m, 0x3020, 0, 0x0FFF, 0x96, 0x40)
+	m.cpu.gdtr = { base = 0x3000, limit = 0x27 }
+	m.mem:write32(0x5000, 0x12345678)
+	installGate(m, 13, 0x7000, 8, 0x8E)
+	putCode(m, 0x7000, { 0xC7, 0x05, 0x04, 0x60, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0xF4 })
+	putCode(m, 0x1000, {
+		0xB8,
+		0x20,
+		0x00,
+		0x00,
+		0x00, -- MOV EAX,20h
+		0x8E,
+		0xC0, -- MOV ES,AX
+		0x26,
+		0xA1,
+		0x00,
+		0x50,
+		0x00,
+		0x00, -- MOV EAX,ES:[5000h] (above the limit: valid)
+		0xA3,
+		0x00,
+		0x60,
+		0x00,
+		0x00, -- MOV [6000h],EAX
+		0x26,
+		0xA1,
+		0x00,
+		0x01,
+		0x00,
+		0x00, -- MOV EAX,ES:[100h] (below the limit: #GP)
+		0xF4,
+	})
+	m:run(10)
+	expect(m.mem:read32(0x6000) == 0x12345678, string.format("read %08X", m.mem:read32(0x6000)))
+	expect(m.mem:read32(0x6004) == 0xDEADBEEF, "in-limit offset did not #GP")
+end)
+
 T("page_fault_write_protection_error_code", function(expect)
 	const m = freshMachine()
 	flat32(m)
