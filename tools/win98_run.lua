@@ -755,7 +755,7 @@ if opts.faultLog then
 		if not soft and (onlyVec == nil or onlyVec == n) and seen < want then
 			seen += 1
 			print(
-				("FAULT#%d vec=%X err=%s at %04X:%X v86=%s cr0=%X eax=%X ebx=%X ecx=%X esp=%X fl=%X"):format(
+				("FAULT#%d vec=%X err=%s at %04X:%X v86=%s cr0=%X eax=%X ebx=%X ecx=%X esp=%X fl=%X cr2=%X ds=%X si=%X es=%X di=%X"):format(
 					seen,
 					n,
 					tostring(errorCode),
@@ -767,7 +767,12 @@ if opts.faultLog then
 					self:rr32(3),
 					self:rr32(1),
 					self:rr32(4),
-					self.flags
+					self.flags,
+					if self.lastPageFault then self.lastPageFault.addr else 0,
+					self.ds,
+					self:rr32(6),
+					self.es,
+					self:rr32(7)
 				)
 			)
 		end
