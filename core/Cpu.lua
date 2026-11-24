@@ -3405,7 +3405,7 @@ end
 
 local function ioIn(cpu: any, port: number, width: number): number
 	if not ioAllowed(cpu, port, width) then
-		cpu:fault(13)
+		cpu:fault(13, 0)
 		return 0
 	end
 	if width == 4 then
@@ -3431,7 +3431,7 @@ end
 
 local function ioOut(cpu: any, port: number, width: number, value: number)
 	if not ioAllowed(cpu, port, width) then
-		cpu:fault(13)
+		cpu:fault(13, 0)
 		return
 	end
 	if width == 4 then
@@ -4431,7 +4431,7 @@ H0F[0x00] = function(cpu: any)
 		end
 		const desc = readDescriptor(cpu, selector)
 		if not desc then
-			cpu:fault(13)
+			cpu:fault(13, band(selector, 0xFFFC))
 			return
 		end
 		if e.reg == 2 then

@@ -435,6 +435,18 @@ T("arpl_is_undefined_in_real_mode", function(expect)
 	expect(cpu.ip == 0x2000, string.format("IP=%X, #UD vectors through IVT[6]", cpu.ip))
 end)
 
+T("v86_trapped_out_pushes_a_gp_error_code", function(expect)
+	const m = freshMachine()
+	v86TrapSetup(m, 0x3202)
+	m.mem:write16(0x4066, 0x68) -- I/O map base at the TSS limit: every port denied
+	putCode(m, 0x10100, { 0xE6, 0x20 }) -- OUT 20h, AL -> #GP(0)
+	m.cpu:executeStep()
+	expect(m.cpu.ip == 0x6000, string.format("handler at %X", m.cpu.ip))
+	const esp = m.cpu:rr32(4)
+	expect(esp == 0x9000 - 40, string.format("ESP=%X: the V86 frame needs the error code", esp))
+	expect(m.mem:read32(esp) == 0 and m.mem:read32(esp + 4) == 0x100, "error code 0 below EIP")
+end)
+
 T("v86_cli_traps_to_gp_at_iopl_0", function(expect)
 	const m = freshMachine()
 	v86TrapSetup(m, 0x202)
@@ -583,6 +595,9 @@ T("v86_io_bitmap_trap", function(expect)
 	m.mem:write8(0x20110, 0xFE) -- allow port 0x80, deny port 0x81
 	installGate(m, 13, 0x6000, 8, 0x8E)
 	putCode(m, 0x6000, {
+		0x83,
+		0xC4,
+		0x04, -- ADD ESP,4 (drop the #GP error code)
 		0x83,
 		0x04,
 		0x24,
