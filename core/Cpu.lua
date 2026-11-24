@@ -1643,7 +1643,10 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		self:loadSeg("cs", targetSelector)
 		self.ip = targetOffset
 	end
-	self.flags = band(self.flags, bnot(VM))
+	-- Interrupt and trap gates clear VM, NT, RF and TF. A ring-3 NT left set
+	-- would turn the handler's IRET into a task return (#TS); Win98's VMM
+	-- recursed on that until its ring-0 stack overflowed and the PC reset.
+	self.flags = band(self.flags, bnot(bor(VM, NT, RF)))
 	self:setbits(TF, false)
 	if gateType == 0x06 or gateType == 0x0E then
 		self:setbits(IFF, false)

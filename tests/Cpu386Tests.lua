@@ -277,6 +277,19 @@ T("pop_to_esp_based_memory_uses_incremented_esp", function(expect)
 	expect(m.mem:read32(0x8004) == 0x22222222, "wrote the pre-pop slot")
 end)
 
+-- Interrupt gates clear NT so the handler's IRET is a plain return.
+T("interrupt_gate_clears_nt", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.cpu.flags = bor(2, 0x4000)
+	installGate(m, 0x30, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, { 0x9C, 0x58, 0xF4 }) -- PUSHFD; POP EAX; HLT
+	putCode(m, 0x1000, { 0xCD, 0x30 })
+	m:run(4)
+	expect(band(m.cpu:rr32(0), 0x4000) == 0, string.format("handler EFLAGS=%X", m.cpu:rr32(0)))
+	expect(band(m.mem:read32(m.cpu:rr32(4) + 8), 0x4000) ~= 0, "saved EFLAGS lost NT")
+end)
+
 T("page_fault_write_protection_error_code", function(expect)
 	const m = freshMachine()
 	flat32(m)
