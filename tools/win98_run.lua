@@ -311,6 +311,10 @@ local function react(screen)
 	return nil
 end
 
+-- --timer-div N: guest steps per PIT count (default 2), applied after --load.
+if opts.timerDiv then
+	m.timerDivisor = opts.timerDiv
+end
 -- --steps N: run N million steps past the loaded checkpoint (relative; --budget is absolute).
 local budget = if opts.steps then st.executed + opts.steps * 1_000_000 else opts.budget * 1_000_000
 local saveAt = if opts.saveAt then opts.saveAt * 1_000_000 else nil
@@ -911,6 +915,20 @@ if opts.execCount then
 		return oe(self)
 	end
 	execCountRef = c
+end
+
+-- --pci-log N: print the first N writes to the PCI address port (0xCF8) with the guest eip.
+if opts.pciLog then
+	local left = tonumber(opts.pciLog) :: number
+	local io = m.cpu.io :: any
+	local o32 = io.out32
+	io.out32 = function(port, v)
+		if left > 0 and port == 0xCF8 then
+			left -= 1
+			print(("PCI addr=%08X cs:eip=%04X:%X"):format(v, m.cpu.cs, m.cpu.ip))
+		end
+		return o32(port, v)
+	end
 end
 
 -- --irq-hist 1: count Pic:raise calls per IRQ and print at end.
