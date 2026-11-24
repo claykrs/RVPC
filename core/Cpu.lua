@@ -4340,7 +4340,17 @@ local function bitTest(cpu: any, operation: number, immediate: boolean?)
 		op = e.reg - 4
 		index = band(cpu:fetch8(), width - 1)
 	else
-		index = band(if width == 32 then cpu:rr32(e.reg) else cpu:rr(e.reg), width - 1)
+		const raw = if width == 32 then cpu:rr32(e.reg) else cpu:rr(e.reg)
+		index = band(raw, width - 1)
+		if e.mod ~= 3 then
+			-- Register bit offsets reach past the operand: the signed offset
+			-- selects the word/dword at off + (offset >> log2 width) * size. The
+			-- Win9x VMM sets I/O-permission bits with BTS [bitmap], port.
+			const signed = if raw >= 2 ^ (width - 1) then raw - 2 ^ width else raw
+			const disp = (signed // width) * (width // 8)
+			const mask = if cpu.address32 then 0xFFFFFFFF else 0xFFFF
+			e.off = band((e.off :: number) + disp, mask)
+		end
 	end
 	const value = if width == 32 then cpu:readRM32(e) else cpu:readRM16(e)
 	const bit = band(rshift(value, index), 1)

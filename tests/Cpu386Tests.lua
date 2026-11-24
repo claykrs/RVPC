@@ -393,6 +393,21 @@ local function v86TrapSetup(m, flags: number)
 	putCode(m, 0x10100, { 0xFA }) -- CLI
 end
 
+T("bts_register_offset_addresses_past_the_dword", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	cpu:wr32(3, 0x3000)
+	cpu:wr32(0, 0x21) -- I/O port 21h in a permission bitmap at 3000h
+	putCode(m, 0x1000, { 0x0F, 0xAB, 0x03, 0x0F, 0xAB, 0x03 }) -- BTS [EBX], EAX twice
+	cpu:executeStep()
+	expect(m.mem:read32(0x3000) == 0, string.format("dword 0 = %X", m.mem:read32(0x3000)))
+	expect(m.mem:read32(0x3004) == 2, string.format("dword 1 = %X", m.mem:read32(0x3004)))
+	cpu:wr32(0, 0xFFFFFFFF) -- offset -1: bit 31 of the dword below
+	cpu:executeStep()
+	expect(m.mem:read32(0x2FFC) == 0x80000000, string.format("dword -1 = %X", m.mem:read32(0x2FFC)))
+end)
+
 T("arpl_raises_rpl_in_protected_mode", function(expect)
 	const m = freshMachine()
 	flat32(m)

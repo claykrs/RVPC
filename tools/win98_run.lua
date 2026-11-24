@@ -889,7 +889,14 @@ if opts.picLog then
 	local io = m.cpu.io :: any
 	local oo = io.out8
 	io.out8 = function(port, v)
-		if left > 0 and (port == 0xA1 or port == 0xA0) then
+		if
+			left > 0
+			and (
+				port == 0xA1
+				or port == 0xA0
+				or (opts.picMaster and (port == 0x20 or port == 0x21))
+			)
+		then
 			left -= 1
 			print(
 				("PICW %02X=%02X cs:eip=%04X:%X irr=%02X"):format(
@@ -928,6 +935,50 @@ if opts.pciLog then
 			print(("PCI addr=%08X cs:eip=%04X:%X"):format(v, m.cpu.cs, m.cpu.ip))
 		end
 		return o32(port, v)
+	end
+end
+
+-- --pc-log A,B,... [--pc-log-n N]: print registers (and the dword at [eax]) each time
+-- execution reaches one of the linear addresses; stops printing after N hits.
+if opts.pcLog then
+	local want: { [number]: boolean } = {}
+	for a in string.gmatch(tostring(opts.pcLog), "[^,]+") do
+		want[tonumber(a, 16) :: number] = true
+	end
+	local left = tonumber(opts.pcLogN) or 50
+	local oe = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if left > 0 then
+			const lin = self.segBase.cs + self.ip
+			if want[lin] then
+				left -= 1
+				const okd, at = pcall(function()
+					return self:read32(self:rr32(0), true)
+				end)
+				const okc, atc = pcall(function()
+					return self:read32(self:rr32(1), true)
+				end)
+				print(
+					("PC %08X tsc=%d eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X [eax]=%s [ecx]=%s"):format(
+						lin,
+						self.tsc,
+						self:rr32(0),
+						self:rr32(3),
+						self:rr32(1),
+						self:rr32(2),
+						self:rr32(6),
+						self:rr32(7),
+						if okd then ("%08X"):format(at) else "?",
+						if okc then ("%08X"):format(atc) else "?"
+					)
+				)
+				if opts.pcSave then
+					checkpoint(opts.pcSave)
+					process.exit(0)
+				end
+			end
+		end
+		return oe(self)
 	end
 end
 
@@ -1165,6 +1216,25 @@ if opts.bt then
 			cpu.ip,
 			cpu:rr32(5),
 			table.concat(out, " ")
+		)
+	)
+end
+if opts.tss then
+	local cpu = m.cpu :: any
+	local mb = cpu:read16(cpu.trBase + 0x66, true)
+	local function b(port)
+		return cpu:read8(cpu.trBase + mb + port // 8, true)
+	end
+	print(
+		("TSS tr=%04X base=%08X limit=%X tr32=%s mapBase=%X bits20=%02X bitsA0=%02X bits1F0=%02X"):format(
+			cpu.tr or -1,
+			cpu.trBase,
+			cpu.trLimit,
+			tostring(cpu.tr32),
+			mb,
+			b(0x20),
+			b(0xA0),
+			b(0x1F0)
 		)
 	)
 end
