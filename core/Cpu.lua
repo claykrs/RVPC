@@ -505,6 +505,8 @@ function Cpu.pageFault(
 		errorCode = bor(errorCode, 16) -- 486 I/D bit
 	end
 	self.lastPageFault = { addr = addr, errorCode = errorCode, write = write, user = user }
+	-- CR2 holds the faulting linear address for the #PF handler.
+	self.cr[2] = addr
 	self.faultIP = self.opIP
 	self.faultCS = self.opCS
 	if self.inPageFault then

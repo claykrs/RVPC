@@ -684,23 +684,34 @@ if opts.ringFault then
 	local peStop = tonumber(opts.peStop)
 	local peLast, peStopSeen = bit32.band(m.cpu.cr0, 1), 0
 	local origF = m.cpu.executeStep
+	-- --ring-jumps 1: only record an instruction when it is not within 16 bytes after the previous one.
+	local jumpsOnly = opts.ringJumps ~= nil
+	local lastCs, lastIp = -1, -1
 	m.cpu.executeStep = function(self)
-		faultRing[faultRingPos % faultRingLen + 1] = ("%04X:%08X cr0=%X eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X esp=%X ds=%04X es=%04X ss=%04X"):format(
-			self.cs,
-			self.ip,
-			self.cr0,
-			self:rr32(0),
-			self:rr32(3),
-			self:rr32(1),
-			self:rr32(2),
-			self:rr32(6),
-			self:rr32(7),
-			self:rr32(4),
-			self.ds,
-			self.es,
-			self.ss
-		)
-		faultRingPos += 1
+		local record = true
+		if jumpsOnly then
+			local d = self.ip - lastIp
+			record = self.cs ~= lastCs or d < 0 or d > 16
+			lastCs, lastIp = self.cs, self.ip
+		end
+		if record then
+			faultRing[faultRingPos % faultRingLen + 1] = ("%04X:%08X cr0=%X eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X esp=%X ds=%04X es=%04X ss=%04X"):format(
+				self.cs,
+				self.ip,
+				self.cr0,
+				self:rr32(0),
+				self:rr32(3),
+				self:rr32(1),
+				self:rr32(2),
+				self:rr32(6),
+				self:rr32(7),
+				self:rr32(4),
+				self.ds,
+				self.es,
+				self.ss
+			)
+			faultRingPos += 1
+		end
 		if peStop then
 			const pe = bit32.band(self.cr0, 1)
 			if peLast == 1 and pe == 0 then
@@ -848,6 +859,81 @@ if opts.drLog then
 end
 
 -- --io-hist 1: count port reads/writes (8-bit paths) and print them when the run ends.
+-- --dos-write 1: print the data of every V86 INT 21h AH=40h (write to handle) as text.
+if opts.dosWrite then
+	local origD = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if
+			self:isV86()
+			and (
+				(
+					bit32.band(self:rr32(0), 0xFF00) == 0x4000
+					and self.ip == self.mem:read16(0x84)
+					and self.cs == self.mem:read16(0x86)
+				) or (self.ds == 0x7800 and self.cs == 0xFCB2 and self.ip == 0x2FF7)
+			)
+		then
+			local t = {}
+			local n = math.min(bit32.band(self:rr32(1), 0xFFFF), 200)
+			for k = 0, n - 1 do
+				local okC, c = pcall(function()
+					return self.mem:read8(
+						self:translatePage(
+							self.ds * 16 + bit32.band(self:rr32(2), 0xFFFF) + k,
+							false,
+							false
+						)
+					)
+				end)
+				c = if okC then c else 63
+				table.insert(t, if c >= 32 and c < 127 then string.char(c) else "|")
+			end
+			print(("DOSWRITE h=%d %s"):format(bit32.band(self:rr32(3), 0xFFFF), table.concat(t)))
+		end
+		return origD(self)
+	end
+end
+
+-- --port-log P1,P2,.. [--port-log-n N]: print each 8-bit access to those ports with cs:eip and value.
+if opts.portLog then
+	local want: { [number]: boolean } = {}
+	for h in string.gmatch(opts.portLog, "%x+") do
+		want[tonumber(h, 16) :: number] = true
+	end
+	local left = tonumber(opts.portLogN) or 400
+	local io = m.cpu.io :: any
+	local oi, oo = io.in8, io.out8
+	io.in8 = function(port)
+		local v = oi(port)
+		if want[port] and left > 0 then
+			left -= 1
+			print(
+				("PORT in  %02X -> %02X at %04X:%X"):format(
+					port,
+					v,
+					m.cpu.opCS or m.cpu.cs,
+					m.cpu.opIP or m.cpu.ip
+				)
+			)
+		end
+		return v
+	end
+	io.out8 = function(port, v)
+		if want[port] and left > 0 then
+			left -= 1
+			print(
+				("PORT out %02X <- %02X at %04X:%X"):format(
+					port,
+					v,
+					m.cpu.opCS or m.cpu.cs,
+					m.cpu.opIP or m.cpu.ip
+				)
+			)
+		end
+		return oo(port, v)
+	end
+end
+
 if opts.ioHist then
 	local cnt: { [string]: number } = {}
 	local io = m.cpu.io :: any

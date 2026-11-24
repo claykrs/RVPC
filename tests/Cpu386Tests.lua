@@ -179,6 +179,14 @@ T("page_fault_restarts_faulting_instruction", function(expect)
 		0x40,
 		0x00,
 		0x00, -- MOV [0x4000],EAX
+		0x0F,
+		0x20,
+		0xD0, -- MOV EAX,CR2
+		0xA3,
+		0x08,
+		0x40,
+		0x00,
+		0x00, -- MOV [0x4008],EAX
 		0xC7,
 		0x05,
 		0x08,
@@ -204,9 +212,10 @@ T("page_fault_restarts_faulting_instruction", function(expect)
 		0x00, -- MOV [0x800004],EAX
 		0xF4,
 	})
-	m:run(12)
+	m:run(14)
 	expect(cpu.pageFaults == 1, "pageFaults=" .. cpu.pageFaults)
 	expect(m.mem:read32(0x4000) == 0, "PF error code")
+	expect(m.mem:read32(0x4008) == 0x00800000, string.format("CR2=%08X", m.mem:read32(0x4008)))
 	expect(cpu:rr32(0) == 0xAABBCCDD, string.format("EAX=%08X", cpu:rr32(0)))
 	expect(m.mem:read32(0x00800004) == 0xAABBCCDD, "instruction did not restart")
 end)
