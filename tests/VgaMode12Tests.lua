@@ -150,6 +150,40 @@ T("mode12_detected_from_guest_ports", function(expect)
 	expectPixel(expect, pixels, 0, 0, 640, 255, 255, 255, "guest mode 12 pixel")
 end)
 
+-- Unchained 256-colour (mode X, the Win9x 320x400 boot logo): pixel x is
+-- plane x & 3 at byte x >> 2, not four-bit planar.
+T("unchained_256_colour_renders_mode_x", function(expect)
+	const vga = fresh()
+	writeCrtc(vga, 0x11, 0x0C)
+	writeSeq(vga, 1, 0x01)
+	writeSeq(vga, 2, 0x0F)
+	writeSeq(vga, 4, 0x06) -- chain-4 off
+	writeGfx(vga, 5, 0x40)
+	writeGfx(vga, 6, 0x05)
+	writeGfx(vga, 8, 0xFF)
+	writeAttr(vga, 0x10, 0x41)
+	writeAttr(vga, 0x12, 0x0F)
+	writeCrtc(vga, 0x01, 0x4F)
+	writeCrtc(vga, 0x07, 0x1F)
+	writeCrtc(vga, 0x09, 0x40) -- no scan doubling: 400 lines
+	writeCrtc(vga, 0x12, 0x8F)
+	writeCrtc(vga, 0x13, 0x28)
+	writeCrtc(vga, 0x14, 0x00)
+	writeCrtc(vga, 0x17, 0xE3) -- byte mode
+	writeCrtc(vga, 0x11, 0x8E)
+
+	expect(vga:width() == 320 and vga:height() == 400, "mode X geometry")
+	expect(not vga:isChain4(), "mode X unchained")
+	writePlane(vga, 1, 0, 0x0F)
+	writePlane(vga, 2, 1, 0x0F)
+	writePlane(vga, 0, 80, 0x0F)
+	const pixels = vga:snapshotRGBA()
+	expectPixel(expect, pixels, 0, 0, 320, 0, 0, 0, "mode X pixel 0")
+	expectPixel(expect, pixels, 1, 0, 320, 255, 255, 255, "mode X pixel 1 (plane 1)")
+	expectPixel(expect, pixels, 6, 0, 320, 255, 255, 255, "mode X pixel 6 (plane 2 byte 1)")
+	expectPixel(expect, pixels, 0, 1, 320, 255, 255, 255, "mode X row 1 (byte 80)")
+end)
+
 T("mode13_detected_from_guest_ports", function(expect)
 	const vga = fresh()
 	writeCrtc(vga, 0x11, 0x0C)

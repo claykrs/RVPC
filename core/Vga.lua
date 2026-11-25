@@ -1338,8 +1338,11 @@ function Vga.syncLegacyMode(self: Vga)
 	end
 
 	const chain4 = self:isChain4()
+	-- 256-colour shift mode without chain-4 is unchained "mode X": 8bpp
+	-- pixels spread across the four planes (x & 3 picks the plane).
+	const shift256 = band(self.gfx[5], 0x40) ~= 0
 	local width = (band(self.crtc[0x01], 0xFF) + 1) * 8
-	if chain4 and band(self.gfx[5], 0x40) ~= 0 then
+	if shift256 then
 		-- 256-colour shift mode clocks two pixels per dot clock, so the CRTC
 		-- horizontal display count is twice the visible pixel width.
 		width = math.floor(width / 2)
@@ -1366,7 +1369,7 @@ function Vga.syncLegacyMode(self: Vga)
 	height = math.min(height, VBE_MAX_YRES)
 
 	local kind: ModeKind = if chain4 then "linear" else "planar"
-	const bitsPerPixel = if chain4 then 8 else 4
+	const bitsPerPixel = if chain4 or shift256 then 8 else 4
 	const lineStride = legacyLineStride(self, width)
 	const rowBytes = if chain4 then math.max(width, lineStride) else lineStride
 
@@ -1374,7 +1377,7 @@ function Vga.syncLegacyMode(self: Vga)
 	-- the 1bpp variants (0x0F/0x11) apart from the 16-colour ones
 	-- (0x10/0x12); both use the same four-plane renderer with plane masking.
 	local modeNumber = 0x1FF
-	if kind == "planar" then
+	if kind == "planar" and bitsPerPixel == 4 then
 		const planeEnable = band(self.attr[0x12], 0x0F)
 		if width == 320 and height == 200 then
 			modeNumber = 0x0D
@@ -1409,8 +1412,9 @@ function Vga.syncLegacyMode(self: Vga)
 		height = height,
 		rowBytes = rowBytes,
 		bitsPerPixel = bitsPerPixel,
-		label = if kind == "planar"
-			then string.format("%dx%d planar", width, height)
+		label = if kind == "planar" and bitsPerPixel == 8
+			then string.format("%dx%d unchained", width, height)
+			elseif kind == "planar" then string.format("%dx%d planar", width, height)
 			else string.format("%dx%d linear", width, height),
 	}
 	self.modeNumber = modeNumber
@@ -1993,8 +1997,35 @@ end
 -- Convert only [x0, x1) x [y0, y1) into the retained RGBA buffer. The host
 -- normally repaints a small dirty rectangle (cursor, menu, typing), so a full
 -- 640x480 conversion every frame wastes most of the frame budget.
+-- Unchained 256-colour (mode X): pixel x lives in plane x & 3 at byte x >> 2.
+local function blitUnchained(self: Vga, x0: number, y0: number, x1: number, y1: number)
+	const target = self.rgba
+	const width = self.widthPx
+	const rowBytes = math.max(math.ceil(width / 4), self:planarRowBytes())
+	const start = self:displayStartBytes()
+	const colors = self.paletteRGBA
+	const mask = self.dacMask
+	const planes = self.planes
+	for y = y0, y1 - 1 do
+		const rowBase = start + y * rowBytes
+		local dest = (y * width + x0) * 4
+		for x = x0, x1 - 1 do
+			const index = band(
+				buffer.readu8(planes[band(x, 3) + 1], band(rowBase + rshift(x, 2), 0xFFFF)),
+				mask
+			)
+			buffer.writeu32(target, dest, colors[index + 1])
+			dest += 4
+		end
+	end
+end
+
 local function blitPlanar(self: Vga, x0: number, y0: number, x1: number, y1: number)
 	self:ensurePalette()
+	if self.info.bitsPerPixel == 8 then
+		blitUnchained(self, x0, y0, x1, y1)
+		return
+	end
 	const target = self.rgba
 	const width = self.widthPx
 	const bytesPerRow = math.ceil(width / 8)

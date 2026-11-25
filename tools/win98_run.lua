@@ -268,6 +268,23 @@ local function shot()
 	print(("SHOT %d at %d steps pc=%s"):format(st.guiShot, st.executed, m:bootPc()))
 end
 
+-- --shot-only PATH: write the current screen of the loaded state to PATH (PPM) and exit.
+if opts.shotOnly then
+	local pixels = m.vga:snapshotRGBA()
+	local width, height = m.vga:width(), m.vga:height()
+	local out = { ("P6\n%d %d\n255\n"):format(width, height) }
+	for index = 0, width * height - 1 do
+		out[#out + 1] = string.char(
+			buffer.readu8(pixels, index * 4),
+			buffer.readu8(pixels, index * 4 + 1),
+			buffer.readu8(pixels, index * 4 + 2)
+		)
+	end
+	fs.writeFile(tostring(opts.shotOnly), table.concat(out))
+	print(("SHOT-ONLY %dx%d %s"):format(width, height, m.vga.info.label))
+	process.exit(0)
+end
+
 -- One driver tick: react to the current screen. Returns "stop" to end the run.
 local function react(screen)
 	if string.find(screen, "Bad Fault in MS-DOS Extender", 1, true) then
