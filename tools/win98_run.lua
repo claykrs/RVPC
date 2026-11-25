@@ -160,6 +160,25 @@ if opts.load then
 		print(("CR3=%X PDE=%X PTE=%X cr0=%X cr4?"):format(cr3, pde, pte, m.cpu.cr0))
 		process.exit(0)
 	end
+	-- --desc SEL: print the raw GDT/LDT descriptor and the cached CS state, then exit.
+	if opts.desc then
+		local sel = tonumber(tostring(opts.desc), 16) :: number
+		local tb = if bit32.band(sel, 4) ~= 0 then m.cpu.ldtrBase else m.cpu.gdtr.base
+		local a = tb + bit32.band(sel, 0xFFF8)
+		print(
+			("DESC %04X at %X: %08X %08X gdtr=%X/%X cs=%04X cslim=%X"):format(
+				sel,
+				a,
+				m.cpu:read32(a, true),
+				m.cpu:read32(a + 4, true),
+				m.cpu.gdtr.base,
+				m.cpu.gdtr.limit,
+				m.cpu.cs,
+				m.cpu.segLimit.cs
+			)
+		)
+		process.exit(0)
+	end
 	-- --dump ADDR [--dump-len N]: print physical bytes of the loaded checkpoint and exit.
 	if opts.dump then
 		local a, n = tonumber(opts.dump), tonumber(opts.dumpLen) or 64
@@ -874,6 +893,17 @@ if opts.faultLog then
 				)
 			)
 		end
+		if opts.faultTbIp and (self.opIP or self.ip) == tonumber(tostring(opts.faultTbIp), 16) then
+			print(
+				("TB vec=%X cslim=%X csacc=%X csflags=%X"):format(
+					n,
+					self.segLimit.cs,
+					self.segAccess.cs,
+					self.segFlags.cs or 0
+				)
+			)
+			print(debug.traceback())
+		end
 		if opts.faultTrace and errorCode and errorCode > 0xFFFF then
 			print(debug.traceback())
 		end
@@ -1305,6 +1335,42 @@ if opts.csTrace then
 			depth -= 1
 			logging = true
 		end
+		return oe(self)
+	end
+end
+
+-- --cslim-watch LIMIT: print the ring and descriptor the first time CS's cached limit equals LIMIT (hex).
+if opts.cslimWatch then
+	local want = tonumber(tostring(opts.cslimWatch), 16)
+	local oe = m.cpu.executeStep
+	local done = false
+	local prevSel, prevIp = 0, 0
+	m.cpu.executeStep = function(self)
+		if not done and self.segLimit.cs == want then
+			done = true
+			local a = self.gdtr.base + bit32.band(self.cs, 0xFFF8)
+			print(
+				("CSLIM %X at %04X:%08X prev %04X:%08X desc %08X %08X tsc=%d"):format(
+					want,
+					self.cs,
+					self.ip,
+					prevSel,
+					prevIp,
+					self:read32(a, true),
+					self:read32(a + 4, true),
+					self.tsc
+				)
+			)
+			if faultRing then
+				for q = 1, faultRingLen do
+					local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+					if e then
+						print(e)
+					end
+				end
+			end
+		end
+		prevSel, prevIp = self.cs, self.ip
 		return oe(self)
 	end
 end

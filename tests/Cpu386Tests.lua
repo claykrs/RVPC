@@ -277,6 +277,41 @@ T("pop_to_esp_based_memory_uses_incremented_esp", function(expect)
 	expect(m.mem:read32(0x8004) == 0x22222222, "wrote the pre-pop slot")
 end)
 
+-- A near CALL past the CS limit faults on the CALL itself: the #GP frame holds
+-- the CALL's address and nothing was pushed (Win98's FF000FFF ring-0 limit).
+T("near_call_beyond_cs_limit_faults_before_push", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.cpu.segLimit.cs = 0x7FFF
+	installGate(m, 13, 0x7000, 8, 0x8E)
+	putCode(m, 0x7000, {
+		0x8B,
+		0x44,
+		0x24,
+		0x04, -- MOV EAX,[ESP+4]
+		0xA3,
+		0x00,
+		0x60,
+		0x00,
+		0x00, -- MOV [6000h],EAX
+		0x89,
+		0x25,
+		0x04,
+		0x60,
+		0x00,
+		0x00, -- MOV [6004h],ESP
+		0xF4,
+	})
+	putCode(m, 0x1000, { 0xE8, 0xFB, 0x8F, 0x00, 0x00, 0xF4 }) -- CALL 0A000h
+	const esp0 = m.cpu:rr32(4)
+	m:run(6)
+	expect(m.mem:read32(0x6000) == 0x1000, string.format("fault EIP %X", m.mem:read32(0x6000)))
+	expect(
+		m.mem:read32(0x6004) == esp0 - 16,
+		string.format("ESP %X want %X", m.mem:read32(0x6004), esp0 - 16)
+	)
+end)
+
 -- Interrupt gates clear NT so the handler's IRET is a plain return.
 T("interrupt_gate_clears_nt", function(expect)
 	const m = freshMachine()

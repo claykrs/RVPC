@@ -3059,14 +3059,36 @@ for i = 0, 7 do
 	end
 end
 
+-- A near branch whose target lies beyond the CS limit raises #GP(0) on the
+-- branch itself, before it pushes or pops anything. Win98's VMM narrows the
+-- ring-0 code limit to FF000FFF and relies on that fault to catch calls into
+-- its FF00xxxx callback stubs.
+local function checkNearTarget(cpu: any, target: number)
+	if target > cpu.segLimit.cs and band(cpu.cr0, CR0_PE) ~= 0 then
+		cpu:linear("cs", target, 1)
+	end
+end
+
 H[0xC2] = function(cpu: any) -- RET imm16
 	const n = cpu:fetch16()
-	cpu.ip = if cpu.operand32 then cpu:pop32() else cpu:pop16()
+	const sp = cpu:getSP()
+	const target = if cpu.operand32 then cpu:pop32() else cpu:pop16()
+	if target > cpu.segLimit.cs then
+		cpu:setSP(sp)
+		checkNearTarget(cpu, target)
+	end
+	cpu.ip = target
 	const mask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
 	cpu:setSP(band(cpu:getSP() + n, mask))
 end
 H[0xC3] = function(cpu: any)
-	cpu.ip = if cpu.operand32 then cpu:pop32() else cpu:pop16()
+	const sp = cpu:getSP()
+	const target = if cpu.operand32 then cpu:pop32() else cpu:pop16()
+	if target > cpu.segLimit.cs then
+		cpu:setSP(sp)
+		checkNearTarget(cpu, target)
+	end
+	cpu.ip = target
 end
 
 H[0xC4] = function(cpu: any) -- LES r, m16:16 / m16:32
@@ -3512,22 +3534,29 @@ end
 H[0xE8] = function(cpu: any) -- CALL rel16/32
 	if cpu.operand32 then
 		const d = sign32(cpu:fetch32())
+		const target = band(cpu.ip + d, cpu:ipMask())
+		checkNearTarget(cpu, target)
 		cpu:push32(cpu.ip)
-		cpu.ip = band(cpu.ip + d, cpu:ipMask())
+		cpu.ip = target
 	else
 		const d = cpu:fetch16()
+		const target = band(cpu.ip + sign16(d), cpu:ipMask())
+		checkNearTarget(cpu, target)
 		cpu:push16(cpu.ip)
-		cpu.ip = band(cpu.ip + sign16(d), cpu:ipMask())
+		cpu.ip = target
 	end
 end
 H[0xE9] = function(cpu: any) -- JMP rel16/32
+	local target
 	if cpu.operand32 then
 		const d = sign32(cpu:fetch32())
-		cpu.ip = band(cpu.ip + d, cpu:ipMask())
+		target = band(cpu.ip + d, cpu:ipMask())
 	else
 		const d = cpu:fetch16()
-		cpu.ip = band(cpu.ip + sign16(d), cpu:ipMask())
+		target = band(cpu.ip + sign16(d), cpu:ipMask())
 	end
+	checkNearTarget(cpu, target)
+	cpu.ip = target
 end
 H[0xEA] = function(cpu: any)
 	const ip = if cpu.operand32 then cpu:fetch32() else cpu:fetch16()
@@ -3539,7 +3568,9 @@ H[0xEB] = function(cpu: any)
 	if d >= 0x80 then
 		d -= 0x100
 	end
-	cpu.ip = band(cpu.ip + d, cpu:ipMask())
+	const target = band(cpu.ip + d, cpu:ipMask())
+	checkNearTarget(cpu, target)
+	cpu.ip = target
 end
 
 H[0xEC] = function(cpu: any)
@@ -3854,6 +3885,7 @@ H[0xFF] = function(cpu: any)
 		cpu:setbits(CF, cf)
 	elseif reg == 2 then
 		const target = cpu:readRM(e)
+		checkNearTarget(cpu, target)
 		if width == 4 then
 			cpu:push32(cpu.ip)
 		else
@@ -3866,7 +3898,9 @@ H[0xFF] = function(cpu: any)
 		const cs = cpu:read16(addr + width)
 		cpu:farCall(cs, ip, true)
 	elseif reg == 4 then
-		cpu.ip = cpu:readRM(e)
+		const target = cpu:readRM(e)
+		checkNearTarget(cpu, target)
+		cpu.ip = target
 	elseif reg == 5 then
 		const addr = cpu:linear(e.seg :: string, e.off :: number, width + 2)
 		const cs = cpu:read16(addr + width)
