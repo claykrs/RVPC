@@ -139,4 +139,19 @@ T("ppi_refresh_and_speaker_latch", function(expect)
 	expect(band(latched, 0x03) == 0x03, "speaker latch not readable")
 end)
 
+-- SeaBIOS's PnP BIOS reports no device nodes; Win9x trusts a visible "$PnP"
+-- header and then never enumerates PCI, so Machine hides it by default.
+T("pnp_bios_header_hidden_only_when_aligned_and_well_formed", function(expect)
+	const buf = buffer.create(0x100)
+	buffer.writestring(buf, 0x40, "$PnP")
+	buffer.writeu8(buf, 0x44, 0x10)
+	buffer.writeu8(buf, 0x45, 0x21)
+	buffer.writestring(buf, 0x83, "$PnP") -- code-embedded string: not aligned
+	buffer.writeu8(buf, 0x87, 0x10)
+	buffer.writeu8(buf, 0x88, 0x21)
+	expect(Machine.hidePnpHeader(buf, 0, 0x100) == 1, "one header hidden")
+	expect(buffer.readstring(buf, 0x40, 4) == "$NoP", "aligned header renamed")
+	expect(buffer.readstring(buf, 0x83, 4) == "$PnP", "unaligned bytes untouched")
+end)
+
 return TESTS

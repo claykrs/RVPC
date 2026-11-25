@@ -127,6 +127,67 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	-- --hide-pnp 1: hide the PnP BIOS header in the loaded state's BIOS shadow (F-segment),
+	-- as a fresh Machine does by default.
+	if opts.hidePnp then
+		print(
+			("HIDE-PNP hid %d header(s)"):format(Machine.hidePnpHeader(m.mem.buf, 0xF0000, 0x10000))
+		)
+	end
+	-- --export-hdd PATH: write the loaded state's current hard disk image to PATH and exit.
+	if opts.exportHdd then
+		fs.writeFile(tostring(opts.exportHdd), buffer.tostring(m.ide.master.image))
+		print(("EXPORTED hdd to %s"):format(tostring(opts.exportHdd)))
+		process.exit(0)
+	end
+	-- --call-int HEX --call-ax HEX: from a real-mode state, run INT n with AX set (code at
+	-- 0000:0600), print the returned registers and flags, and exit.
+	-- --call-code HEXBYTES instead runs those bytes at 0000:0600 up to their final F4 (HLT).
+	if opts.callInt or opts.callCode then
+		const cpu = m.cpu
+		local bytes = {}
+		if opts.callCode then
+			for h in string.gmatch(tostring(opts.callCode), "%x%x") do
+				table.insert(bytes, tonumber(h, 16))
+			end
+		else
+			bytes = { 0xCD, tonumber(tostring(opts.callInt), 16), 0xF4 }
+		end
+		for q, v in bytes do
+			m.mem:write8(0x600 + q - 1, v)
+		end
+		const haltAt = 0x600 + #bytes - 1
+		cpu:loadSeg("cs", 0)
+		cpu.ip = 0x600
+		cpu:wr32(0, tonumber(tostring(opts.callAx or "0"), 16) :: number)
+		for _ = 1, 2_000_000 do
+			if cpu.cs == 0 and cpu.ip == haltAt then
+				break
+			end
+			m:run(1)
+		end
+		print(("CALL mem[700..70F]=%s"):format((function()
+			local t = {}
+			for q = 0, 15 do
+				t[#t + 1] = ("%02X"):format(m.mem:read8(0x700 + q))
+			end
+			return table.concat(t, " ")
+		end)()))
+		print(
+			("CALL int=%s -> eax=%08X ebx=%08X ecx=%08X edx=%08X edi=%08X flags=%04X at %04X:%X"):format(
+				tostring(opts.callInt),
+				cpu:rr32(0),
+				cpu:rr32(3),
+				cpu:rr32(1),
+				cpu:rr32(2),
+				cpu:rr32(7),
+				cpu.flags,
+				cpu.cs,
+				cpu.ip
+			)
+		)
+		process.exit(0)
+	end
 	-- --reset-after-load 1: press the reset button on the loaded state (disks keep their contents).
 	if opts.resetAfterLoad then
 		m:reset()
@@ -817,8 +878,12 @@ if opts.ringFault then
 	local lastCs, lastIp = -1, -1
 	-- --ring-skip-cs HEX: do not record instructions executed with this CS.
 	local skipCs = if opts.ringSkipCs then tonumber(tostring(opts.ringSkipCs), 16) else nil
+	-- --ring-ip-lo HEX --ring-ip-hi HEX: only record instructions with lo <= ip < hi.
+	local ipLo = if opts.ringIpLo then tonumber(tostring(opts.ringIpLo), 16) else nil
+	local ipHi = if opts.ringIpHi then tonumber(tostring(opts.ringIpHi), 16) else nil
 	m.cpu.executeStep = function(self)
 		local record = self.cs ~= skipCs
+			and (ipLo == nil or (self.ip >= ipLo and self.ip < (ipHi :: number)))
 		if jumpsOnly then
 			local d = self.ip - lastIp
 			record = record and (self.cs ~= lastCs or d < 0 or d > 16)
@@ -1078,6 +1143,62 @@ if opts.vxdDev then
 	end
 end
 
+-- --dos-calls 1: print INT 21h calls with AH 3D/48/49/4A/4B/4C/58 (any mode) and the
+-- ASCIIZ name at DS:DX for opens/execs.
+if opts.dosCalls then
+	local want = {
+		[0x3D] = true,
+		[0x48] = true,
+		[0x49] = true,
+		[0x4A] = true,
+		[0x4B] = true,
+		[0x4C] = true,
+		[0x58] = true,
+	}
+	local origD2 = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if not self:isProtected() or self:isV86() then
+			const lin = self.segBase.cs + self.ip
+			const ok, b0, b1 = pcall(function()
+				return self:read8(lin, true), self:read8(lin + 1, true)
+			end)
+			if ok and b0 == 0xCD and b1 == 0x21 then
+				const ah = bit32.band(bit32.rshift(self:rr32(0), 8), 0xFF)
+				if want[ah] then
+					local name = ""
+					if ah == 0x3D or ah == 0x4B then
+						local t = {}
+						const base = self.segBase.ds + bit32.band(self:rr32(2), 0xFFFF)
+						for q = 0, 79 do
+							const okc, c = pcall(function()
+								return self:read8(base + q, true)
+							end)
+							if not okc or c == 0 then
+								break
+							end
+							t[#t + 1] = string.char(c)
+						end
+						name = table.concat(t)
+					end
+					print(
+						("DOS %04X:%04X ah=%02X ax=%04X bx=%04X cx=%04X %s step %d"):format(
+							self.cs,
+							self.ip,
+							ah,
+							bit32.band(self:rr32(0), 0xFFFF),
+							bit32.band(self:rr32(3), 0xFFFF),
+							bit32.band(self:rr32(1), 0xFFFF),
+							name,
+							st.executed
+						)
+					)
+				end
+			end
+		end
+		return origD2(self)
+	end
+end
+
 -- --stop-ip HEX [--stop-cs HEX]: save --save and exit just before executing that ip (and cs).
 if opts.stopIp then
 	local wantIp = tonumber(tostring(opts.stopIp), 16)
@@ -1229,6 +1350,44 @@ if opts.portLog then
 			)
 		end
 		return oo(port, v)
+	end
+	for _, w in { { "in16", "out16", 4 }, { "in32", "out32", 8 } } do
+		local wi, wo = io[w[1]], io[w[2]]
+		if wi then
+			io[w[1]] = function(port)
+				local v = wi(port)
+				if want[port] and left > 0 then
+					left -= 1
+					print(
+						("PORT %s %02X -> %0" .. w[3] .. "X at %04X:%X"):format(
+							w[1],
+							port,
+							v,
+							m.cpu.opCS or m.cpu.cs,
+							m.cpu.opIP or m.cpu.ip
+						)
+					)
+				end
+				return v
+			end
+		end
+		if wo then
+			io[w[2]] = function(port, v)
+				if want[port] and left > 0 then
+					left -= 1
+					print(
+						("PORT %s %02X <- %0" .. w[3] .. "X at %04X:%X"):format(
+							w[2],
+							port,
+							v,
+							m.cpu.opCS or m.cpu.cs,
+							m.cpu.opIP or m.cpu.ip
+						)
+					)
+				end
+				return wo(port, v)
+			end
+		end
 	end
 end
 

@@ -60,6 +60,12 @@ export type FloppyConfig = {
 
 export type Config = {
 	memorySize: number?,
+	-- Keep SeaBIOS's "$PnP" installation header visible (default false: it is
+	-- hidden). SeaBIOS's PnP BIOS answers every node call with
+	-- FUNCTION_NOT_SUPPORTED, so a guest that finds it (Win9x) trusts it to
+	-- report the PCI bus, gets nothing, and never enumerates PCI. Without the
+	-- header Win9x falls back to legacy detection, which finds the PCI bus.
+	pnpBios: boolean?,
 	cpu: any?,
 	serial: any?,
 	printer: any?,
@@ -378,13 +384,39 @@ local function pciWrite(machine: any, address: number, value: number)
 	end
 end
 
+-- Overwrite the signature of every PnP BIOS installation header ("$PnP",
+-- paragraph aligned, version 1.0, length 0x21) in buf[start, start+length).
+-- Returns how many headers were hidden.
+function Machine.hidePnpHeader(buf: buffer, start: number, length: number): number
+	local hidden = 0
+	local offset = start + -start % 16
+	while offset + 0x21 <= start + length do
+		if
+			buffer.readu32(buf, offset) == 0x506E5024 -- "$PnP"
+			and buffer.readu8(buf, offset + 4) == 0x10
+			and buffer.readu8(buf, offset + 5) == 0x21
+		then
+			buffer.writeu32(buf, offset, 0x506F4E24) -- "$NoP"
+			hidden += 1
+		end
+		offset += 16
+	end
+	return hidden
+end
+
 function Machine.new(deps: Deps, config: Config?): Machine
 	const cfg: Config = config or {}
 	local self = setmetatable({}, Machine) :: any
 	self.config = cfg
 	self.mem = deps.Memory.new(cfg.memorySize or (16 * 1024 * 1024))
 	if cfg.rom then
-		self.mem:loadRom(cfg.rom)
+		local rom = cfg.rom
+		if not cfg.pnpBios then
+			rom = buffer.create(buffer.len(cfg.rom))
+			buffer.copy(rom, 0, cfg.rom)
+			Machine.hidePnpHeader(rom, 0, buffer.len(rom))
+		end
+		self.mem:loadRom(rom)
 	end
 	if cfg.vgaRom then
 		self.mem:loadOptionRom(cfg.vgaRom, 0xC0000)
