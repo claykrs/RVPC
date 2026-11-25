@@ -281,7 +281,8 @@ end)
 -- the CALL's address and nothing was pushed (Win98's FF000FFF ring-0 limit).
 -- A call gate into ring 0 forces CS.RPL to 0 even when the gate names its
 -- target with RPL 3 (Win98 SYSDETMG thunks do); the ring-0 RETF must then see
--- an outer return and restore the ring-3 SS:ESP.
+-- an outer return and restore the ring-3 SS:ESP. Copied parameters sit
+-- between CS:EIP and the saved SS:ESP, and RETF imm16 releases them on both stacks.
 T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
 	const m = freshMachine()
 	flat32(m)
@@ -290,7 +291,7 @@ T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
 	writeDescriptor(m, 0x3000 + 0x28, 0, 0xFFFFF, 0xF2, 0xCF)
 	m.mem:write16(0x3000 + 0x30, 0x2000) -- 386 call gate DPL3 -> 000B:2000
 	m.mem:write16(0x3000 + 0x32, 0x000B)
-	m.mem:write8(0x3000 + 0x34, 0)
+	m.mem:write8(0x3000 + 0x34, 1) -- one dword parameter
 	m.mem:write8(0x3000 + 0x35, 0xEC)
 	m.mem:write16(0x3000 + 0x36, 0)
 	cpu.gdtr = { base = 0x3000, limit = 0x37 }
@@ -300,14 +301,40 @@ T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
 	cpu.cs, cpu.ss = 0x23, 0x2B
 	cpu.segSel.cs, cpu.segSel.ss = 0x23, 0x2B
 	cpu:setSP(0x8000)
-	putCode(m, 0x1000, { 0x9A, 0, 0, 0, 0, 0x33, 0x00 }) -- CALL 0033:0
-	putCode(m, 0x2000, { 0x8C, 0xC8, 0xA3, 0x00, 0x60, 0x00, 0x00, 0xCB }) -- MOV AX,CS; MOV [6000h],EAX; RETF
-	m:run(4)
+	putCode(m, 0x1000, { 0x68, 0xCD, 0xAB, 0x34, 0x12, 0x9A, 0, 0, 0, 0, 0x33, 0x00 }) -- PUSH 1234ABCDh; CALL 0033:0
+	putCode(m, 0x2000, {
+		0x8C,
+		0xC8, -- MOV AX,CS
+		0xA3,
+		0x00,
+		0x60,
+		0x00,
+		0x00, -- MOV [6000h],EAX
+		0x8B,
+		0x44,
+		0x24,
+		0x08, -- MOV EAX,[ESP+8]
+		0xA3,
+		0x04,
+		0x60,
+		0x00,
+		0x00, -- MOV [6004h],EAX
+		0xCA,
+		0x04,
+		0x00, -- RETF 4
+	})
+	m:run(7)
 	expect(
 		band(m.mem:read32(0x6000), 0xFFFF) == 0x08,
 		string.format("ring-0 CS %X", m.mem:read32(0x6000))
 	)
-	expect(cpu.cs == 0x23 and cpu.ip == 0x1007, string.format("return %X:%X", cpu.cs, cpu.ip))
+	expect(m.mem:read32(0x6004) == 0x1234ABCD, string.format("param %X", m.mem:read32(0x6004)))
+	expect(m.mem:read32(0x9000 - 4) == 0x2B, string.format("saved SS %X", m.mem:read32(0x9000 - 4)))
+	expect(
+		m.mem:read32(0x9000 - 8) == 0x7FFC,
+		string.format("saved ESP %X", m.mem:read32(0x9000 - 8))
+	)
+	expect(cpu.cs == 0x23 and cpu.ip == 0x100C, string.format("return %X:%X", cpu.cs, cpu.ip))
 	expect(
 		cpu.ss == 0x2B and cpu:rr32(4) == 0x8000,
 		string.format("stack %X:%X", cpu.ss, cpu:rr32(4))

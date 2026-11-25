@@ -1296,7 +1296,16 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	const newBase = ssDesc.base
 	const newStack32 = band(ssDesc.flags, 0x40) ~= 0
 	const newMask = if newStack32 then 0xFFFFFFFF else 0xFFFF
-	local newSp = band(newSp0 - paramCount * gateWidth, newMask)
+	-- Inner frame, top down: old SS, old SP, the copied parameters, CS, IP.
+	local newSp = band(newSp0 - 2 * gateWidth, newMask)
+	if gateWidth == 4 then
+		self:write32(newBase + band(newSp + 4, newMask), oldSs, true)
+		self:write32(newBase + newSp, oldSp, true)
+	else
+		self:write16(newBase + band(newSp + 2, newMask), oldSs, true)
+		self:write16(newBase + newSp, oldSp, true)
+	end
+	newSp = band(newSp - paramCount * gateWidth, newMask)
 	for index = 0, paramCount - 1 do
 		const offsetInFrame = band(oldSp + index * gateWidth, oldMask)
 		const value = if gateWidth == 4
@@ -1308,23 +1317,14 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			self:write16(newBase + band(newSp + index * 2, newMask), value, true)
 		end
 	end
-	-- Nested frame (top to bottom): IP, CS, old SP, old SS, params.
 	-- A 286/386 CALL through a call gate pushes the old SS:SP and the return
 	-- CS:IP only; unlike an interrupt gate it does not push FLAGS.
 	if gateWidth == 4 then
-		newSp = band(newSp - 4, newMask)
-		self:write32(newBase + newSp, oldSs, true)
-		newSp = band(newSp - 4, newMask)
-		self:write32(newBase + newSp, oldSp, true)
 		newSp = band(newSp - 4, newMask)
 		self:write32(newBase + newSp, self.cs, true)
 		newSp = band(newSp - 4, newMask)
 		self:write32(newBase + newSp, self.ip, true)
 	else
-		newSp = band(newSp - 2, newMask)
-		self:write16(newBase + newSp, oldSs, true)
-		newSp = band(newSp - 2, newMask)
-		self:write16(newBase + newSp, oldSp, true)
 		newSp = band(newSp - 2, newMask)
 		self:write16(newBase + newSp, self.cs, true)
 		newSp = band(newSp - 2, newMask)
@@ -3158,6 +3158,12 @@ local function retf(cpu: any, extra: number)
 	end
 	local outerSp, outerSs
 	if cpu:isProtected() and not cpu:isV86() and band(csSel, 3) > cpu:cpl() then
+		-- Outer return: release the copied gate parameters on the inner stack
+		-- before popping SS:SP; the imm16 is applied again on the outer stack.
+		if extra ~= 0 then
+			const innerMask = if cpu:stack32() then 0xFFFFFFFF else 0xFFFF
+			cpu:setSP(band(cpu:getSP() + extra, innerMask))
+		end
 		outerSp = cpu:popValue(width)
 		outerSs = band(if width == 4 then cpu:pop32() else cpu:pop16(), 0xFFFF)
 	end

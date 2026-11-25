@@ -1022,6 +1022,25 @@ if opts.drLog then
 	}) :: any
 end
 
+-- --pc-hist N: sample cs:ip every N instructions and print the 40 most frequent at the end.
+local pcHistRef: { [string]: number }? = nil
+if opts.pcHist then
+	local every = tonumber(opts.pcHist) :: number
+	local count = 0
+	local hist: { [string]: number } = {}
+	pcHistRef = hist
+	local origP = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		count += 1
+		if count >= every then
+			count = 0
+			const k = ("%04X:%08X"):format(self.cs, self.ip)
+			hist[k] = (hist[k] or 0) + 1
+		end
+		return origP(self)
+	end
+end
+
 -- --io-hist 1: count port reads/writes (8-bit paths) and print them when the run ends.
 -- --dos-write 1: print the data of every V86 INT 21h AH=40h (write to handle) as text.
 if opts.dosWrite then
@@ -1665,6 +1684,18 @@ if opts.tss then
 end
 if execCountRef then
 	print(("EXEC %d instructions"):format(execCountRef.n))
+end
+if pcHistRef then
+	local keys = {}
+	for k in pcHistRef do
+		table.insert(keys, k)
+	end
+	table.sort(keys, function(a, b)
+		return (pcHistRef :: any)[a] > (pcHistRef :: any)[b]
+	end)
+	for i = 1, math.min(40, #keys) do
+		print(("PC %s %d"):format(keys[i], (pcHistRef :: any)[keys[i]]))
+	end
 end
 if ioHistRef then
 	local keys = {}
