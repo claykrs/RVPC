@@ -429,3 +429,6 @@ branch with natural lowercase messages.
   - `POP m` with an ESP base used the pre-pop ESP (`bdd3f42`). The 16->32 thunk at 0147:65xx does `pop dword [esp+8]` then `o32 retf`, so it overwrote the CS slot (fatal exception 0D at 0147:656A, error 53CC).
 - With those fixed, Win98 reaches the GUI: 640x480, hourglass on blue, by 44.18B (`tools/out/w98_546.ppm`). Checkpoint `tools/out/w98k.snap.44200m`.
 - Note: the runner presses Enter and takes a PPM shot every 80M steps after 580M (`tools/win98_run.lua` ~line 1271), and forces `pit.channel0Divisor = 1` after 500M.
+- Fifth fix: interrupt/trap gates now clear NT and RF (`326a408`). A ring-3 NT leaked into the VMM, its IRET became a task return (#TS at C00015E1), recursed ~32 times, overflowed the ring-0 stack and reset the PC.
+- Win98 SE first-boot Setup Wizard runs in the GUI: User Information (typed "RVPC" with the new `--keys`), License Agreement accepted (Alt+A, Enter), now on the **Windows Product Key** page. Checkpoint `tools/out/w98p.snap.44500m`, shot `tools/out/w98_552.ppm`.
+- To continue: `tools/bin/lune.exe run tools/win98_run.lua --load tools/out/w98p.snap.44500m --steps 200 --no-auto-enter 1 --keys "<25 key chars, no dashes>{ENTER}" --keys-at 44502 --save tools/out/w98q.snap --save-every 20` (the boxes auto-advance).
