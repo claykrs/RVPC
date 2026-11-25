@@ -1125,6 +1125,18 @@ local function descriptorIsCode(desc: Descriptor): boolean
 	return band(desc.access, 0x18) == 0x18
 end
 
+-- CPL after a same-ring transfer into a code segment: a non-conforming
+-- target runs at its DPL (which a legal transfer makes equal to CPL), a
+-- conforming one keeps the caller's CPL. Using the DPL also covers the far
+-- JMP that follows setting CR0.PE, where CS still holds a real-mode value
+-- whose low bits are not a privilege level.
+local function transferCpl(cpu: any, desc: Descriptor): number
+	if band(desc.access, 0x04) ~= 0 then
+		return cpu:cpl()
+	end
+	return band(rshift(desc.access, 5), 3)
+end
+
 local function descriptorIsWritableData(desc: Descriptor): boolean
 	return band(desc.access, 0x18) == 0x10 and band(desc.access, 2) ~= 0
 end
@@ -1215,7 +1227,7 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			self:pushValue(self.ip, nearWidth)
 		end
 		-- The loaded CS.RPL becomes the CPL (unchanged by a direct transfer).
-		self:loadSeg("cs", bor(band(selector, 0xFFFC), self:cpl()))
+		self:loadSeg("cs", bor(band(selector, 0xFFFC), transferCpl(self, desc)))
 		self.ip = offset
 		return
 	end
@@ -1253,7 +1265,7 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			self:pushValue(self.cs, gateWidth)
 			self:pushValue(self.ip, gateWidth)
 		end
-		self:loadSeg("cs", bor(band(targetSelector, 0xFFFC), cpl))
+		self:loadSeg("cs", bor(band(targetSelector, 0xFFFC), transferCpl(self, targetDesc)))
 		self.ip = targetOffset
 		return
 	end

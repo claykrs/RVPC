@@ -283,6 +283,21 @@ end)
 -- target with RPL 3 (Win98 SYSDETMG thunks do); the ring-0 RETF must then see
 -- an outer return and restore the ring-3 SS:ESP. Copied parameters sit
 -- between CS:EIP and the saved SS:ESP, and RETF imm16 releases them on both stacks.
+-- The far JMP right after CR0.PE is set runs with CS still holding a
+-- real-mode segment; the new CS.RPL must come from the target's DPL, not
+-- from that segment's low bits (Win98's VMM32 loader enters 0028 this way).
+T("far_jmp_after_pe_takes_rpl_from_target_dpl", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	cpu.cs = 0x074F
+	cpu.segSel.cs = 0x074F
+	putCode(m, 0x1000, { 0xEA, 0x00, 0x20, 0x00, 0x00, 0x08, 0x00 }) -- JMP FAR 0008:00002000
+	m:run(1)
+	expect(cpu.cs == 0x08 and cpu.ip == 0x2000, string.format("landed %X:%X", cpu.cs, cpu.ip))
+	expect(cpu:cpl() == 0, string.format("cpl %d", cpu:cpl()))
+end)
+
 T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
 	const m = freshMachine()
 	flat32(m)

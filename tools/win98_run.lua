@@ -1046,6 +1046,55 @@ if opts.drLog then
 	}) :: any
 end
 
+-- --vxd-dev HEX: print each protected-mode INT 20h VxD call to that device (cs:ip, service).
+if opts.vxdDev then
+	local dev = tonumber(tostring(opts.vxdDev), 16)
+	local origV = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if self:isProtected() and not self:isV86() then
+			const lin = self.segBase.cs + self.ip
+			const ok, b0 = pcall(function()
+				return self:read8(lin, true)
+			end)
+			if ok and b0 == 0xCD then
+				const ok2, b1, id = pcall(function()
+					return self:read8(lin + 1, true), self:read32(lin + 2, true)
+				end)
+				if ok2 and b1 == 0x20 then
+					if bit32.band(bit32.rshift(id, 16), 0x7FFF) == dev then
+						print(
+							("VXD %04X:%08X -> %08X step %d"):format(
+								self.cs,
+								self.ip,
+								id,
+								st.executed
+							)
+						)
+					end
+				end
+			end
+		end
+		return origV(self)
+	end
+end
+
+-- --stop-ip HEX [--stop-cs HEX]: save --save and exit just before executing that ip (and cs).
+if opts.stopIp then
+	local wantIp = tonumber(tostring(opts.stopIp), 16)
+	local wantCs = if opts.stopCs then tonumber(tostring(opts.stopCs), 16) else nil
+	local origS = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if self.ip == wantIp and (wantCs == nil or self.cs == wantCs) then
+			print(("STOP at %04X:%08X step %d"):format(self.cs, self.ip, st.executed))
+			if opts.save then
+				checkpoint(opts.save)
+			end
+			process.exit(0)
+		end
+		return origS(self)
+	end
+end
+
 -- --pc-hist N: sample cs:ip every N instructions and print the 40 most frequent at the end.
 local pcHistRef: { [string]: number }? = nil
 if opts.pcHist then
