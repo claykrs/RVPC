@@ -279,6 +279,41 @@ end)
 
 -- A near CALL past the CS limit faults on the CALL itself: the #GP frame holds
 -- the CALL's address and nothing was pushed (Win98's FF000FFF ring-0 limit).
+-- A call gate into ring 0 forces CS.RPL to 0 even when the gate names its
+-- target with RPL 3 (Win98 SYSDETMG thunks do); the ring-0 RETF must then see
+-- an outer return and restore the ring-3 SS:ESP.
+T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	writeDescriptor(m, 0x3000 + 0x20, 0, 0xFFFFF, 0xFA, 0xCF)
+	writeDescriptor(m, 0x3000 + 0x28, 0, 0xFFFFF, 0xF2, 0xCF)
+	m.mem:write16(0x3000 + 0x30, 0x2000) -- 386 call gate DPL3 -> 000B:2000
+	m.mem:write16(0x3000 + 0x32, 0x000B)
+	m.mem:write8(0x3000 + 0x34, 0)
+	m.mem:write8(0x3000 + 0x35, 0xEC)
+	m.mem:write16(0x3000 + 0x36, 0)
+	cpu.gdtr = { base = 0x3000, limit = 0x37 }
+	m.mem:write32(0x4004, 0x9000)
+	m.mem:write16(0x4008, 0x10)
+	cpu.tr, cpu.trBase, cpu.trLimit, cpu.tr32 = 0x18, 0x4000, 0x67, true
+	cpu.cs, cpu.ss = 0x23, 0x2B
+	cpu.segSel.cs, cpu.segSel.ss = 0x23, 0x2B
+	cpu:setSP(0x8000)
+	putCode(m, 0x1000, { 0x9A, 0, 0, 0, 0, 0x33, 0x00 }) -- CALL 0033:0
+	putCode(m, 0x2000, { 0x8C, 0xC8, 0xA3, 0x00, 0x60, 0x00, 0x00, 0xCB }) -- MOV AX,CS; MOV [6000h],EAX; RETF
+	m:run(4)
+	expect(
+		band(m.mem:read32(0x6000), 0xFFFF) == 0x08,
+		string.format("ring-0 CS %X", m.mem:read32(0x6000))
+	)
+	expect(cpu.cs == 0x23 and cpu.ip == 0x1007, string.format("return %X:%X", cpu.cs, cpu.ip))
+	expect(
+		cpu.ss == 0x2B and cpu:rr32(4) == 0x8000,
+		string.format("stack %X:%X", cpu.ss, cpu:rr32(4))
+	)
+end)
+
 T("near_call_beyond_cs_limit_faults_before_push", function(expect)
 	const m = freshMachine()
 	flat32(m)

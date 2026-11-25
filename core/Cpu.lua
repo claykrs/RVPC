@@ -1214,7 +1214,8 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			self:pushValue(self.cs, nearWidth)
 			self:pushValue(self.ip, nearWidth)
 		end
-		self:loadSeg("cs", selector)
+		-- The loaded CS.RPL becomes the CPL (unchanged by a direct transfer).
+		self:loadSeg("cs", bor(band(selector, 0xFFFC), self:cpl()))
 		self.ip = offset
 		return
 	end
@@ -1252,7 +1253,7 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 			self:pushValue(self.cs, gateWidth)
 			self:pushValue(self.ip, gateWidth)
 		end
-		self:loadSeg("cs", targetSelector)
+		self:loadSeg("cs", bor(band(targetSelector, 0xFFFC), cpl))
 		self.ip = targetOffset
 		return
 	end
@@ -1331,7 +1332,8 @@ function Cpu.farCall(self: Cpu, selector: number, offset: number, isCall: boolea
 	end
 	self:loadSeg("ss", newSs)
 	self:setSP(newSp)
-	self:loadSeg("cs", targetSelector)
+	-- CS.RPL is forced to the new CPL; the gate's target selector RPL is ignored.
+	self:loadSeg("cs", bor(band(targetSelector, 0xFFFC), targetRing))
 	self.ip = targetOffset
 end
 

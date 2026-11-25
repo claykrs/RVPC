@@ -904,6 +904,21 @@ if opts.faultLog then
 			)
 			print(debug.traceback())
 		end
+		-- --fault-ring-ip HEX: with --ring-fault, print the ring and exit at the first fault at that ip.
+		if
+			opts.faultRingIp
+			and faultRing
+			and (self.opIP or self.ip) == tonumber(tostring(opts.faultRingIp), 16)
+		then
+			print(("RING at fault vec=%X err=%s"):format(n, tostring(errorCode)))
+			for q = 1, faultRingLen do
+				local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+				if e then
+					print(e)
+				end
+			end
+			process.exit(0)
+		end
 		if opts.faultTrace and errorCode and errorCode > 0xFFFF then
 			print(debug.traceback())
 		end
