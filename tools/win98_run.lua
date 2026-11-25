@@ -1242,6 +1242,73 @@ if opts.pcLog then
 	end
 end
 
+-- --cs-trace SEL [--cs-trace-n N]: print ip, code bytes, registers and flags before every
+-- instruction executed with CS = SEL (hex); stops after N lines.
+if opts.csTrace then
+	local sel = tonumber(tostring(opts.csTrace), 16)
+	local left = tonumber(opts.csTraceN) or 100000
+	local oe = m.cpu.executeStep
+	local logging = false
+	local depth = 0
+	for _, w in { { "read8", 1 }, { "read16", 2 }, { "read32", 4 } } do
+		local orig = m.cpu[w[1]]
+		m.cpu[w[1]] = function(self, addr, sup)
+			depth += 1
+			const v = orig(self, addr, sup)
+			depth -= 1
+			if logging and depth == 0 then
+				print(("R %d %08X %X"):format(w[2], addr, v))
+			end
+			return v
+		end
+	end
+	for _, w in { { "write8", 1 }, { "write16", 2 }, { "write32", 4 } } do
+		local orig = m.cpu[w[1]]
+		m.cpu[w[1]] = function(self, addr, v, sup)
+			if logging and depth == 0 then
+				print(("W %d %08X %X"):format(w[2], addr, v))
+			end
+			depth += 1
+			orig(self, addr, v, sup)
+			depth -= 1
+		end
+	end
+	m.cpu.executeStep = function(self)
+		logging = false
+		if left > 0 and self.segSel.cs == sel then
+			left -= 1
+			depth += 1
+			const lin = self.segBase.cs + self.ip
+			local bytes = {}
+			for q = 0, 7 do
+				const ok, b = pcall(function()
+					return self:read8(lin + q, true)
+				end)
+				bytes[#bytes + 1] = if ok then ("%02X"):format(b) else "??"
+			end
+			print(
+				("T %04X %s %08X %08X %08X %08X %08X %08X %08X %08X %08X"):format(
+					self.ip,
+					table.concat(bytes),
+					self:rr32(0),
+					self:rr32(1),
+					self:rr32(2),
+					self:rr32(3),
+					self:rr32(4),
+					self:rr32(5),
+					self:rr32(6),
+					self:rr32(7),
+					self.flags
+				)
+			)
+			print(("S %08X %08X %08X"):format(self.segBase.ds, self.segBase.es, self.segBase.ss))
+			depth -= 1
+			logging = true
+		end
+		return oe(self)
+	end
+end
+
 -- --irq-hist 1: count Pic:raise calls per IRQ and print at end.
 if opts.irqHist then
 	local rc: { [number]: number } = {}
