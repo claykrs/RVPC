@@ -338,7 +338,17 @@ local function identify(drive: Drive): buffer
 	putWord(out, 3, heads) -- heads
 	putWord(out, 6, sectorsPerTrack) -- sectors/track
 	putWord(out, 49, 0x0300) -- DMA + LBA
-	putWord(out, 53, 0x0006) -- words 54-58 and 64-70 are valid
+	putWord(out, 51, 0x0200) -- PIO data transfer cycle timing mode 2
+	putWord(out, 53, 0x0007) -- words 54-58, 64-70 and 88 are valid
+	-- Current CHS translation (words 54-58). Leaving these zero while a
+	-- driver reads them makes the disk look empty: Win98's ESDI_506 then
+	-- never claims it and blocks the BIOS path to the channel instead.
+	const currentCapacity = cylinders * heads * sectorsPerTrack
+	putWord(out, 54, cylinders)
+	putWord(out, 55, heads)
+	putWord(out, 56, sectorsPerTrack)
+	putWord(out, 57, band(currentCapacity, 0xFFFF))
+	putWord(out, 58, band(rshift(currentCapacity, 16), 0xFFFF))
 	putWord(out, 60, band(total, 0xFFFF))
 	putWord(out, 61, band(rshift(total, 16), 0xFFFF))
 	putWord(out, 63, 0x0007) -- multiword DMA modes 0-2

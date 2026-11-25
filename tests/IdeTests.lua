@@ -394,6 +394,10 @@ T("ata_identify_32m_geometry", function(expect)
 	expect(words[2] == 65, "cylinders=" .. words[2])
 	expect(words[4] == 16, "heads=" .. words[4])
 	expect(words[7] == 63, "sectors/track=" .. words[7])
+	-- Word 53 bit 0 vouches for the current CHS words 54-58; they must match.
+	expect(band(words[54], 0x0001) ~= 0, "word53 bit0 (current CHS valid) missing")
+	expect(words[55] == 65 and words[56] == 16 and words[57] == 63, "current CHS words")
+	expect(words[58] + words[59] * 65536 == 65 * 16 * 63, "current CHS capacity")
 
 	-- Last sector of the 32 MiB image exercises the LBA28 register path.
 	writeSectors(ide, 65535, 1, 0xBEE0)
