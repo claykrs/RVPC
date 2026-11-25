@@ -127,6 +127,11 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
+	-- --reset-after-load 1: press the reset button on the loaded state (disks keep their contents).
+	if opts.resetAfterLoad then
+		m:reset()
+		print("RESET after load")
+	end
 	if opts.rtc then
 		local r = m.rtcState
 		print(("RTC regA=%02X regB=%02X regC=%02X"):format(r.regA or -1, r.regB, r.regC or -1))
@@ -810,11 +815,13 @@ if opts.ringFault then
 	-- --ring-jumps 1: only record an instruction when it is not within 16 bytes after the previous one.
 	local jumpsOnly = opts.ringJumps ~= nil
 	local lastCs, lastIp = -1, -1
+	-- --ring-skip-cs HEX: do not record instructions executed with this CS.
+	local skipCs = if opts.ringSkipCs then tonumber(tostring(opts.ringSkipCs), 16) else nil
 	m.cpu.executeStep = function(self)
-		local record = true
+		local record = self.cs ~= skipCs
 		if jumpsOnly then
 			local d = self.ip - lastIp
-			record = self.cs ~= lastCs or d < 0 or d > 16
+			record = record and (self.cs ~= lastCs or d < 0 or d > 16)
 			lastCs, lastIp = self.cs, self.ip
 		end
 		if record then
@@ -1729,6 +1736,15 @@ end
 if vgaHistRef then
 	for k, v in vgaHistRef do
 		print(("HIST %s %d"):format(k, v))
+	end
+end
+-- --ring-end 1: with --ring-fault, print the ring when the run ends.
+if opts.ringEnd and faultRing then
+	for q = 1, faultRingLen do
+		local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+		if e then
+			print(e)
+		end
 	end
 end
 if opts.endText then
