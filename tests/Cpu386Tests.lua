@@ -298,6 +298,27 @@ T("far_jmp_after_pe_takes_rpl_from_target_dpl", function(expect)
 	expect(cpu:cpl() == 0, string.format("cpl %d", cpu:cpl()))
 end)
 
+-- CR0.ET is hardwired to 1 with a 387-class FPU; Win9x reads it to decide
+-- whether to emulate floating point. LMSW only loads PE/MP/EM/TS.
+T("cr0_et_reads_one_with_fpu_and_lmsw_keeps_high_bits", function(expect)
+	const m = freshFpuMachine()
+	const cpu = m.cpu
+	expect(band(cpu.cr0, 0x10) ~= 0, string.format("reset cr0 %X", cpu.cr0))
+	cpu:loadSeg("cs", 0)
+	cpu.ip = 0x1000
+	-- MOV EAX,0 ; MOV CR0,EAX ; MOV EAX,CR0 ; HLT
+	putCode(m, 0x1000, { 0x66, 0xB8, 0, 0, 0, 0, 0x0F, 0x22, 0xC0, 0x0F, 0x20, 0xC0, 0xF4 })
+	m:run(3)
+	expect(band(cpu:rr32(0), 0x10) ~= 0, string.format("cr0 after write %X", cpu:rr32(0)))
+	-- LMSW AX with AX=0x0008 (TS) from protected mode keeps PE and ET.
+	flat32(m)
+	cpu.cr0 = bor(cpu.cr0, 0x10)
+	cpu.ip = 0x1100
+	putCode(m, 0x1100, { 0xB8, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x01, 0xF0, 0xF4 }) -- MOV EAX,8 ; LMSW AX
+	m:run(2)
+	expect(cpu.cr0 == 0x19, string.format("cr0 after lmsw %X", cpu.cr0))
+end)
+
 T("call_gate_sets_cs_rpl_to_new_cpl", function(expect)
 	const m = freshMachine()
 	flat32(m)

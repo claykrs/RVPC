@@ -21,6 +21,9 @@ const FIXEDFLAGS_286 = ALWAYS -- 286 real mode: bits 12-15 read as 0
 const CR0_PE = 0x00000001
 const CR0_EM = 0x00000004
 const CR0_TS = 0x00000008
+-- ET reads as 1 on a 486 (and on a 386 with a 387); Win9x checks it to
+-- decide whether a 387-class coprocessor exists, else it emulates FPU code.
+const CR0_ET = 0x00000010
 const CR0_WP = 0x00010000
 const CR0_PG = 0x80000000
 
@@ -342,7 +345,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.segSel = { es = 0, cs = 0, ss = 0, ds = 0, fs = 0, gs = 0 }
 	self.ip = 0
 	self.flags = bor(self.fixedFlags, IFF)
-	self.cr0 = 0
+	self.cr0 = if self.fpu then CR0_ET else 0
 	self.cr = { 0, 0, 0, 0 }
 	self.dr = { 0, 0, 0, 0 }
 	self.gdtr = { base = 0, limit = 0 }
@@ -888,7 +891,7 @@ function Cpu.reset(self: Cpu)
 	self.fetchEntry = -1
 	self.fetchEpoch = -1
 	self.fetchKey = -1
-	self.cr0 = 0
+	self.cr0 = if self.fpu then CR0_ET else 0
 	self.cr3 = 0
 	self.tlb = nil
 	self.tlbEpoch = 1
@@ -4342,9 +4345,12 @@ local function movControl(cpu: any, op: number)
 	else
 		-- MOV to CRn/DRn reads the full 32-bit register regardless of operand size
 		-- (WIN.COM writes CR0 = 805B0001h from real mode with no 0x66 prefix).
-		const value = cpu:rr32(e.rm)
+		local value = cpu:rr32(e.rm)
 		if op == 0x22 then
 			if e.reg == 0 then
+				if cpu.fpu then
+					value = bor(value, CR0_ET)
+				end
 				local oldCr0 = cpu.cr0
 				cpu.cr0 = value
 				cpu.cr[0] = value
@@ -4595,7 +4601,8 @@ H0F[0x01] = function(cpu: any)
 		end
 	elseif reg == 6 then
 		const value = cpu:readRM16(e)
-		local nextCr0 = bor(band(cpu.cr0, 0xFFFF0000), band(value, 0xFFFF))
+		-- LMSW loads only PE/MP/EM/TS and cannot clear PE.
+		local nextCr0 = bor(band(cpu.cr0, bnot(0x0F)), band(value, 0x0F), band(cpu.cr0, CR0_PE))
 		if band(cpu.cr0, CR0_PG) ~= band(nextCr0, CR0_PG) then
 			cpu:flushTlb()
 		end
