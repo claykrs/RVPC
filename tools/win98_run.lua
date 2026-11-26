@@ -292,6 +292,30 @@ if opts.load then
 		process.exit(0)
 	end
 	-- --dump ADDR [--dump-len N]: print physical bytes of the loaded checkpoint and exit.
+	-- --dump-file PATH: with --dump/--dump-len, write the raw bytes to PATH instead
+	-- (unmapped linear pages read as zero with --dump-lin).
+	if opts.dump and opts.dumpFile then
+		local a, n = tonumber(opts.dump) :: number, tonumber(opts.dumpLen) or 64
+		local out = buffer.create(n)
+		local k = 0
+		while k < n do
+			local pageLeft = math.min(4096 - ((a + k) % 4096), n - k)
+			local okP, phys = true, a + k
+			if opts.dumpLin then
+				okP, phys = pcall(function()
+					return probePhys(m.cpu, a + k, false, false)
+				end)
+			end
+			if okP then
+				for j = 0, pageLeft - 1 do
+					buffer.writeu8(out, k + j, m.mem:read8(phys + j))
+				end
+			end
+			k += pageLeft
+		end
+		fs.writeFile(tostring(opts.dumpFile), out)
+		process.exit(0)
+	end
 	if opts.dump then
 		local a, n = tonumber(opts.dump), tonumber(opts.dumpLen) or 64
 		for row = 0, n - 1, 16 do
@@ -376,7 +400,11 @@ local function shot()
 		out[#out + 1] = table.concat(row)
 	end
 	st.guiShot += 1
-	fs.writeFile(("tools/out/w98_%03d.ppm"):format(st.guiShot), table.concat(out))
+	-- --shot-prefix NAME: name GUI shots tools/out/NAME_<n>.ppm (default w98) so parallel runs do not collide.
+	fs.writeFile(
+		("tools/out/%s_%03d.ppm"):format(tostring(opts.shotPrefix or "w98"), st.guiShot),
+		table.concat(out)
+	)
 	print(("SHOT %d at %d steps pc=%s"):format(st.guiShot, st.executed, m:bootPc()))
 end
 
@@ -1401,7 +1429,8 @@ if opts.dosWrite then
 	end
 end
 
--- --lwatch LINEAR [--lwatch-len N]: print each instruction that changes N bytes at a paged linear address.
+-- --lwatch LINEAR [--lwatch-len N] [--lwatch-max N]: print each instruction that changes N bytes at a
+-- paged linear address (the first --lwatch-max changes, default 60).
 if opts.lwatch then
 	local la = tonumber(opts.lwatch) :: number
 	local n = tonumber(opts.lwatchLen) or 8
@@ -1424,7 +1453,7 @@ if opts.lwatch then
 		local now = grab(self)
 		-- --lwatch-cs HEX: only report changes made while CS is this selector, and
 		-- ignore the slot mapping in/out across address-space switches ("??").
-		local report = now ~= last and hits < 60
+		local report = now ~= last and hits < (tonumber(opts.lwatchMax) or 60)
 		if report and opts.lwatchCs then
 			report = string.find(now, "?", 1, true) == nil
 				and string.find(last, "?", 1, true) == nil
@@ -1639,7 +1668,11 @@ if opts.pcLog then
 	m.cpu.executeStep = function(self)
 		if left > 0 then
 			const lin = self.segBase.cs + self.ip
-			if want[lin] then
+			-- --pc-log-ss HEX: only count hits while SS is this selector/segment.
+			if
+				want[lin]
+				and (opts.pcLogSs == nil or self.ss == tonumber(tostring(opts.pcLogSs), 16))
+			then
 				left -= 1
 				const okd, at = pcall(function()
 					return self.mem:read32(probePhys(self, self:rr32(0)))
@@ -1648,9 +1681,11 @@ if opts.pcLog then
 					return self.mem:read32(probePhys(self, self:rr32(1)))
 				end)
 				print(
-					("PC %08X tsc=%d eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X [eax]=%s [ecx]=%s"):format(
+					("PC %08X tsc=%d ss:sp=%04X:%X eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X [eax]=%s [ecx]=%s"):format(
 						lin,
 						self.tsc,
+						self.ss,
+						self:rr32(4),
 						self:rr32(0),
 						self:rr32(3),
 						self:rr32(1),
@@ -1661,6 +1696,22 @@ if opts.pcLog then
 						if okc then ("%08X"):format(atc) else "?"
 					)
 				)
+				-- --pc-log-stack N: also print N words at SS:SP (paged linear SS base + SP).
+				if opts.pcLogStack then
+					local w = {}
+					for q = 0, (tonumber(opts.pcLogStack) :: number) - 1 do
+						const okw, v = pcall(function()
+							return self.mem:read16(
+								probePhys(
+									self,
+									self.segBase.ss + ((self:rr32(4) + q * 2) % 0x10000)
+								)
+							)
+						end)
+						table.insert(w, if okw then ("%04X"):format(v) else "????")
+					end
+					print("  STK " .. table.concat(w, " "))
+				end
 				if faultRing then
 					for q = 1, faultRingLen do
 						local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]

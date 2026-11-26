@@ -737,6 +737,41 @@ T("v86_trapped_out_pushes_a_gp_error_code", function(expect)
 	expect(m.mem:read32(esp) == 0 and m.mem:read32(esp + 4) == 0x100, "error code 0 below EIP")
 end)
 
+T("v86_interrupt_nulls_the_data_segments", function(expect)
+	-- Leaving V86 for ring 0 saves ES/DS/FS/GS in the frame and loads them with
+	-- null. Win98's VMM pushes and pops ES in an IRQ that can land before it
+	-- reloads its own selectors; a leftover V86 value (7700h) made that POP ES
+	-- #GP in ring 0 -> "Windows protection error" on the first boot after Setup.
+	const m = freshMachine()
+	v86TrapSetup(m, 0x202)
+	const cpu = m.cpu
+	cpu.ds, cpu.es, cpu.fs, cpu.gs = 0x7700, 0x7701, 0x7702, 0x7703
+	cpu.segBase.ds, cpu.segBase.es, cpu.segBase.fs, cpu.segBase.gs =
+		0x77000, 0x77010, 0x77020, 0x77030
+	putCode(m, 0x6000, { 0x06, 0x07, 0xEB, 0xFE }) -- #GP handler: PUSH ES, POP ES, JMP $
+	cpu:executeStep() -- CLI at IOPL 0 -> #GP to the ring-0 handler
+	expect(cpu.ip == 0x6000, string.format("handler at %X", cpu.ip))
+	expect(
+		cpu.ds == 0 and cpu.es == 0 and cpu.fs == 0 and cpu.gs == 0,
+		string.format("ds=%X es=%X fs=%X gs=%X, want null", cpu.ds, cpu.es, cpu.fs, cpu.gs)
+	)
+	const esp = cpu:rr32(4)
+	expect(esp == 0x9000 - 40, string.format("ESP=%X", esp))
+	expect(
+		m.mem:read32(esp + 24) == 0x7701
+			and m.mem:read32(esp + 28) == 0x7700
+			and m.mem:read32(esp + 32) == 0x7702
+			and m.mem:read32(esp + 36) == 0x7703,
+		"frame keeps the V86 ES, DS, FS, GS"
+	)
+	cpu:executeStep()
+	cpu:executeStep()
+	expect(
+		cpu.ip == 0x6002,
+		string.format("PUSH ES / POP ES of null stays in the handler (ip=%X)", cpu.ip)
+	)
+end)
+
 T("v86_cli_traps_to_gp_at_iopl_0", function(expect)
 	const m = freshMachine()
 	v86TrapSetup(m, 0x202)
@@ -769,6 +804,12 @@ T("v86_interrupt_frame_and_iret", function(expect)
 	m.mem:write16(0x4008, 0x10)
 	installGate(m, 0x21, 0x6000, 8, 0xEE) -- DPL 3 so V86 software INT is legal
 	putCode(m, 0x6000, {
+		0x66,
+		0xB8,
+		0x10,
+		0x00, -- MOV AX,10h
+		0x8E,
+		0xD8, -- MOV DS,AX: leaving V86 left DS null
 		0x8B,
 		0x04,
 		0x24, -- MOV EAX,[ESP] saved EIP

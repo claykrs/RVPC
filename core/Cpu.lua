@@ -1665,6 +1665,15 @@ function Cpu.pmInterrupt(self: Cpu, n: number, errorCode: number?, software: boo
 		self:setSP(newSp)
 		self:loadSeg("cs", targetSelector)
 		self.ip = targetOffset
+		-- Leaving V86 loads null into the data segments (their V86 values live
+		-- in the frame). Win98's VMM pushes and pops ES in IRQs that can arrive
+		-- before it reloads its selectors; a stale V86 value made POP ES #GP.
+		if v86 then
+			self:loadSeg("es", 0)
+			self:loadSeg("ds", 0)
+			self:loadSeg("fs", 0)
+			self:loadSeg("gs", 0)
+		end
 	else
 		self:pushValue(savedFlags, frameWidth)
 		self:pushValue(savedCS, frameWidth)
