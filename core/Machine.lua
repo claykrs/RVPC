@@ -439,7 +439,22 @@ function Machine.new(deps: Deps, config: Config?): Machine
 		if cfg.floppy1 and cfg.floppy1.image then
 			floppyType = bor(floppyType, 0x04) -- drive B: 1.44M
 		end
-		const cmos = deps.Cmos.new({ memorySize = self.mem.size, floppyType = floppyType })
+		-- Primary master disk geometry as IDENTIFY reports it (16 heads, 63
+		-- sectors, cylinders from the image size, capped at 16383).
+		local hardDisks = {}
+		if cfg.hdd then
+			const total = math.floor(buffer.len(cfg.hdd) / 512)
+			hardDisks[1] = {
+				cylinders = math.max(1, math.min(16383, math.floor(total / (16 * 63)))),
+				heads = 16,
+				sectors = 63,
+			}
+		end
+		const cmos = deps.Cmos.new({
+			memorySize = self.mem.size,
+			floppyType = floppyType,
+			hardDisks = hardDisks,
+		})
 		self.cmos = cmos
 		self.rtcState = cmos.rtc
 	end

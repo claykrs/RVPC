@@ -57,15 +57,24 @@ export type RtcState = {
 	alarmHour: number,
 }
 
+export type DiskGeometry = { cylinders: number, heads: number, sectors: number }
+
 export type Config = {
 	memorySize: number?,
 	floppyType: number?,
+	-- Primary-channel ATA disks (index 1 = master, 2 = slave). Their presence
+	-- and geometry go in the AT fixed-disk bytes: 0x12 type nibbles (0xF =
+	-- extended type in 0x19/0x1A), type 47 user parameters at 0x1B/0x24, the
+	-- same layout QEMU writes. Win9x's ESDI_506 only claims a disk on a legacy
+	-- (non-PCI) controller when CMOS lists it.
+	hardDisks: { DiskGeometry? }?,
 }
 
 export type Cmos = typeof(setmetatable(
 	{} :: {
 		index: number,
 		nmiMasked: boolean,
+		fixedDisk: { [number]: number },
 		memorySize: number,
 		floppyType: number,
 		ram: { [number]: number },
@@ -476,8 +485,8 @@ local function readRegister(self: Cmos, index: number): number
 		return self.shutdown
 	elseif index == 0x10 then
 		return self.floppyType -- high nibble drive A, low nibble drive B
-	elseif index == 0x12 then
-		return 0x00 -- no fixed disk types
+	elseif index >= 0x10 and index <= 0x2F and self.fixedDisk[index] ~= nil then
+		return self.fixedDisk[index]
 	elseif index == 0x14 then
 		return 0x02 -- FPU present, no equipment bits
 	elseif index == 0x15 or index == 0x16 then
@@ -518,6 +527,37 @@ function Cmos.new(config: Config?): Cmos
 	-- always-present floppy fallback from winning the first attempt.
 	self.ram[0x38] = 0x10
 	self.ram[0x3D] = 0x23
+	self.fixedDisk = {}
+	const disks = cfg.hardDisks or {}
+	local types = 0
+	for unit = 1, 2 do
+		const geo = disks[unit]
+		if geo then
+			types = bor(types, if unit == 1 then 0xF0 else 0x0F)
+			self.fixedDisk[0x18 + unit] = 47 -- 0x19 / 0x1A: user-defined type
+			const base = if unit == 1 then 0x1B else 0x24
+			const cyl = math.min(geo.cylinders, 0xFFFF)
+			self.fixedDisk[base] = band(cyl, 0xFF)
+			self.fixedDisk[base + 1] = band(rshift(cyl, 8), 0xFF)
+			self.fixedDisk[base + 2] = band(geo.heads, 0xFF)
+			self.fixedDisk[base + 3] = 0xFF -- write precompensation: none
+			self.fixedDisk[base + 4] = 0xFF
+			self.fixedDisk[base + 5] = bor(0xC0, if geo.heads > 8 then 0x08 else 0) -- control byte
+			self.fixedDisk[base + 6] = band(cyl, 0xFF) -- landing zone
+			self.fixedDisk[base + 7] = band(rshift(cyl, 8), 0xFF)
+			self.fixedDisk[base + 8] = band(geo.sectors, 0xFF)
+		end
+	end
+	if types ~= 0 then
+		self.fixedDisk[0x12] = types
+		-- Standard CMOS checksum over 0x10-0x2D (big-endian at 0x2E/0x2F).
+		local sum = 0
+		for index = 0x10, 0x2D do
+			sum += readRegister(self, index)
+		end
+		self.fixedDisk[0x2E] = band(rshift(sum, 8), 0xFF)
+		self.fixedDisk[0x2F] = band(sum, 0xFF)
+	end
 	return self
 end
 

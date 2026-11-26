@@ -395,6 +395,31 @@ T("cmos_memory_and_shutdown", function(expect)
 	expect(cmos:in8(0x71) == 0x02, "status B")
 end)
 
+-- Win98's ESDI_506 claims a legacy-controller disk only when CMOS 0x12 lists
+-- it; the layout matches QEMU's (type 0xF -> 47 in 0x19, params at 0x1B).
+T("cmos_fixed_disk_type_47", function(expect)
+	const cmos = Cmos.new({ hardDisks = { { cylinders = 1040, heads = 16, sectors = 63 } } })
+	local function reg(index)
+		cmos:out8(0x70, index)
+		return cmos:in8(0x71)
+	end
+	expect(reg(0x12) == 0xF0, string.format("0x12=%02X", reg(0x12)))
+	expect(reg(0x19) == 47 and reg(0x1A) == 0, "extended types")
+	expect(
+		reg(0x1B) == 0x10 and reg(0x1C) == 0x04 and reg(0x1D) == 16 and reg(0x23) == 63,
+		"type 47 params"
+	)
+	local sum = 0
+	for index = 0x10, 0x2D do
+		sum += reg(index)
+	end
+	expect(reg(0x2E) * 256 + reg(0x2F) == sum, "checksum")
+	expect(Cmos.new():in8(0x71) ~= nil, "no-disk construction")
+	const bare = Cmos.new()
+	bare:out8(0x70, 0x12)
+	expect(bare:in8(0x71) == 0, "no disks -> 0x12 = 0")
+end)
+
 T("rtc_periodic_irq8_status_c", function(expect)
 	const m = freshMachine()
 	const io = m.cpu.io
