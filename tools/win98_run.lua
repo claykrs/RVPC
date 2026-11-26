@@ -549,8 +549,10 @@ local NAMED = {
 	CTRL = 0x1D,
 	F1 = 0x3B,
 	F8 = 0x42,
+	DEL = 0x53,
 }
 local keyQueue: { { number } } = {}
+local keyMode: { [number]: string } = {}
 if opts.keys then
 	local text = tostring(opts.keys)
 	local i = 1
@@ -559,9 +561,19 @@ if opts.keys then
 		if c == "{" then
 			local j = string.find(text, "}", i, true) :: number
 			local name = string.sub(text, i + 1, j - 1)
-			local alt = string.match(name, "^ALT%+(%w+)$")
-			if alt then
-				table.insert(keyQueue, { 0x38, NAMED[alt] or SCAN[string.lower(alt)] })
+			-- {ALT+X}, {CTRL+X}, {SHIFT+X} and stacked forms such as {CTRL+ALT+DEL};
+			-- {HOLD+X} presses X without releasing it, {UP+X} releases it.
+			local mods, key = string.match(name, "^([%u%+]+)%+(%w+)$")
+			if mods == "HOLD" or mods == "UP" then
+				table.insert(keyQueue, { NAMED[key] or SCAN[string.lower(key)] })
+				keyMode[#keyQueue] = mods
+			elseif mods and key and NAMED[string.match(mods, "^(%u+)")] then
+				local combo = {}
+				for mod in string.gmatch(mods, "%u+") do
+					table.insert(combo, NAMED[mod])
+				end
+				table.insert(combo, NAMED[key] or SCAN[string.lower(key)])
+				table.insert(keyQueue, combo)
 			else
 				table.insert(keyQueue, { NAMED[name] })
 			end
@@ -1948,11 +1960,15 @@ local function advance(limit)
 		end
 		if keyIndex <= #keyQueue and st.executed >= keysAt then
 			local combo = keyQueue[keyIndex]
-			for _, code in combo do
-				m:pressKey(code)
+			if keyMode[keyIndex] ~= "UP" then
+				for _, code in ipairs(combo) do
+					m:pressKey(code)
+				end
 			end
-			for k = #combo, 1, -1 do
-				m:releaseKey(combo[k])
+			if keyMode[keyIndex] ~= "HOLD" then
+				for k = #combo, 1, -1 do
+					m:releaseKey(combo[k])
+				end
 			end
 			print(("KEY %d/%d at %d"):format(keyIndex, #keyQueue, st.executed))
 			keyIndex += 1
