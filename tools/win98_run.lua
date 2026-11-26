@@ -1247,13 +1247,86 @@ if opts.dosCalls then
 	end
 end
 
+-- --api-log HEX,HEX,... [--api-log-n N]: for 32-bit user code, log each call that
+-- reaches one of these entry addresses (first two stack args, as ASCII strings when
+-- they point at text) and the EAX it returns with.
+if opts.apiLog then
+	local entries: { [number]: boolean } = {}
+	for h in string.gmatch(tostring(opts.apiLog), "%x+") do
+		entries[tonumber(h, 16) :: number] = true
+	end
+	local left = tonumber(opts.apiLogN) or 2000
+	local pending: { [number]: { ret: number, esp: number, what: string } } = {}
+	local function peek32(cpu: any, la: number): number?
+		const ok, v = pcall(function()
+			return cpu.mem:read32(probePhys(cpu, la))
+		end)
+		return if ok then v else nil
+	end
+	local function text(cpu: any, la: number): string?
+		local t = {}
+		for q = 0, 79 do
+			const ok, c = pcall(function()
+				return cpu.mem:read8(probePhys(cpu, la + q))
+			end)
+			if not ok then
+				return nil
+			end
+			if c == 0 then
+				break
+			end
+			if c < 32 or c > 126 then
+				return nil
+			end
+			t[#t + 1] = string.char(c)
+		end
+		return if #t > 0 then table.concat(t) else nil
+	end
+	local origA = m.cpu.executeStep
+	m.cpu.executeStep = function(self)
+		if left > 0 and self.cs == 0x167 then
+			const ip = self.ip
+			const esp = self:rr32(4)
+			const p = pending[ip]
+			if p and esp > p.esp then
+				pending[ip] = nil
+				left -= 1
+				print(("API ret %s -> eax=%08X step %d"):format(p.what, self:rr32(0), st.executed))
+			end
+			if entries[ip] then
+				const ret = peek32(self, esp) or 0
+				const a1 = peek32(self, esp + 4) or 0
+				const a2 = peek32(self, esp + 8) or 0
+				const s1 = text(self, a1)
+				const s2 = text(self, a2)
+				const what = ("%08X(%s, %s) from %08X"):format(
+					ip,
+					if s1 then '"' .. s1 .. '"' else ("%X"):format(a1),
+					if s2 then '"' .. s2 .. '"' else ("%X"):format(a2),
+					ret
+				)
+				pending[ret] = { ret = ret, esp = esp, what = what }
+			end
+		end
+		return origA(self)
+	end
+end
+
 -- --stop-ip HEX [--stop-cs HEX]: save --save and exit just before executing that ip (and cs).
 if opts.stopIp then
 	local wantIp = tonumber(tostring(opts.stopIp), 16)
 	local wantCs = if opts.stopCs then tonumber(tostring(opts.stopCs), 16) else nil
 	local origS = m.cpu.executeStep
 	m.cpu.executeStep = function(self)
-		if self.ip == wantIp and (wantCs == nil or self.cs == wantCs) then
+		if
+			self.ip == wantIp
+			and (wantCs == nil or self.cs == wantCs)
+			-- --stop-after M: ignore hits before absolute step M million.
+			and (
+				opts.stopAfter == nil
+				or st.executed >= (tonumber(opts.stopAfter) :: number) * 1_000_000
+			)
+		then
 			print(("STOP at %04X:%08X step %d"):format(self.cs, self.ip, st.executed))
 			if faultRing then
 				for q = 1, faultRingLen do
