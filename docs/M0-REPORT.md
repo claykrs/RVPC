@@ -178,5 +178,5 @@ M0:
   back in `tools/check.lua`: 333 assertions.
 
 M1 bring-up (IDE/ATAPI, 8042/PS2, PAM locking) is commit `4fbd3bc` and is
-still in progress; see `HANDOFF.md` for its exact boot state and blockers.
+still in progress; see `docs/ENGINEERING-LOG.md` for its exact boot state and blockers.
 

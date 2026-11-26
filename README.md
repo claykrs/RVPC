@@ -58,8 +58,11 @@ left.
 
 Booting a real OS is the best emulator test there is. A few of the CPU and
 hardware bugs Windows 98 Setup turned up, each now covered by a regression
-test (full write-ups in [HANDOFF.md](HANDOFF.md)):
+test (full write-ups in the [engineering log](docs/ENGINEERING-LOG.md)):
 
+- **The 8042 could not reboot the PC.** Its `0xFE` command pulses the CPU
+  reset line, which is how Windows restarts the machine; RVPC only reset the
+  keyboard controller, so Setup's restart never happened.
 - **Faulting pushes moved ESP.** Win9x grows thread stacks through guard-page
   faults; a `PUSH` whose store faulted had already decremented ESP, so the
   restarted instruction pushed twice and DLL entry points returned into their
@@ -75,7 +78,7 @@ test (full write-ups in [HANDOFF.md](HANDOFF.md)):
   legacy-controller disk that CMOS lists, so it refused the disk and blocked
   the BIOS path to it.
 - **MOV SS / POP SS interrupt shadow**, **CMPSW/SCASW flag width**, and a
-  dozen more in the [engineering log](HANDOFF.md).
+  dozen more in the [engineering log](docs/ENGINEERING-LOG.md).
 
 ## Status
 
@@ -84,8 +87,10 @@ test (full write-ups in [HANDOFF.md](HANDOFF.md)):
 | SeaBIOS boot, FreeDOS 1.3 install | ✅ working |
 | Win98 SE Setup: wizard, file copy, first reboot, hardware detection | ✅ working |
 | Win98 kernel boot (VMM32, VxDs, ESDI_506, GUI) | ✅ working |
-| Win98 Setup final stage | 🚧 running; some IE component registrations report errors |
-| Setup's own restart | 🚧 hangs at "Windows is shutting down" (a reset gets past it) |
+| Win98 Setup final stage | ✅ completes; some IE component registrations report errors |
+| Reboot through the keyboard controller | ✅ working |
+| Windows' own shutdown | 🚧 stalls at "Windows is shutting down" (a reset gets past it) |
+| First boot after Setup | 🚧 running |
 | Windows 98 desktop | 🔜 next |
 | Speed | ~0.5M guest instructions/s headless — a full install is many hours |
 
@@ -134,8 +139,8 @@ core/     Machine, Cpu (486), Fpu, Memory, Vga, Ide, Pic, Pit, Cmos, Kbc,
           Dma, Fdc, Sb16, Ne2000, Isp, Uart, Lpt, Xms, Snapshot
 roblox/   Studio shell: EditableImage presenter, input bridge, UI
 tests/    23 suites, 2000+ assertions, run by CI on every push
-tools/    build, CI gate, Win98 run/debug workbench, probes
-docs/     architecture, Windows 98 notes, milestone reports
+tools/    build, CI gate, Win98 run/debug workbench
+docs/     architecture, Windows 98 notes, engineering log, milestone reports
 ```
 
 The core is environment-pure (`--!strict`, no Roblox or filesystem APIs);

@@ -38,3 +38,6 @@ __pycache__/
 @AutomationLog.txt
 tools/_*.lua
 tools/mcp_result.json
+
+# local editor / MCP configuration
+.mcp.json
