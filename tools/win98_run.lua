@@ -134,6 +134,21 @@ if opts.load then
 			("HIDE-PNP hid %d header(s)"):format(Machine.hidePnpHeader(m.mem.buf, 0xF0000, 0x10000))
 		)
 	end
+	-- --import-hdd PATH: replace the loaded state's hard disk contents with the image at PATH
+	-- (same size), e.g. after editing files in an exported image.
+	if opts.importHdd then
+		const data = buffer.fromstring(fs.readFile(tostring(opts.importHdd)))
+		const image = m.ide.master.image
+		assert(
+			buffer.len(data) == buffer.len(image),
+			"import-hdd: size differs from the current disk"
+		)
+		buffer.copy(image, 0, data)
+		if m.ide.markAllDirty then
+			m.ide:markAllDirty()
+		end
+		print(("IMPORTED hdd from %s"):format(tostring(opts.importHdd)))
+	end
 	-- --export-hdd PATH: write the loaded state's current hard disk image to PATH and exit.
 	if opts.exportHdd then
 		fs.writeFile(tostring(opts.exportHdd), buffer.tostring(m.ide.master.image))
@@ -166,9 +181,9 @@ if opts.load then
 			end
 			m:run(1)
 		end
-		print(("CALL mem[700..70F]=%s"):format((function()
+		print(("CALL mem[700..74F]=%s"):format((function()
 			local t = {}
-			for q = 0, 15 do
+			for q = 0, 0x4F do
 				t[#t + 1] = ("%02X"):format(m.mem:read8(0x700 + q))
 			end
 			return table.concat(t, " ")
@@ -485,9 +500,9 @@ if opts.keys then
 		if c == "{" then
 			local j = string.find(text, "}", i, true) :: number
 			local name = string.sub(text, i + 1, j - 1)
-			local alt = string.match(name, "^ALT%+(%w)$")
+			local alt = string.match(name, "^ALT%+(%w+)$")
 			if alt then
-				table.insert(keyQueue, { 0x38, SCAN[string.lower(alt)] })
+				table.insert(keyQueue, { 0x38, NAMED[alt] or SCAN[string.lower(alt)] })
 			else
 				table.insert(keyQueue, { NAMED[name] })
 			end
