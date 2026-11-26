@@ -122,6 +122,29 @@ local function newState()
 end
 
 local m = build()
+
+-- Side-effect-free linear-to-physical walk for debug probes: unlike
+-- Cpu.translatePage it never raises #PF, sets CR2, touches A/D bits or fills
+-- the TLB. Errors (not present) so pcall-wrapped callers print "??".
+local function probePhys(cpu: any, la: number, _w: any?, _u: any?): number
+	la = bit32.band(la, 0xFFFFFFFF)
+	if bit32.band(cpu.cr0, 0x80000000) == 0 then
+		return la
+	end
+	const pde = cpu.mem:read32(bit32.band(cpu.cr3, 0xFFFFF000) + bit32.rshift(la, 22) * 4)
+	if bit32.band(pde, 1) == 0 then
+		error("pde not present")
+	end
+	if bit32.band(pde, 0x80) ~= 0 and bit32.band(cpu.cr4 or 0, 0x10) ~= 0 then
+		return bit32.band(pde, 0xFFC00000) + bit32.band(la, 0x3FFFFF)
+	end
+	const pte =
+		cpu.mem:read32(bit32.band(pde, 0xFFFFF000) + bit32.band(bit32.rshift(la, 12), 0x3FF) * 4)
+	if bit32.band(pte, 1) == 0 then
+		error("pte not present")
+	end
+	return bit32.band(pte, 0xFFFFF000) + bit32.band(la, 0xFFF)
+end
 local st = newState()
 if opts.load then
 	local started = os.clock()
@@ -250,8 +273,8 @@ if opts.load then
 			("DESC %04X at %X: %08X %08X gdtr=%X/%X cs=%04X cslim=%X"):format(
 				sel,
 				a,
-				m.cpu:read32(a, true),
-				m.cpu:read32(a + 4, true),
+				m.cpu.mem:read32(probePhys(m.cpu, a)),
+				m.cpu.mem:read32(probePhys(m.cpu, a + 4)),
 				m.cpu.gdtr.base,
 				m.cpu.gdtr.limit,
 				m.cpu.cs,
@@ -269,7 +292,7 @@ if opts.load then
 				local pa = a + k
 				if opts.dumpLin then
 					local okP, phys = pcall(function()
-						return m.cpu:translatePage(a + k, false, false)
+						return probePhys(m.cpu, a + k, false, false)
 					end)
 					pa = if okP then phys else 0xFFFFFFFF
 				end
@@ -284,7 +307,7 @@ end
 -- --poke LINEAR=BYTE: write a byte through paging after loading (experiments only).
 if opts.poke and opts.load then
 	local la, val = string.match(opts.poke, "^(%x+)=(%x+)$")
-	local pa = m.cpu:translatePage(tonumber(la, 16) :: number, true, false)
+	local pa = probePhys(m.cpu, tonumber(la, 16) :: number, true, false)
 	m.mem:write8(pa, tonumber(val, 16) :: number)
 	print(("poked %s at phys %X"):format(opts.poke, pa))
 end
@@ -664,7 +687,7 @@ if opts.ringAt then
 				local words = {}
 				for q = 0, 15 do
 					local la = ma + q * 4
-					local pa = if opts.ringLin then self:translatePage(la, false, false) else la
+					local pa = if opts.ringLin then probePhys(self, la, false, false) else la
 					table.insert(words, ("%08X"):format(m.mem:read32(pa)))
 				end
 				print(("MEM %X: %s"):format(ma, table.concat(words, " ")))
@@ -1031,7 +1054,7 @@ if opts.faultLog then
 			local base = self.segBase.cs + (self.opIP or self.ip)
 			for k = 0, 15 do
 				local okB, b = pcall(function()
-					return self.mem:read8(self:translatePage(base + k, false, false))
+					return self.mem:read8(probePhys(self, base + k, false, false))
 				end)
 				table.insert(t, if okB then ("%02X"):format(b) else "??")
 			end
@@ -1068,14 +1091,14 @@ if opts.v86ret then
 	m.cpu.executeStep = function(self)
 		if seen < want and bit32.band(self.cr0, 1) ~= 0 and not self:isV86() then
 			local okT, lin = pcall(function()
-				return self:translatePage(self.segBase.cs + self.ip, false, false)
+				return probePhys(self, self.segBase.cs + self.ip, false, false)
 			end)
 			if okT and m.mem:read8(lin) == 0xCF then
 				local okS, a, b, c = pcall(function()
 					local sp = self.segBase.ss + self:rr32(4)
-					return self:read32(sp, true),
-						self:read32(sp + 4, true),
-						self:read32(sp + 8, true)
+					return self.mem:read32(probePhys(self, sp)),
+						self.mem:read32(probePhys(self, sp + 4)),
+						self.mem:read32(probePhys(self, sp + 8))
 				end)
 				if okS and bit32.band(c, 0x20000) ~= 0 then
 					seen += 1
@@ -1083,7 +1106,7 @@ if opts.v86ret then
 						("V86RET#%d esp=%X phys=%X from %04X:%X -> %04X:%X eflags=%X"):format(
 							seen,
 							self:rr32(4),
-							self:translatePage(self.segBase.ss + self:rr32(4) + 8, false, false),
+							probePhys(self, self.segBase.ss + self:rr32(4) + 8, false, false),
 							self.cs,
 							self.ip,
 							bit32.band(b, 0xFFFF),
@@ -1134,11 +1157,12 @@ if opts.vxdDev then
 		if self:isProtected() and not self:isV86() then
 			const lin = self.segBase.cs + self.ip
 			const ok, b0 = pcall(function()
-				return self:read8(lin, true)
+				return self.mem:read8(probePhys(self, lin))
 			end)
 			if ok and b0 == 0xCD then
 				const ok2, b1, id = pcall(function()
-					return self:read8(lin + 1, true), self:read32(lin + 2, true)
+					return self.mem:read8(probePhys(self, lin + 1)),
+						self.mem:read32(probePhys(self, lin + 2))
 				end)
 				if ok2 and b1 == 0x20 then
 					if bit32.band(bit32.rshift(id, 16), 0x7FFF) == dev then
@@ -1175,7 +1199,8 @@ if opts.dosCalls then
 		if not self:isProtected() or self:isV86() then
 			const lin = self.segBase.cs + self.ip
 			const ok, b0, b1 = pcall(function()
-				return self:read8(lin, true), self:read8(lin + 1, true)
+				return self.mem:read8(probePhys(self, lin)),
+					self.mem:read8(probePhys(self, lin + 1))
 			end)
 			if ok and b0 == 0xCD and b1 == 0x21 then
 				const ah = bit32.band(bit32.rshift(self:rr32(0), 8), 0xFF)
@@ -1186,7 +1211,7 @@ if opts.dosCalls then
 						const base = self.segBase.ds + bit32.band(self:rr32(2), 0xFFFF)
 						for q = 0, 79 do
 							const okc, c = pcall(function()
-								return self:read8(base + q, true)
+								return self.mem:read8(probePhys(self, base + q))
 							end)
 							if not okc or c == 0 then
 								break
@@ -1222,6 +1247,14 @@ if opts.stopIp then
 	m.cpu.executeStep = function(self)
 		if self.ip == wantIp and (wantCs == nil or self.cs == wantCs) then
 			print(("STOP at %04X:%08X step %d"):format(self.cs, self.ip, st.executed))
+			if faultRing then
+				for q = 1, faultRingLen do
+					local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
+					if e then
+						print(e)
+					end
+				end
+			end
 			if opts.save then
 				checkpoint(opts.save)
 			end
@@ -1270,7 +1303,8 @@ if opts.dosWrite then
 			for k = 0, n - 1 do
 				local okC, c = pcall(function()
 					return self.mem:read8(
-						self:translatePage(
+						probePhys(
+							self,
 							self.ds * 16 + bit32.band(self:rr32(2), 0xFFFF) + k,
 							false,
 							false
@@ -1294,7 +1328,7 @@ if opts.lwatch then
 		local t = {}
 		for k = 0, n - 1 do
 			local okB, b = pcall(function()
-				return cpu.mem:read8(cpu:translatePage(la + k, false, false))
+				return cpu.mem:read8(probePhys(cpu, la + k, false, false))
 			end)
 			t[k + 1] = if okB then ("%02X"):format(b) else "??"
 		end
@@ -1516,10 +1550,10 @@ if opts.pcLog then
 			if want[lin] then
 				left -= 1
 				const okd, at = pcall(function()
-					return self:read32(self:rr32(0), true)
+					return self.mem:read32(probePhys(self, self:rr32(0)))
 				end)
 				const okc, atc = pcall(function()
-					return self:read32(self:rr32(1), true)
+					return self.mem:read32(probePhys(self, self:rr32(1)))
 				end)
 				print(
 					("PC %08X tsc=%d eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X [eax]=%s [ecx]=%s"):format(
@@ -1593,7 +1627,7 @@ if opts.csTrace then
 			local bytes = {}
 			for q = 0, 7 do
 				const ok, b = pcall(function()
-					return self:read8(lin + q, true)
+					return self.mem:read8(probePhys(self, lin + q))
 				end)
 				bytes[#bytes + 1] = if ok then ("%02X"):format(b) else "??"
 			end
@@ -1637,8 +1671,8 @@ if opts.cslimWatch then
 					self.ip,
 					prevSel,
 					prevIp,
-					self:read32(a, true),
-					self:read32(a + 4, true),
+					self.mem:read32(probePhys(self, a)),
+					self.mem:read32(probePhys(self, a + 4)),
 					self.tsc
 				)
 			)
@@ -1679,7 +1713,7 @@ if opts.vxdlog then
 		do
 			local lin = self.segBase.cs + self.ip
 			local okT, phys = pcall(function()
-				return self:translatePage(lin, false, false)
+				return probePhys(self, lin, false, false)
 			end)
 			if okT then
 				lin = phys
@@ -1895,7 +1929,7 @@ if opts.bt then
 	local out = {}
 	for i = 0, tonumber(opts.bt) :: number do
 		local ok, v = pcall(function()
-			return cpu:read32(base + esp + i * 4, true)
+			return cpu.mem:read32(probePhys(cpu, base + esp + i * 4))
 		end)
 		if ok and v >= 0xC0000000 and v < 0xC1000000 then
 			table.insert(out, ("%X:%08X"):format(i * 4, v))
@@ -1912,9 +1946,9 @@ if opts.bt then
 end
 if opts.tss then
 	local cpu = m.cpu :: any
-	local mb = cpu:read16(cpu.trBase + 0x66, true)
+	local mb = cpu.mem:read16(probePhys(cpu, cpu.trBase + 0x66))
 	local function b(port)
-		return cpu:read8(cpu.trBase + mb + port // 8, true)
+		return cpu.mem:read8(probePhys(cpu, cpu.trBase + mb + port // 8))
 	end
 	print(
 		("TSS tr=%04X base=%08X limit=%X tr32=%s mapBase=%X bits20=%02X bitsA0=%02X bits1F0=%02X"):format(
