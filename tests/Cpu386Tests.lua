@@ -1244,6 +1244,37 @@ T("pm_ud_0f_ff_delivers_exception_6", function(expect)
 	expect(m.cpu.halted, "execution did not resume past the undefined opcode")
 end)
 
+-- The undefined group encodings FF /7 and FE /2-7, and UD2 (0F 0B), are #UD
+-- in protected mode and V86 too. Windows 98's first boot after Setup jumps a
+-- V86 DOS program into a page of 0xFF filler; on a real CPU that is an
+-- ordinary #UD for the VMM to handle, not a machine stop.
+T("pm_ud_undefined_group_encodings_deliver_exception_6", function(expect)
+	for _, encoding in ipairs({ { 0xFF, 0xFF }, { 0xFE, 0xFF }, { 0x0F, 0x0B } }) do
+		const m = pm16Machine()
+		installGate(m, 6, 0x6000, 8, 0x86)
+		putCode(m, 0x6000, {
+			0x55, -- PUSH BP
+			0x89,
+			0xE5, -- MOV BP,SP
+			0x83,
+			0x46,
+			0x02,
+			0x02, -- ADD WORD [BP+2],2  skip the 2-byte encoding
+			0x5D, -- POP BP
+			0xCF, -- IRET
+		})
+		putCode(m, 0x1000, { encoding[1], encoding[2], 0xB8, 0x66, 0x66, 0xF4 }) -- ?? ; MOV AX,0x6666 ; HLT
+		m:run(12)
+		const name = string.format("%02X %02X", encoding[1], encoding[2])
+		expect(
+			(m.cpu.intCounts[6] or 0) == 1,
+			name .. ": vector 6 count=" .. (m.cpu.intCounts[6] or 0)
+		)
+		expect(m.cpu.r[1] == 0x6666, string.format("%s: AX=%04X", name, m.cpu.r[1]))
+		expect(m.cpu.halted, name .. ": execution did not resume past the undefined opcode")
+	end
+end)
+
 -- A far JMP to an in-limit descriptor with P=0 raises #NP (vector 11) with the
 -- selector as the error code instead of aborting the host. WIN98 SETUP's DOS
 -- extender jumps to such a not-present LDT code segment (046F) and relies on

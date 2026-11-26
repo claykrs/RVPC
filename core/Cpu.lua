@@ -3902,6 +3902,18 @@ H[0xFD] = function(cpu: any)
 	cpu:setbits(DFF, true)
 end
 
+-- An undefined encoding raises #UD. In protected mode and V86 it is delivered
+-- through the IDT, where the guest decides what to do (the Win9x VMM reflects it
+-- to the VM or terminates the offending program). In real mode an undefined
+-- opcode is almost always a slide into data, so keep the loud error there.
+local function invalidOpcode(cpu: any, message: string)
+	if band(cpu.cr0, 1) ~= 0 then
+		cpu:fault(6, nil)
+		return
+	end
+	error(message)
+end
+
 H[0xFE] = function(cpu: any)
 	local e = cpu:modrm()
 	local cf = cpu:getF(CF)
@@ -3911,7 +3923,9 @@ H[0xFE] = function(cpu: any)
 	elseif e.reg == 1 then
 		res = doALU(cpu, 5, cpu:readRM8(e), 1, false)
 	else
-		error("bad FE /" .. e.reg)
+		-- FE /2-7 are undefined: #UD in protected mode/V86 (see invalidOpcode).
+		invalidOpcode(cpu, ("bad FE /%d at %04X:%04X"):format(e.reg, cpu.cs, cpu.ip - 2))
+		return
 	end
 	cpu:writeRM8(e, res)
 	cpu:setbits(CF, cf)
@@ -3955,7 +3969,7 @@ H[0xFF] = function(cpu: any)
 			cpu:push16(cpu:readRM16(e))
 		end
 	else
-		error(("bad FF /7 at %04X:%04X"):format(cpu.cs, cpu.ip - 2))
+		invalidOpcode(cpu, ("bad FF /7 at %04X:%04X"):format(cpu.cs, cpu.ip - 2))
 	end
 end
 
@@ -4790,7 +4804,7 @@ for nop = 0x18, 0x1F do
 end
 
 H0F[0x0B] = function(cpu: any): ()
-	error(("#UD: UD2 at %04X:%08X"):format(cpu.cs, cpu.ip))
+	invalidOpcode(cpu, ("#UD: UD2 at %04X:%08X"):format(cpu.cs, cpu.ip))
 end
 H0F[0xA2] = function(cpu: any) -- CPUID
 	const leaf = cpu:rr32(0)
