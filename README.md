@@ -1,69 +1,121 @@
-# RVPC
+# RVPC — a Windows 98 PC emulator written in Luau
 
 [![CI](https://github.com/claykrs/RVPC/actions/workflows/ci.yml/badge.svg)](https://github.com/claykrs/RVPC/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-Luau-orange)
+![Tests](https://img.shields.io/badge/assertions-2000%2B-brightgreen)
 ![Code style](https://img.shields.io/badge/style-StyLua-purple)
 
-**A 486-class PC emulator written in Luau, running inside Roblox Studio — targeting Windows 98 SE.**
+**A full 486-class PC — CPU, chipset, disks, VGA, FPU — emulated in Luau, the
+scripting language of Roblox. It boots real SeaBIOS firmware and installs
+Windows 98 SE from the original CD.**
 
-RVPC is a full-system emulator, not a DOS compatibility layer: a real
-[SeaBIOS](https://www.seabios.org/) firmware image boots on a cycle-driven
-486 core with IDE/ATAPI storage, VGA graphics, a PIC/PIT/CMOS chipset, PS/2
-input and an 80-bit x87 FPU. Today it installs **FreeDOS 1.3** from CD onto a
-persistent virtual hard disk. The target is a **Windows 98 SE** install and
-desktop.
+![Windows 98 SE Setup running inside RVPC](docs/images/hero.png)
 
-```
-SeaBIOS ──▶ boot menu ──▶ CD / floppy / HDD ──▶ FreeDOS 1.3 ──▶ Windows 98 SE (in progress)
-```
+No host hypervisor, no native code, no DOS shortcuts: every instruction Windows
+runs is decoded and executed by a Luau interpreter. The same machine runs
+headless under [Lune](https://lune-org.github.io/docs) for testing and
+interactively inside Roblox Studio.
+
+## What it can do today
+
+- Boots **SeaBIOS** (the firmware QEMU uses) and its boot menu, from CD,
+  floppy or hard disk.
+- Installs **FreeDOS 1.3** from CD onto a persistent virtual hard disk.
+- Runs **Windows 98 SE Setup** from the retail CD:
+  the setup wizard, product key, ~40B instructions of CAB file copying, the
+  reboot into the real Windows 98 kernel, hardware detection, Plug and Play
+  device setup and the final "setting up the following items" stage.
+- Windows 98 boots its protected-mode VxD kernel (VMM32), the 32-bit IDE
+  driver (ESDI_506), the boot logo in unchained "mode X" VGA, and the
+  640×480 16-colour GUI.
+
+**Next milestone:** the Windows 98 desktop. See [status](#status) for what is
+left.
+
+| | |
+| --- | --- |
+| ![CD-ROM startup menu](docs/images/boot-menu.png) | ![Start Wizard](docs/images/start-wizard.png) |
+| *SeaBIOS boots the Win98 SE CD (El Torito)* | *First-boot Setup Wizard in the real Win98 GUI* |
+| ![Hardware detection](docs/images/hardware-detection.png) | ![Final settings](docs/images/final-settings.png) |
+| *Non-Plug-and-Play hardware detection* | *Setup's last stage: "Updating System Settings"* |
+
+## The machine
+
+| Component | Emulation |
+| --- | --- |
+| CPU | 486 core: real / protected / virtual-8086 modes, paging + TLB, task switches, call gates, privilege checks, precise fault restart |
+| FPU | 80-bit x87 (190/190 precision-control vectors), CR0.ET/TS lazy switching |
+| Firmware | Real SeaBIOS + VGA BIOS images (QEMU builds), PCI BIOS, CMOS disk types |
+| Chipset | Dual 8259 PIC, 8254 PIT, MC146818 RTC (alarm + periodic IRQ8, configurable date), 8237 DMA, i440FX/PIIX3 PCI |
+| Storage | IDE/ATAPI with PIO, bus-master DMA and packet commands; floppy controller |
+| Video | VGA text, planar 16-colour, mode 13h, unchained mode X, VBE/Bochs SVGA |
+| Input / I/O | PS/2 keyboard and mouse (8042), UART, LPT |
+| Network / audio | NE2000 Ethernet with a host-side virtual ISP (DHCP/DNS/TCP/HTTP), Sound Blaster 16 |
+| Snapshots | Delta checkpoints of the whole machine — resume a multi-hour install in seconds |
+
+## Bugs Windows 98 found
+
+Booting a real OS is the best emulator test there is. A few of the CPU and
+hardware bugs Windows 98 Setup turned up, each now covered by a regression
+test (full write-ups in [HANDOFF.md](HANDOFF.md)):
+
+- **Faulting pushes moved ESP.** Win9x grows thread stacks through guard-page
+  faults; a `PUSH` whose store faulted had already decremented ESP, so the
+  restarted instruction pushed twice and DLL entry points returned into their
+  own PE header.
+- **CR0.ET read as 0.** Windows concluded there was no coprocessor and sent
+  every FPU instruction to its software emulator, which then failed.
+- **Call-gate frames** were built in the wrong order, and gate transfers kept
+  the target selector's RPL instead of the new CPL — the Plug and Play
+  detection thunks read shifted arguments and hung.
+- **Near branches past the CS limit** faulted on the target instead of the
+  branch, breaking the VMM's ring-0 callback trick.
+- **No disk in CMOS 0x12.** Windows' protected-mode IDE driver only claims a
+  legacy-controller disk that CMOS lists, so it refused the disk and blocked
+  the BIOS path to it.
+- **MOV SS / POP SS interrupt shadow**, **CMPSW/SCASW flag width**, and a
+  dozen more in the [engineering log](HANDOFF.md).
 
 ## Status
 
-| Subsystem | State |
+| Area | State |
 | --- | --- |
-| 486 core: real/protected/V86 modes, paging, TLB, task gates | ✅ working |
-| SeaBIOS boot (MBR, El Torito CD, floppy, warm reset) | ✅ working |
-| IDE/ATAPI (PIO, Busmaster DMA, packet commands, signatures) | ✅ working |
-| VGA (text + cursor, planar mode 12h, mode 13h, VBE/DISPI SVGA) | ✅ working |
-| 80-bit x87 FPU (190/190 precision-control vectors) | ✅ working |
-| Chipset: PIC×2, PIT, MC146818 RTC (clock/alarm/periodic IRQ8), 8237 DMA, PIIX3 PCI | ✅ working |
-| NE2000 Ethernet + host virtual ISP (DHCP/DNS/TCP/HTTP) | ✅ working |
-| FreeDOS 1.3 CD install onto the virtual HDD (diskette auto-swap) | ✅ working |
-| Windows 98 SE SETUP | 🚧 reaches the graphical "Welcome to Windows 98 Setup" screen — see the [triage guide](docs/WIN98.md) |
-| PS/2 mouse integration, SB16 audio in-guest | 🔜 planned |
-
-CI runs the full gate (StyLua, Selene, strict `luau-analyze`, **1800+
-assertions**) on every push.
+| SeaBIOS boot, FreeDOS 1.3 install | ✅ working |
+| Win98 SE Setup: wizard, file copy, first reboot, hardware detection | ✅ working |
+| Win98 kernel boot (VMM32, VxDs, ESDI_506, GUI) | ✅ working |
+| Win98 Setup final stage | 🚧 running; some IE component registrations report errors |
+| Setup's own restart | 🚧 hangs at "Windows is shutting down" (a reset gets past it) |
+| Windows 98 desktop | 🔜 next |
+| Speed | ~0.5M guest instructions/s headless — a full install is many hours |
 
 ## Quick start
-
-**In Roblox Studio**
-
-```sh
-lune run tools/build_rbxmx.lua     # writes the importable Rvpc.rbxmx
-```
-
-Import `Rvpc.rbxmx` into a place and press Play. The shell presents the VGA
-frame through an `EditableImage` with integer scaling and bridges set-1
-keyboard/mouse input.
 
 **Headless (Lune)**
 
 ```sh
-lune run tools/check.lua           # the CI gate
-lune run tools/harness.lua         # boot SeaBIOS headless and watch the screen
-lune run tools/harness.lua 40      # step budget in millions
-lune run tools/win98_run.lua --budget 3500 --save-at 2700   # Win98 Setup with a checkpoint (core/Snapshot.lua)
-lune run tools/win98_run.lua --load tools/out/win98.snap       # resume from it in minutes
+lune run tools/check.lua                     # the CI gate: format, lint, types, 2000+ assertions
+lune run tools/harness.lua                   # boot SeaBIOS headless and watch the screen
+lune run tools/win98_run.lua --steps 4000 --save tools/out/w98.snap --save-every 200
+lune run tools/win98_run.lua --load tools/out/w98.snap.<N>m   # resume from a checkpoint
 ```
 
-## Firmware and media (not committed)
+`tools/win98_run.lua` is also the debugging workbench: instruction/jump
+rings, fault and port logs, memory watches, API call tracing, screenshot
+export and disk-image export (see the option comments in the file).
 
-The emulator is a real PC: it needs real firmware and OS media, which stay
-out of git. Stage them locally:
+**In Roblox Studio**
 
-**Firmware** (QEMU builds — free):
+```sh
+lune run tools/build_rbxmx.lua               # writes the importable Rvpc.rbxmx
+```
+
+Import `Rvpc.rbxmx` into a place and press Play. The shell presents the VGA
+frame through an `EditableImage` and bridges keyboard and mouse input.
+
+## Firmware and media (not included)
+
+The emulator needs real firmware and OS media, which stay out of git.
 
 ```powershell
 New-Item -ItemType Directory -Force roms
@@ -71,38 +123,26 @@ Invoke-WebRequest https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/bio
 Invoke-WebRequest https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/vgabios-stdvga.bin -OutFile roms/vgabios-stdvga.bin
 ```
 
-**Guest media** under `media/`:
+Put guest media under `media/` (`win98se.iso` for Windows 98 SE — you need
+your own licensed copy and product key; `freedos-boot.iso` and the FreeDOS
+floppy set for FreeDOS). The hard-disk image is created on first run.
 
-| File | Used for |
-| --- | --- |
-| `freedos-boot.iso` | FreeDOS 1.3 boot/install CD |
-| `x86BOOT.img`, `x86DSK01–05.img` | FreeDOS floppy set (auto-swapped during install) |
-| `win98se.iso` | Windows 98 SE — also attached to the [releases page](../../releases), provided there by the repository author for testing |
-| `win98-hdd.img` | created automatically for the persistent C: |
-
-## Architecture
+## Layout
 
 ```
-core/     Machine, Cpu(486), Memory, Vga, Ide, Pic, Pit, Cmos, Kbc,
-          Fpu(80-bit), Dma, Fdc, Sb16, Ne2000, Isp, Uart, Lpt, Xms
-roblox/   Studio shell: EditableImage presenter, input bridge, perf HUD
-tests/    20+ suites, 1800+ assertions, run by CI on every push
-tools/    build/deploy/probe tooling (Lune + MCP bridge into Studio)
+core/     Machine, Cpu (486), Fpu, Memory, Vga, Ide, Pic, Pit, Cmos, Kbc,
+          Dma, Fdc, Sb16, Ne2000, Isp, Uart, Lpt, Xms, Snapshot
+roblox/   Studio shell: EditableImage presenter, input bridge, UI
+tests/    23 suites, 2000+ assertions, run by CI on every push
+tools/    build, CI gate, Win98 run/debug workbench, probes
+docs/     architecture, Windows 98 notes, milestone reports
 ```
 
-The core is environment-pure (`--!strict`; no `require`, `game`, filesystem
-or Roblox APIs) — the same machine runs headless under Lune and interactively
-in Studio. Host services (video, input, disks, network, audio) are injected
-through `Machine.new`.
-
-## Docs
-
-- [`docs/WIN98.md`](docs/WIN98.md) — Windows 98 staging plan, current blockers, triage guide
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — machine design
-- [`HANDOFF.md`](HANDOFF.md) — engineering log: what was fixed and why, with evidence
+The core is environment-pure (`--!strict`, no Roblox or filesystem APIs);
+host services — video, input, disks, network, audio — are injected through
+`Machine.new`. About 39k lines of Luau: 20k core, 13k tests, 4k tools.
 
 ## License
 
 MIT for the emulator source — see [LICENSE](LICENSE). SeaBIOS/VGA BIOS
-firmware and guest OS media are not included; supply your own copies where
-required.
+firmware and guest operating systems are not included.
