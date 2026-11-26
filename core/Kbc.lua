@@ -33,6 +33,9 @@ export type Kbc = typeof(setmetatable(
 		irq1Armed: boolean,
 		irq12Armed: boolean,
 		lastStatus: number,
+		outputPort: number,
+		resetRequested: boolean,
+		a20Request: boolean?,
 		trace: { string },
 		in8: (self: Kbc, port: number) -> number,
 		out8: (self: Kbc, port: number, value: number) -> (),
@@ -59,6 +62,9 @@ function Kbc.new(): Kbc
 	self.irq1Armed = false
 	self.irq12Armed = false
 	self.lastStatus = 0
+	self.outputPort = 0x03 -- bit 0: CPU reset line (active low), bit 1: A20 gate
+	self.resetRequested = false
+	self.a20Request = nil
 	self.trace = {}
 	return self
 end
@@ -75,6 +81,9 @@ function Kbc.reset(self: Kbc)
 	self.irq1Armed = false
 	self.irq12Armed = false
 	self.lastStatus = 0
+	self.outputPort = 0x03
+	self.resetRequested = false
+	self.a20Request = nil
 end
 
 local function status(self: Kbc): number
@@ -244,6 +253,15 @@ function Kbc.out8(self: Kbc, port: number, value: number)
 		elseif command == 0xD4 then
 			self.pendingData = nil
 			guestMouseByte(self, value)
+		elseif command == 0xD1 then
+			-- Write output port: bit 1 gates A20, and clearing bit 0 pulls the
+			-- CPU reset line. The machine applies both after this write.
+			self.pendingData = nil
+			self.outputPort = value
+			self.a20Request = band(value, 0x02) ~= 0
+			if band(value, 0x01) == 0 then
+				self.resetRequested = true
+			end
 		elseif self.command == 0xD2 then
 			self.command = nil
 			queueByte(self, value, false)
@@ -291,10 +309,20 @@ function Kbc.out8(self: Kbc, port: number, value: number)
 	elseif value == 0xD4 then
 		self.pendingData = 0xD4
 		self.command = nil
-	elseif value == 0xFE then
-		self:reset()
-		queueByte(self, 0xFA, false)
-		queueByte(self, 0xAA, false)
+	elseif value == 0xD0 then
+		queueByte(self, self.outputPort, false)
+		self.command = nil
+	elseif value == 0xD1 then
+		self.pendingData = 0xD1
+		self.command = nil
+	elseif value >= 0xF0 then
+		-- Pulse output port bits whose mask bit is clear. Bit 0 is the CPU
+		-- reset line, so 0xFE (and every even 0xFx) resets the processor:
+		-- the standard way DOS, Windows and SeaBIOS reboot a PC.
+		if band(value, 0x01) == 0 then
+			self.resetRequested = true
+		end
+		self.command = nil
 	else
 		self.command = nil
 	end

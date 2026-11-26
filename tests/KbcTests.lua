@@ -173,4 +173,50 @@ T("irq12_mouse_packet", function(expect)
 	expect(#m.kbc.queue == 0, "mouse queue not drained")
 end)
 
+T("output_port_read_write_and_reset_pulses", function(expect)
+	const kbc = Kbc.new()
+	kbc:out8(0x64, 0xD0)
+	expect(kbc:in8(0x60) == 0x03, "default output port")
+	kbc:out8(0x64, 0xD1)
+	kbc:out8(0x60, 0xDD) -- A20 off, reset line high
+	expect(kbc.a20Request == false, "D1 A20 off")
+	expect(not kbc.resetRequested, "D1 with bit 0 set must not reset")
+	expect(#kbc.queue == 0, "D1 data byte leaked to the keyboard")
+	kbc:out8(0x64, 0xD0)
+	expect(kbc:in8(0x60) == 0xDD, "output port write")
+	kbc:out8(0x64, 0xFF) -- pulse nothing
+	expect(not kbc.resetRequested, "0xFF pulses no lines")
+	kbc:out8(0x64, 0xFE)
+	expect(kbc.resetRequested, "0xFE pulses the CPU reset line")
+	expect(#kbc.queue == 0, "0xFE is not acknowledged")
+end)
+
+T("pulse_reset_restarts_the_cpu", function(expect)
+	for _, sequence in ipairs({
+		{ 0xB0, 0xFE, 0xE6, 0x64 }, -- MOV AL,FEh ; OUT 64h,AL
+		{ 0xB0, 0xD1, 0xE6, 0x64, 0xB0, 0xDE, 0xE6, 0x60 }, -- output port write with bit 0 clear
+	}) do
+		const m = Machine.new({
+			Memory = Memory,
+			Cpu = Cpu,
+			Pic = Pic,
+			Kbc = Kbc,
+		}, { memorySize = 1024 * 1024 })
+		const cpu = m.cpu
+		cpu:loadSeg("cs", 0x600)
+		cpu.ip = 0x100
+		cpu.halted = false
+		for index, byte in ipairs(sequence) do
+			m.mem:write8(0x6000 + 0x100 + index - 1, byte)
+		end
+		m.mem:write8(0x6000 + 0x100 + #sequence, 0xEB)
+		m.mem:write8(0x6000 + 0x101 + #sequence, 0xFE) -- JMP $
+		m:run(#sequence // 2)
+		expect(
+			cpu.cs == 0xF000 and cpu.ip == 0xFFF0,
+			("cpu at %04X:%04X, not the reset vector"):format(cpu.cs, cpu.ip)
+		)
+	end
+end)
+
 return TESTS

@@ -802,7 +802,16 @@ function Machine.new(deps: Deps, config: Config?): Machine
 				return
 			end
 			if self.kbc and (port == 0x60 or port == 0x64) then
-				self.kbc:out8(port, value)
+				const kbc = self.kbc
+				kbc:out8(port, value)
+				if kbc.a20Request ~= nil then
+					self.mem:setA20(kbc.a20Request)
+					kbc.a20Request = nil
+				end
+				if kbc.resetRequested then
+					kbc.resetRequested = false
+					self:reset()
+				end
 				return
 			end
 			if self.fdc and ((port >= 0x3F0 and port <= 0x3F5) or port == 0x3F7) then
