@@ -1209,6 +1209,7 @@ function Machine.run(self: Machine, maxSteps: number?): number
 				-- extra call in the common unpaged, untraced case.
 				if not cpu.traceEnabled then
 					cpu:executeStep()
+					cpu.opActive = false
 				else
 					cpu:step()
 				end

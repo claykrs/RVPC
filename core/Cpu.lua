@@ -148,6 +148,7 @@ export type Cpu = {
 	-- is built.
 	opIP: number,
 	opSP: number,
+	opActive: boolean,
 	opCS: number,
 	faultIP: number?,
 	faultCS: number?,
@@ -386,6 +387,7 @@ function Cpu.new(mem: any, io: Io?, config: any?): Cpu
 	self.descCache = {}
 	self.opIP = 0
 	self.opSP = 0
+	self.opActive = false
 	self.opCS = 0
 	self.faultIP = nil
 	self.faultCS = nil
@@ -477,9 +479,20 @@ function Cpu.pagingEnabled(self: Cpu): boolean
 	return band(self.cr0, CR0_PG) ~= 0
 end
 
+-- A fault restarts its instruction, so ESP must read as it did when the
+-- instruction began (a multi-push such as PUSHAD, CALL FAR or ENTER may have
+-- moved it before the faulting store). Only while an instruction executes:
+-- IRQ delivery between instructions leaves opSP stale.
+local function rewindStackForFault(self: any)
+	if self.opActive then
+		self.r[5] = self.opSP
+	end
+end
+
 function Cpu.fault(self: Cpu, n: number, errorCode: number?)
 	self.faultIP = self.opIP
 	self.faultCS = self.opCS
+	rewindStackForFault(self)
 	self:interrupt(n, errorCode, false)
 end
 
@@ -520,6 +533,7 @@ function Cpu.pageFault(
 		error(ABORT_INSTRUCTION, 0)
 	end
 	self.inPageFault = true
+	rewindStackForFault(self)
 	const ok, _err = pcall(function()
 		self:interrupt(14, errorCode, false)
 	end)
@@ -905,6 +919,7 @@ function Cpu.reset(self: Cpu)
 	self.faultCS = nil
 	self.opIP = 0
 	self.opSP = 0
+	self.opActive = false
 	self.opCS = 0
 	self.tsc = 0
 	self.intCounts = {}
@@ -1917,7 +1932,10 @@ end
 function Cpu.pushValue(self: Cpu, v: number, width: number)
 	const mask = if self:stack32() then 0xFFFFFFFF else 0xFFFF
 	const sp = band(self:getSP() - width, mask)
-	self:setSP(sp)
+	-- Write before committing SP: a push whose store faults (#PF on a stack
+	-- guard page, #SS) must leave ESP unchanged so the restarted instruction
+	-- pushes once. Win9x grows thread stacks exactly this way; decrementing
+	-- first left every faulting push 4 bytes off and later RETs popped garbage.
 	if width == 4 then
 		self:write32(self:linear("ss", sp, 4), v)
 	elseif width == 2 then
@@ -1925,6 +1943,7 @@ function Cpu.pushValue(self: Cpu, v: number, width: number)
 	else
 		self:write8(self:linear("ss", sp, 1), v)
 	end
+	self:setSP(sp)
 end
 
 function Cpu.popValue(self: Cpu, width: number): number
@@ -5057,6 +5076,7 @@ function Cpu.executeStep(self: Cpu): number
 	self.opIP = self.ip
 	self.opCS = self.cs
 	self.opSP = self.r[5]
+	self.opActive = true
 	self.faultIP = nil
 	self.faultCS = nil
 	self.oseg = nil
@@ -5140,12 +5160,15 @@ function Cpu.step(self: Cpu): number
 		end
 	end
 	if band(self.cr0, bor(CR0_PG, CR0_PE)) == 0 then
-		return (self :: any):executeStep()
+		const steps = (self :: any):executeStep()
+		self.opActive = false
+		return steps
 	end
 	-- pcall(f, self) instead of a wrapping closure: no allocation per
 	-- instruction while paging is on.
 	const ok, result = pcall((self :: any).executeStep, self)
 	self.aborting = false
+	self.opActive = false
 	if not ok then
 		if result == ABORT_INSTRUCTION then
 			return 1

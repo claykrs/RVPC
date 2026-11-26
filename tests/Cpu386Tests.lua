@@ -156,6 +156,84 @@ T("paged_accesses_crossing_a_page_boundary_use_both_pages", function(expect)
 	)
 end)
 
+-- A push whose store page-faults must leave ESP as it was so the restarted
+-- instruction pushes once (Win9x grows thread stacks through guard-page
+-- faults). PUSHAD faulting halfway must restart from the original ESP too.
+T("faulting_push_and_pushad_restart_with_original_esp", function(expect)
+	const m = freshMachine()
+	flat32(m)
+	m.mem.a20 = true
+	const cpu = m.cpu
+	writeDescriptor(m, 0x3000 + 0x20, 0, 0xFFFFF, 0xFA, 0xCF)
+	writeDescriptor(m, 0x3000 + 0x28, 0, 0xFFFFF, 0xF2, 0xCF)
+	cpu.gdtr = { base = 0x3000, limit = 0x2F }
+	m.mem:write32(0x4004, 0x9000)
+	m.mem:write16(0x4008, 0x10)
+	cpu.tr, cpu.trBase, cpu.trLimit, cpu.tr32 = 0x18, 0x4000, 0x67, true
+	-- PDE0: 4 MiB identity, user-accessible. PDE1/PDE2 start absent.
+	m.mem:write32(0x2000, 0x00000087)
+	m.mem:write32(0x2004, 0)
+	m.mem:write32(0x2008, 0)
+	cpu.cr3 = 0x2000
+	cpu.cr[3] = 0x2000
+	cpu.cr0 = bor(cpu.cr0, 0x80000000)
+	cpu.cr[0] = cpu.cr0
+	installGate(m, 14, 0x6000, 8, 0x8E)
+	-- #PF handler: map the 4 MiB page holding CR2, flush, return.
+	putCode(m, 0x6000, {
+		0x50, -- PUSH EAX
+		0x51, -- PUSH ECX
+		0x0F,
+		0x20,
+		0xD0, -- MOV EAX,CR2
+		0xC1,
+		0xE8,
+		0x16, -- SHR EAX,22
+		0x89,
+		0xC1, -- MOV ECX,EAX
+		0xC1,
+		0xE0,
+		0x16, -- SHL EAX,22
+		0x0C,
+		0x87, -- OR AL,87h
+		0x89,
+		0x04,
+		0x8D,
+		0x00,
+		0x20,
+		0x00,
+		0x00, -- MOV [ECX*4+2000h],EAX
+		0x0F,
+		0x20,
+		0xD8, -- MOV EAX,CR3
+		0x0F,
+		0x22,
+		0xD8, -- MOV CR3,EAX
+		0x59, -- POP ECX
+		0x58, -- POP EAX
+		0x83,
+		0xC4,
+		0x04, -- ADD ESP,4 (error code)
+		0xCF, -- IRETD
+	})
+	putCode(m, 0x1000, { 0x50, 0x60, 0xEB, 0xFE }) -- PUSH EAX ; PUSHAD ; JMP $
+	cpu.cs, cpu.ss, cpu.ds, cpu.es = 0x23, 0x2B, 0x2B, 0x2B
+	for _, reg in ipairs({ "cs", "ss", "ds", "es" }) do
+		cpu.segSel[reg] = cpu[reg]
+	end
+	cpu.ip = 0x1000
+	cpu:wr32(0, 0x11111111)
+	cpu:wr32(1, 0x22222222)
+	cpu:wr32(7, 0x77777777)
+	cpu:wr32(4, 0x00800010)
+	m:run(60)
+	expect(cpu:rr32(4) == 0x007FFFEC, string.format("final ESP %X", cpu:rr32(4)))
+	expect(m.mem:read32(0x0080000C) == 0x11111111, "PUSH EAX stored once at 80000C")
+	expect(m.mem:read32(0x00800008) == 0x11111111, "PUSHAD EAX slot")
+	expect(m.mem:read32(0x00800004) == 0x22222222, "PUSHAD ECX slot")
+	expect(m.mem:read32(0x007FFFEC) == 0x77777777, "PUSHAD EDI slot")
+end)
+
 T("page_fault_restarts_faulting_instruction", function(expect)
 	const m = freshMachine()
 	flat32(m)

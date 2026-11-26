@@ -1349,7 +1349,18 @@ if opts.lwatch then
 		local pc = ("%04X:%X"):format(self.cs, self.ip)
 		local r = origW(self)
 		local now = grab(self)
-		if now ~= last and hits < 60 then
+		-- --lwatch-cs HEX: only report changes made while CS is this selector, and
+		-- ignore the slot mapping in/out across address-space switches ("??").
+		local report = now ~= last and hits < 60
+		if report and opts.lwatchCs then
+			report = string.find(now, "?", 1, true) == nil
+				and string.find(last, "?", 1, true) == nil
+				and self.cs == tonumber(tostring(opts.lwatchCs), 16)
+		end
+		if not report and now ~= last and opts.lwatchCs then
+			last = now
+		end
+		if report then
 			hits += 1
 			print(
 				("LWATCH %s -> %s by %s eax=%X ebx=%X ecx=%X edx=%X esi=%X edi=%X"):format(
@@ -1984,6 +1995,15 @@ if pcHistRef then
 	end)
 	for i = 1, math.min(40, #keys) do
 		print(("PC %s %d"):format(keys[i], (pcHistRef :: any)[keys[i]]))
+	end
+	-- Per-code-segment totals of the same samples.
+	local bySeg: { [string]: number } = {}
+	for k, v in pcHistRef :: any do
+		const seg = string.sub(k, 1, 4)
+		bySeg[seg] = (bySeg[seg] or 0) + v
+	end
+	for seg, v in bySeg do
+		print(("PCSEG %s %d"):format(seg, v))
 	end
 end
 if ioHistRef then
