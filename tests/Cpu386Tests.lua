@@ -698,6 +698,22 @@ T("bts_register_offset_addresses_past_the_dword", function(expect)
 	expect(m.mem:read32(0x2FFC) == 0x80000000, string.format("dword -1 = %X", m.mem:read32(0x2FFC)))
 end)
 
+T("xlat_uses_ebx_with_32_bit_addressing", function(expect)
+	-- KERNEL32's GetTempFileName turns a time value into hex digits with
+	-- MOV EBX,BFFC9F5Ch / XLATB. XLAT masked EBX+AL to 16 bits, read page
+	-- 9000h and IE4UINIT died with an invalid page fault during first boot.
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	m.mem:write8(0x123405, 0x42)
+	m.mem:write8(0x3405, 0x99)
+	cpu:wr32(3, 0x123400)
+	cpu:wr32(0, 0x05)
+	putCode(m, 0x1000, { 0xD7 }) -- XLATB
+	cpu:executeStep()
+	expect(cpu:rb(0) == 0x42, string.format("AL=%02X, want [EBX+AL]", cpu:rb(0)))
+end)
+
 T("arpl_raises_rpl_in_protected_mode", function(expect)
 	const m = freshMachine()
 	flat32(m)

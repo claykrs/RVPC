@@ -3404,7 +3404,10 @@ H[0xD6] = function(cpu: any)
 	cpu:wb(0, cpu:getF(CF) and 0xFF or 0)
 end -- SALC
 H[0xD7] = function(cpu: any) -- XLAT
-	const off = band(cpu.r[4] + cpu:rb(0), 0xFFFF)
+	-- The address size picks BX or EBX (32-bit code uses EBX + AL).
+	const off = if cpu.address32
+		then band(cpu:rr32(3) + cpu:rb(0), 0xFFFFFFFF)
+		else band(cpu.r[4] + cpu:rb(0), 0xFFFF)
 	cpu:wb(0, cpu:read8(cpu:linear(cpu.osegReg or "ds", off, 1)))
 end
 
