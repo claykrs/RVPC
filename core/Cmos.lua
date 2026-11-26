@@ -68,6 +68,12 @@ export type Config = {
 	-- same layout QEMU writes. Win9x's ESDI_506 only claims a disk on a legacy
 	-- (non-PCI) controller when CMOS lists it.
 	hardDisks: { DiskGeometry? }?,
+	-- Initial RTC date/time (default 2026-01-01 12:00). Win9x verifies
+	-- Authenticode signatures against this clock; its 1999-era Microsoft
+	-- certificates have long expired, so an era-appropriate date avoids the
+	-- "Java Package Manager ... 800B010B" and DllRegisterServer failures that
+	-- a real machine with today's date also gets.
+	rtcDate: { year: number, month: number, day: number, hour: number?, minute: number? }?,
 }
 
 export type Cmos = typeof(setmetatable(
@@ -505,6 +511,47 @@ local function readRegister(self: Cmos, index: number): number
 	return self.ram[index] or 0x00
 end
 
+-- Day of week for the RTC (Sunday = 1), Zeller-style.
+local function dayOfWeek(year: number, month: number, day: number): number
+	local y, m = year, month
+	if m < 3 then
+		m += 12
+		y -= 1
+	end
+	const k = y % 100
+	const j = math.floor(y / 100)
+	const h = (
+		day
+		+ math.floor(13 * (m + 1) / 5)
+		+ k
+		+ math.floor(k / 4)
+		+ math.floor(j / 4)
+		+ 5 * j
+	) % 7
+	-- h: 0 = Saturday .. 6 = Friday; convert to Sunday = 1.
+	return (h + 6) % 7 + 1
+end
+
+-- Set the RTC calendar (full year, e.g. 1999).
+function Cmos.setDate(
+	self: Cmos,
+	year: number,
+	month: number,
+	day: number,
+	hour: number?,
+	minute: number?
+)
+	const rtc = self.rtc
+	rtc.century = math.floor(year / 100)
+	rtc.year = year % 100
+	rtc.month = month
+	rtc.day = day
+	rtc.dayOfWeek = dayOfWeek(year, month, day)
+	rtc.hour = hour or 12
+	rtc.minute = minute or 0
+	rtc.second = 0
+end
+
 function Cmos.new(config: Config?): Cmos
 	const cfg = (config or {}) :: Config
 	local self = setmetatable({}, Cmos) :: any
@@ -527,6 +574,10 @@ function Cmos.new(config: Config?): Cmos
 	-- always-present floppy fallback from winning the first attempt.
 	self.ram[0x38] = 0x10
 	self.ram[0x3D] = 0x23
+	if cfg.rtcDate then
+		const d = cfg.rtcDate
+		Cmos.setDate(self, d.year, d.month, d.day, d.hour, d.minute)
+	end
 	self.fixedDisk = {}
 	const disks = cfg.hardDisks or {}
 	local types = 0

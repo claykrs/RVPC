@@ -226,6 +226,14 @@ if opts.load then
 		)
 		process.exit(0)
 	end
+	-- --rtc-date YYYY-MM-DD: set the CMOS clock (e.g. 1999-06-01 so Win98's
+	-- 1999-era code-signing certificates still validate).
+	if opts.rtcDate then
+		const y, mo, d = string.match(tostring(opts.rtcDate), "^(%d+)-(%d+)-(%d+)$")
+		assert(y, "--rtc-date wants YYYY-MM-DD")
+		m.cmos:setDate(tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number)
+		print(("RTC set to %s"):format(tostring(opts.rtcDate)))
+	end
 	-- --reset-after-load 1: press the reset button on the loaded state (disks keep their contents).
 	if opts.resetAfterLoad then
 		m:reset()

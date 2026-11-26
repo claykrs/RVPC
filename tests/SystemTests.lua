@@ -397,6 +397,19 @@ end)
 
 -- Win98's ESDI_506 claims a legacy-controller disk only when CMOS 0x12 lists
 -- it; the layout matches QEMU's (type 0xF -> 47 in 0x19, params at 0x1B).
+T("cmos_rtc_date_config", function(expect)
+	const cmos = Cmos.new({ rtcDate = { year = 1999, month = 6, day = 1 } })
+	local function reg(index)
+		cmos:out8(0x70, index)
+		return cmos:in8(0x71)
+	end
+	expect(reg(0x09) == 0x99 and reg(0x08) == 0x06 and reg(0x07) == 0x01, "BCD date 99-06-01")
+	expect(reg(0x32) == 0x19, "century 19")
+	expect(reg(0x06) == 3, "1999-06-01 is a Tuesday")
+	cmos:setDate(2026, 1, 1)
+	expect(reg(0x06) == 5, "2026-01-01 is a Thursday")
+end)
+
 T("cmos_fixed_disk_type_47", function(expect)
 	const cmos = Cmos.new({ hardDisks = { { cylinders = 1040, heads = 16, sectors = 63 } } })
 	local function reg(index)
