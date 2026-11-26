@@ -1840,6 +1840,10 @@ function Vga.in8(self: Vga, port: number): number
 			return 0x09
 		end
 		return 0x00
+	elseif address == 0x3CD then
+		-- ET3000/ET4000 segment select: absent on a plain VGA. A latched value
+		-- here made Windows 98 detect a Tseng Labs ET4000.
+		return 0xFF
 	end
 
 	return self.latched[address] or 0xFF
@@ -1953,7 +1957,7 @@ function Vga.out8(self: Vga, port: number, value: number)
 	elseif address == 0x3DA or address == 0x3BA then
 		self.feature = byte
 		self.attrFlipFlop = true
-	else
+	elseif address ~= 0x3CD then
 		self.latched[address] = byte
 	end
 	self:syncLegacyMode()

@@ -926,4 +926,15 @@ T("text_cursor_blinks_and_disable_wins", function(expect)
 	expectPixel(expect, pixels, 0, 13, 640, 0, 0, 0, "disabled cursor rendered")
 end)
 
+T("no_tseng_segment_select_register", function(expect)
+	-- Port 3CDh is the ET3000/ET4000 segment select register. A plain VGA has
+	-- nothing there; when it latched writes, Windows 98 detected a "Tseng Labs
+	-- ET4000" and opened the Add New Hardware wizard on the first boot.
+	const vga = fresh()
+	vga:out8(0x3CD, 0x55)
+	expect(vga:in8(0x3CD) == 0xFF, string.format("3CD reads %02X after writing 55", vga:in8(0x3CD)))
+	vga:out8(0x3CD, 0xAA)
+	expect(vga:in8(0x3CD) == 0xFF, "3CD floats")
+end)
+
 return TESTS
