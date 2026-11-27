@@ -714,6 +714,26 @@ T("xlat_uses_ebx_with_32_bit_addressing", function(expect)
 	expect(cpu:rb(0) == 0x42, string.format("AL=%02X, want [EBX+AL]", cpu:rb(0)))
 end)
 
+T("null_selector_with_rpl_loads_into_data_segments", function(expect)
+	-- Selectors 0-3 are all null. POP DS of 0003 must load a null DS, not
+	-- raise #GP(0): GDI.EXE did exactly that and Rundll32 died with a GPF on
+	-- the first boot after Setup.
+	const m = freshMachine()
+	flat32(m)
+	const cpu = m.cpu
+	cpu:push32(3)
+	putCode(m, 0x1000, { 0x1F }) -- POP DS
+	cpu:step()
+	expect(cpu.ip == 0x1001, string.format("ip=%X, POP DS of 0003 faulted", cpu.ip))
+	expect(cpu.ds == 3, string.format("DS=%X", cpu.ds))
+	-- Using it is a #GP(0) like any null selector: the handler runs.
+	installGate(m, 13, 0x6000, 8, 0x8E)
+	putCode(m, 0x6000, { 0xEB, 0xFE })
+	putCode(m, 0x1001, { 0xA1, 0x00, 0x00, 0x00, 0x00 }) -- MOV EAX,[0]
+	cpu:step()
+	expect(cpu.ip == 0x6000, string.format("ip=%X, DS=0003 access must #GP", cpu.ip))
+end)
+
 T("arpl_raises_rpl_in_protected_mode", function(expect)
 	const m = freshMachine()
 	flat32(m)

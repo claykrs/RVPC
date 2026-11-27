@@ -1065,17 +1065,18 @@ function Cpu.loadSeg(self: Cpu, reg: string, selector: number): boolean
 		cacheReal(self, reg, selector)
 		return true
 	end
-	if selector == 0 then
-		-- Null data selectors are legal and leave the segment unusable.
+	if band(selector, 0xFFFC) == 0 then
+		-- Null data selectors (0-3: index 0 in the GDT, any RPL) are legal and
+		-- leave the segment unusable; the register keeps the RPL bits.
 		if reg == "cs" or reg == "ss" then
 			error(("#GP: cannot load null selector into %s"):format(reg))
 		end
-		setSeg(self, reg, 0)
+		setSeg(self, reg, selector)
 		self.segBase[reg] = 0
 		self.segLimit[reg] = 0
 		self.segAccess[reg] = 0
 		self.segFlags[reg] = 0
-		self.segSel[reg] = 0
+		self.segSel[reg] = selector
 		return true
 	end
 	const desc = loadDescriptor(self, selector)
