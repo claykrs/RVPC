@@ -10,7 +10,7 @@
 scripting language of Roblox. It boots real SeaBIOS firmware and installs
 Windows 98 SE from the original CD.**
 
-![Windows 98 SE Setup running inside RVPC](docs/images/hero.png)
+![The Windows 98 SE desktop running inside RVPC](docs/images/desktop.png)
 
 No host hypervisor, no native code, no DOS shortcuts: every instruction Windows
 runs is decoded and executed by a Luau interpreter. The same machine runs
@@ -29,9 +29,10 @@ interactively inside Roblox Studio.
 - Windows 98 boots its protected-mode VxD kernel (VMM32), the 32-bit IDE
   driver (ESDI_506), the boot logo in unchained "mode X" VGA, and the
   640×480 16-colour GUI.
+- Windows 98 reaches its **desktop**: Explorer, the taskbar and Start button,
+  the tray clock and the "Welcome to Windows 98" screen.
 
-**Next milestone:** the Windows 98 desktop. See [status](#status) for what is
-left.
+See [status](#status) for what is left.
 
 | | |
 | --- | --- |
@@ -87,11 +88,11 @@ test (full write-ups in the [engineering log](docs/ENGINEERING-LOG.md)):
 | SeaBIOS boot, FreeDOS 1.3 install | ✅ working |
 | Win98 SE Setup: wizard, file copy, first reboot, hardware detection | ✅ working |
 | Win98 kernel boot (VMM32, VxDs, ESDI_506, GUI) | ✅ working |
-| Win98 Setup final stage | ✅ completes; some IE component registrations report errors |
+| Win98 Setup final stage | ✅ completes; browseui/shdocvw shell registration failed on builds before the XLAT fix and was re-run by hand (see the engineering log) |
 | Reboot through the keyboard controller | ✅ working |
-| Windows' own shutdown | 🚧 stalls at "Windows is shutting down" (a reset gets past it) |
-| First boot after Setup | 🚧 running |
-| Windows 98 desktop | 🔜 next |
+| Windows' own shutdown | ✅ the stall was REBOOT's fallback after the old KBC reset bug; the restart now reboots |
+| First boot after Setup | ✅ RunOnce steps, hardware wizards, Active Setup |
+| Windows 98 desktop | ✅ Explorer, taskbar, Start button, Welcome screen |
 | Speed | ~0.5M guest instructions/s headless — a full install is many hours |
 
 ## Quick start
