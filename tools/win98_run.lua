@@ -244,6 +244,29 @@ if opts.load then
 		print(("RTC regA=%02X regB=%02X regC=%02X"):format(r.regA or -1, r.regB, r.regC or -1))
 		process.exit(0)
 	end
+	-- --kbc 1: print the 8042 state (config, queued bytes, mouse mode) of the loaded state.
+	if opts.kbc then
+		local k = m.kbc
+		local q = {}
+		for _, e in k.queue do
+			table.insert(q, ("%s%02X"):format(if e.aux then "m" else "k", e.value))
+		end
+		print(
+			("KBC config=%02X cmd=%s pending=%s kbd=%s mouse=%s irq1=%s/%s irq12=%s/%s queue=[%s]"):format(
+				k.config,
+				tostring(k.command),
+				tostring(k.pendingData),
+				tostring(k.keyboardEnabled),
+				tostring(k.mouseEnabled),
+				tostring(k.irq1),
+				tostring(k.irq1Armed),
+				tostring(k.irq12),
+				tostring(k.irq12Armed),
+				table.concat(q, " ")
+			)
+		)
+		process.exit(0)
+	end
 	if opts.pic then
 		local pc = m.pic
 		print(
