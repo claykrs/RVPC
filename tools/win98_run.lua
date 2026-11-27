@@ -252,12 +252,15 @@ if opts.load then
 			table.insert(q, ("%s%02X"):format(if e.aux then "m" else "k", e.value))
 		end
 		print(
-			("KBC config=%02X cmd=%s pending=%s kbd=%s mouse=%s irq1=%s/%s irq12=%s/%s queue=[%s]"):format(
+			("KBC config=%02X cmd=%s pending=%s kbd=%s mouse=%s rate=%d res=%d scale21=%s irq1=%s/%s irq12=%s/%s queue=[%s]"):format(
 				k.config,
 				tostring(k.command),
 				tostring(k.pendingData),
 				tostring(k.keyboardEnabled),
 				tostring(k.mouseEnabled),
+				k.mouseRate,
+				k.mouseResolution,
+				tostring(k.mouseScaling),
 				tostring(k.irq1),
 				tostring(k.irq1Armed),
 				tostring(k.irq12),
@@ -606,7 +609,8 @@ if opts.keys then
 			-- {HOLD+X} presses X without releasing it, {UP+X} releases it.
 			local mods, key = string.match(name, "^([%u%+]+)%+(%w+)$")
 			-- {MOUSE:dx,dy,buttons}: move the PS/2 mouse (screen y grows down) and
-			-- set the buttons (1 left, 2 right); split into packets of at most 4 so Windows applies no pointer acceleration.
+			-- set the buttons (1 left, 2 right); split into packets of at most 4. dx/dy are screen pixels: Windows 98 moves the pointer two
+			-- pixels per count at its default speed, so the runner sends half as many counts.
 			local mdx, mdy, mb = string.match(name, "^MOUSE:(%-?%d+),(%-?%d+),?(%d*)$")
 			if mdx then
 				table.insert(keyQueue, {})
@@ -2017,7 +2021,7 @@ local function advance(limit)
 			local combo = keyQueue[keyIndex]
 			const move = mouseArgs[keyIndex]
 			if move then
-				local dx, dy = move[1], move[2]
+				local dx, dy = move[1] // 2, move[2] // 2
 				repeat
 					const sx = math.clamp(dx, -4, 4)
 					const sy = math.clamp(dy, -4, 4)
