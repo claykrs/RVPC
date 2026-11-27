@@ -93,6 +93,7 @@ test (full write-ups in the [engineering log](docs/ENGINEERING-LOG.md)):
 | Windows' own shutdown | ✅ the stall was REBOOT's fallback after the old KBC reset bug; the restart now reboots |
 | First boot after Setup | ✅ RunOnce steps, hardware wizards, Active Setup |
 | Windows 98 desktop | ✅ Explorer, taskbar, Start button, Welcome screen |
+| Windows 98 mouse | ✅ PS/2 mouse detected and installed; pointer and clicks work |
 | Speed | ~0.5M guest instructions/s headless — a full install is many hours |
 
 ## Quick start
