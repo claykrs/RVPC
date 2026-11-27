@@ -746,7 +746,7 @@ T("v86_trapped_out_pushes_a_gp_error_code", function(expect)
 	v86TrapSetup(m, 0x3202)
 	m.mem:write16(0x4066, 0x68) -- I/O map base at the TSS limit: every port denied
 	putCode(m, 0x10100, { 0xE6, 0x20 }) -- OUT 20h, AL -> #GP(0)
-	m.cpu:executeStep()
+	m.cpu:step()
 	expect(m.cpu.ip == 0x6000, string.format("handler at %X", m.cpu.ip))
 	const esp = m.cpu:rr32(4)
 	expect(esp == 0x9000 - 40, string.format("ESP=%X: the V86 frame needs the error code", esp))
@@ -786,6 +786,38 @@ T("v86_interrupt_nulls_the_data_segments", function(expect)
 		cpu.ip == 0x6002,
 		string.format("PUSH ES / POP ES of null stays in the handler (ip=%X)", cpu.ip)
 	)
+end)
+
+T("v86_trapped_string_io_aborts_the_instruction", function(expect)
+	-- A denied port #GPs before any transfer: REP INSW must stop there. The
+	-- loop ran on after delivery, now through the handler's null ES, and Win98
+	-- triple-faulted in SeaBIOS's ATA PIO read under the VMM.
+	const m = freshMachine()
+	v86TrapSetup(m, 0x3202)
+	const cpu = m.cpu
+	m.mem:write16(0x4066, 0x68) -- I/O map base at the TSS limit: every port denied
+	cpu:wr32(1, 3) -- ECX
+	cpu:wr32(2, 0x1F0) -- DX
+	cpu:wr32(7, 0x200) -- EDI
+	cpu:wr32(0, 0x1234) -- EAX
+	putCode(m, 0x10100, { 0xF3, 0x6D }) -- REP INSW
+	cpu:step()
+	expect(cpu.ip == 0x6000, string.format("handler at %X", cpu.ip))
+	expect(
+		cpu:rr32(1) == 3 and cpu:rr32(7) == 0x200,
+		string.format("ECX=%X EDI=%X untouched", cpu:rr32(1), cpu:rr32(7))
+	)
+	const esp = cpu:rr32(4)
+	expect(m.mem:read32(esp + 4) == 0x100, "frame EIP points at the REP INSW")
+	-- IN AL,DX on a denied port leaves AL alone.
+	const m2 = freshMachine()
+	v86TrapSetup(m2, 0x3202)
+	m2.mem:write16(0x4066, 0x68)
+	m2.cpu:wr32(0, 0x1234)
+	m2.cpu:wr32(2, 0x60)
+	putCode(m2, 0x10100, { 0xEC }) -- IN AL,DX
+	m2.cpu:step()
+	expect(m2.cpu:rr32(0) == 0x1234, string.format("EAX=%X after a trapped IN", m2.cpu:rr32(0)))
 end)
 
 T("v86_cli_traps_to_gp_at_iopl_0", function(expect)

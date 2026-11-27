@@ -3507,8 +3507,11 @@ end
 
 local function ioIn(cpu: any, port: number, width: number): number
 	if not ioAllowed(cpu, port, width) then
+		-- #GP(0) before any transfer; unwind so the instruction (and a REP
+		-- loop) does not run on in the handler's context.
 		cpu:fault(13, 0)
-		return 0
+		cpu.aborting = true
+		error(ABORT_INSTRUCTION, 0)
 	end
 	if width == 4 then
 		const read32 = cpu.io.in32 :: ((p: number) -> number)?
@@ -3534,7 +3537,8 @@ end
 local function ioOut(cpu: any, port: number, width: number, value: number)
 	if not ioAllowed(cpu, port, width) then
 		cpu:fault(13, 0)
-		return
+		cpu.aborting = true
+		error(ABORT_INSTRUCTION, 0)
 	end
 	if width == 4 then
 		const write32 = cpu.io.out32 :: ((p: number, v: number) -> ())?
