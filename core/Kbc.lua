@@ -28,6 +28,10 @@ export type Kbc = typeof(setmetatable(
 		pendingData: number?,
 		keyboardEnabled: boolean,
 		mouseEnabled: boolean,
+		mouseParam: number?,
+		mouseRate: number,
+		mouseResolution: number,
+		mouseScaling: boolean,
 		irq1: boolean,
 		irq12: boolean,
 		irq1Armed: boolean,
@@ -56,7 +60,11 @@ function Kbc.new(): Kbc
 	self.command = nil
 	self.pendingData = nil
 	self.keyboardEnabled = true
-	self.mouseEnabled = true
+	self.mouseEnabled = false -- data reporting is off until the guest sends 0xF4
+	self.mouseParam = nil
+	self.mouseRate = 100
+	self.mouseResolution = 2
+	self.mouseScaling = false
 	self.irq1 = false
 	self.irq12 = false
 	self.irq1Armed = false
@@ -75,7 +83,11 @@ function Kbc.reset(self: Kbc)
 	self.command = nil
 	self.pendingData = nil
 	self.keyboardEnabled = true
-	self.mouseEnabled = true
+	self.mouseEnabled = false -- data reporting is off until the guest sends 0xF4
+	self.mouseParam = nil
+	self.mouseRate = 100
+	self.mouseResolution = 2
+	self.mouseScaling = false
 	self.irq1 = false
 	self.irq12 = false
 	self.irq1Armed = false
@@ -148,7 +160,8 @@ function Kbc.releaseKey(self: Kbc, scancode: number)
 end
 
 function Kbc.mouseMove(self: Kbc, dx: number, dy: number, buttons: number?)
-	if not self.mouseEnabled then
+	-- Packets need data reporting on (0xF4) and the aux clock enabled (config bit 5 clear).
+	if not self.mouseEnabled or band(self.config, 0x20) ~= 0 then
 		return
 	end
 	mousePacket(self, dx, dy, buttons or 0)
@@ -231,13 +244,61 @@ local function guestKeyboardByte(self: Kbc, value: number)
 	end
 end
 
+-- PS/2 mouse device commands (sent through controller command 0xD4). Every
+-- byte is acknowledged with 0xFA; reset and identify answer like a plain
+-- two-button mouse (BAT 0xAA, ID 0x00), which SeaBIOS's INT 15h C2 services and
+-- Windows' mouse detection both wait for.
 local function guestMouseByte(self: Kbc, value: number)
-	if value == 0xF4 or value == 0xFF then
-		self.mouseEnabled = true
-	elseif value == 0xF5 then
-		self.mouseEnabled = false
+	const param = self.mouseParam
+	if param then
+		self.mouseParam = nil
+		if param == 0xF3 then
+			self.mouseRate = value
+		elseif param == 0xE8 then
+			self.mouseResolution = band(value, 0x03)
+		end
+		queueByte(self, 0xFA, true)
+		return
 	end
 	queueByte(self, 0xFA, true)
+	if value == 0xFF then
+		self.mouseEnabled = false
+		self.mouseRate = 100
+		self.mouseResolution = 2
+		self.mouseScaling = false
+		queueByte(self, 0xAA, true)
+		queueByte(self, 0x00, true)
+	elseif value == 0xF6 then
+		self.mouseEnabled = false
+		self.mouseRate = 100
+		self.mouseResolution = 2
+		self.mouseScaling = false
+	elseif value == 0xF5 then
+		self.mouseEnabled = false
+	elseif value == 0xF4 then
+		self.mouseEnabled = true
+	elseif value == 0xF3 or value == 0xE8 then
+		self.mouseParam = value
+	elseif value == 0xF2 then
+		queueByte(self, 0x00, true)
+	elseif value == 0xE9 then
+		local flags = 0
+		if self.mouseEnabled then
+			flags = bor(flags, 0x20)
+		end
+		if self.mouseScaling then
+			flags = bor(flags, 0x10)
+		end
+		queueByte(self, flags, true)
+		queueByte(self, self.mouseResolution, true)
+		queueByte(self, self.mouseRate, true)
+	elseif value == 0xEB then
+		mousePacket(self, 0, 0, 0)
+	elseif value == 0xE7 then
+		self.mouseScaling = true
+	elseif value == 0xE6 then
+		self.mouseScaling = false
+	end
 end
 
 function Kbc.out8(self: Kbc, port: number, value: number)
@@ -286,11 +347,9 @@ function Kbc.out8(self: Kbc, port: number, value: number)
 	elseif value == 0xAA then
 		queueByte(self, 0x55, false)
 		self.command = nil
-	elseif value == 0xAB then
+	elseif value == 0xAB or value == 0xA9 then
+		-- Keyboard / aux interface tests: 0x00 means the clock and data lines are fine.
 		queueByte(self, 0x00, false)
-		self.command = nil
-	elseif value == 0xA9 then
-		queueByte(self, 0x00, true)
 		self.command = nil
 	elseif value == 0xAD then
 		self.keyboardEnabled = false
@@ -299,10 +358,10 @@ function Kbc.out8(self: Kbc, port: number, value: number)
 		self.keyboardEnabled = true
 		self.command = nil
 	elseif value == 0xA7 then
-		self.mouseEnabled = false
+		self.config = bor(self.config, 0x20)
 		self.command = nil
 	elseif value == 0xA8 then
-		self.mouseEnabled = true
+		self.config = band(self.config, 0xDF)
 		self.command = nil
 	elseif value == 0xD2 or value == 0xD3 then
 		self.command = value
