@@ -570,6 +570,7 @@ local NAMED = {
 local keyQueue: { { number } } = {}
 local keyMode: { [number]: string } = {}
 local mouseArgs: { [number]: { number } } = {}
+local mousePending: { { number } } = {}
 if opts.keys then
 	local text = tostring(opts.keys)
 	local i = 1
@@ -582,7 +583,7 @@ if opts.keys then
 			-- {HOLD+X} presses X without releasing it, {UP+X} releases it.
 			local mods, key = string.match(name, "^([%u%+]+)%+(%w+)$")
 			-- {MOUSE:dx,dy,buttons}: move the PS/2 mouse (screen y grows down) and
-			-- set the buttons (1 left, 2 right); split into packets of at most 100.
+			-- set the buttons (1 left, 2 right); split into packets of at most 4 so Windows applies no pointer acceleration.
 			local mdx, mdy, mb = string.match(name, "^MOUSE:(%-?%d+),(%-?%d+),?(%d*)$")
 			if mdx then
 				table.insert(keyQueue, {})
@@ -1983,15 +1984,21 @@ local function advance(limit)
 		if st.executed >= 500_000_000 and m.pit.channel0Divisor ~= 1 then
 			m.pit.channel0Divisor = 1
 		end
-		if keyIndex <= #keyQueue and st.executed >= keysAt then
+		-- One mouse packet per tick once the last one was read, like a mouse
+		-- reporting at its sample rate; a burst of queued packets gets dropped.
+		if #mousePending > 0 and #m.kbc.queue == 0 then
+			const p = table.remove(mousePending, 1) :: { number }
+			m:mouseMove(p[1], p[2], p[3])
+		end
+		if keyIndex <= #keyQueue and st.executed >= keysAt and #mousePending == 0 then
 			local combo = keyQueue[keyIndex]
 			const move = mouseArgs[keyIndex]
 			if move then
 				local dx, dy = move[1], move[2]
 				repeat
-					const sx = math.clamp(dx, -100, 100)
-					const sy = math.clamp(dy, -100, 100)
-					m:mouseMove(sx, -sy, move[3])
+					const sx = math.clamp(dx, -4, 4)
+					const sy = math.clamp(dy, -4, 4)
+					table.insert(mousePending, { sx, -sy, move[3] })
 					dx -= sx
 					dy -= sy
 				until dx == 0 and dy == 0
