@@ -569,6 +569,7 @@ local NAMED = {
 }
 local keyQueue: { { number } } = {}
 local keyMode: { [number]: string } = {}
+local mouseArgs: { [number]: { number } } = {}
 if opts.keys then
 	local text = tostring(opts.keys)
 	local i = 1
@@ -580,7 +581,15 @@ if opts.keys then
 			-- {ALT+X}, {CTRL+X}, {SHIFT+X} and stacked forms such as {CTRL+ALT+DEL};
 			-- {HOLD+X} presses X without releasing it, {UP+X} releases it.
 			local mods, key = string.match(name, "^([%u%+]+)%+(%w+)$")
-			if mods == "HOLD" or mods == "UP" then
+			-- {MOUSE:dx,dy,buttons}: move the PS/2 mouse (screen y grows down) and
+			-- set the buttons (1 left, 2 right); split into packets of at most 100.
+			local mdx, mdy, mb = string.match(name, "^MOUSE:(%-?%d+),(%-?%d+),?(%d*)$")
+			if mdx then
+				table.insert(keyQueue, {})
+				keyMode[#keyQueue] = "MOUSE"
+				mouseArgs[#keyQueue] =
+					{ tonumber(mdx) :: number, tonumber(mdy) :: number, tonumber(mb) or 0 }
+			elseif mods == "HOLD" or mods == "UP" then
 				table.insert(keyQueue, { NAMED[key] or SCAN[string.lower(key)] })
 				keyMode[#keyQueue] = mods
 			elseif mods and key and NAMED[string.match(mods, "^(%u+)")] then
@@ -1976,7 +1985,17 @@ local function advance(limit)
 		end
 		if keyIndex <= #keyQueue and st.executed >= keysAt then
 			local combo = keyQueue[keyIndex]
-			if keyMode[keyIndex] ~= "UP" then
+			const move = mouseArgs[keyIndex]
+			if move then
+				local dx, dy = move[1], move[2]
+				repeat
+					const sx = math.clamp(dx, -100, 100)
+					const sy = math.clamp(dy, -100, 100)
+					m:mouseMove(sx, -sy, move[3])
+					dx -= sx
+					dy -= sy
+				until dx == 0 and dy == 0
+			elseif keyMode[keyIndex] ~= "UP" then
 				for _, code in ipairs(combo) do
 					m:pressKey(code)
 				end

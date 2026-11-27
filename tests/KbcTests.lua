@@ -115,6 +115,20 @@ T("mouse_reset_and_identify_answer_like_a_ps2_mouse", function(expect)
 	expect(kbc:in8(0x60) == 0x00, "aux interface test passed")
 end)
 
+T("each_mouse_packet_byte_raises_irq12", function(expect)
+	-- Windows' and SeaBIOS's IRQ12 handlers read one byte per interrupt.
+	const kbc = Kbc.new()
+	kbc:out8(0x64, 0x60)
+	kbc:out8(0x60, 0x03)
+	kbc.mouseEnabled = true
+	kbc:mouseMove(1, 1, 0)
+	for n = 1, 3 do
+		expect(kbc:takeIrq12(), "no IRQ12 for packet byte " .. n)
+		kbc:in8(0x60)
+	end
+	expect(not kbc:takeIrq12(), "IRQ12 after the packet")
+end)
+
 T("irq1_int9_reads_data_port", function(expect)
 	const m = Machine.new({
 		Memory = Memory,

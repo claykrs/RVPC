@@ -204,14 +204,17 @@ function Kbc.in8(self: Kbc, port: number): number
 	if port == 0x60 then
 		const entry = table.remove(self.queue, 1)
 		if entry then
-			if not entry.aux then
-				-- One keyboard byte per IRQ1. If more make/break bytes are
-				-- queued, arm the next edge now so it is delivered after EOI.
-				for _, queued in self.queue do
-					if not queued.aux then
+			-- One byte per interrupt, as on a real 8042: if more bytes of the
+			-- same device are queued (make/break codes, the rest of a 3-byte
+			-- mouse packet), arm the next edge now so it is delivered after EOI.
+			for _, queued in self.queue do
+				if queued.aux == entry.aux then
+					if entry.aux then
+						self.irq12Armed = true
+					else
 						self.irq1Armed = true
-						break
 					end
+					break
 				end
 			end
 			return entry.value
