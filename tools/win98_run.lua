@@ -292,6 +292,22 @@ if opts.load then
 		process.exit(0)
 	end
 	-- --dump ADDR [--dump-len N]: print physical bytes of the loaded checkpoint and exit.
+	-- --idt HEX: print the IDT gate for that vector of the loaded state and exit.
+	if opts.idt then
+		local v = tonumber(tostring(opts.idt), 16) :: number
+		local a = m.cpu.idtr.base + v * 8
+		print(
+			("IDT %02X at %X: %08X %08X idtr=%X/%X"):format(
+				v,
+				a,
+				m.cpu.mem:read32(probePhys(m.cpu, a)),
+				m.cpu.mem:read32(probePhys(m.cpu, a + 4)),
+				m.cpu.idtr.base,
+				m.cpu.idtr.limit
+			)
+		)
+		process.exit(0)
+	end
 	-- --dump-file PATH: with --dump/--dump-len, write the raw bytes to PATH instead
 	-- (unmapped linear pages read as zero with --dump-lin).
 	if opts.dump and opts.dumpFile then
