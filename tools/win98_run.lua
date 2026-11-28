@@ -1424,6 +1424,21 @@ if opts.stopIp then
 			)
 		then
 			print(("STOP at %04X:%08X step %d"):format(self.cs, self.ip, st.executed))
+			print(
+				("  base cs=%08X ds=%08X es=%08X ss=%08X  eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X esp=%08X"):format(
+					self.segBase.cs,
+					self.segBase.ds,
+					self.segBase.es,
+					self.segBase.ss,
+					self:rr32(0),
+					self:rr32(3),
+					self:rr32(1),
+					self:rr32(2),
+					self:rr32(6),
+					self:rr32(7),
+					self:rr32(4)
+				)
+			)
 			if faultRing then
 				for q = 1, faultRingLen do
 					local e = faultRing[(faultRingPos + q - 1) % faultRingLen + 1]
