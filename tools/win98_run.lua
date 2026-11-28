@@ -150,12 +150,15 @@ if opts.load then
 	local started = os.clock()
 	st = Snapshot.apply(m, fs.readFile(opts.load))
 	print(("loaded %s at step %d in %.1fs"):format(opts.load, st.executed, os.clock() - started))
-	-- --hide-pnp 1: hide the PnP BIOS header in the loaded state's BIOS shadow (F-segment),
-	-- as a fresh Machine does by default.
+	-- --hide-pnp 1: hide the PnP BIOS header in the loaded state's BIOS shadow (F-segment)
+	-- and in its ROM image (which a reset copies back), as a fresh Machine does by default.
+	-- States saved before the header was hidden carry it in both places.
 	if opts.hidePnp then
-		print(
-			("HIDE-PNP hid %d header(s)"):format(Machine.hidePnpHeader(m.mem.buf, 0xF0000, 0x10000))
-		)
+		local hidden = Machine.hidePnpHeader(m.mem.buf, 0xF0000, 0x10000)
+		if m.mem.rom then
+			hidden += Machine.hidePnpHeader(m.mem.rom, 0, buffer.len(m.mem.rom))
+		end
+		print(("HIDE-PNP hid %d header(s)"):format(hidden))
 	end
 	-- --import-hdd PATH: replace the loaded state's hard disk contents with the image at PATH
 	-- (same size), e.g. after editing files in an exported image.
