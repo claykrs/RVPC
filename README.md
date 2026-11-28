@@ -10,7 +10,7 @@
 scripting language of Roblox. It boots real SeaBIOS firmware and installs
 Windows 98 SE from the original CD.**
 
-![The Windows 98 SE desktop running inside RVPC](docs/images/desktop.png)
+![The Windows 98 SE desktop and Start menu running inside RVPC](docs/images/start-menu.png)
 
 No host hypervisor, no native code, no DOS shortcuts: every instruction Windows
 runs is decoded and executed by a Luau interpreter. The same machine runs
@@ -29,8 +29,9 @@ interactively inside Roblox Studio.
 - Windows 98 boots its protected-mode VxD kernel (VMM32), the 32-bit IDE
   driver (ESDI_506), the boot logo in unchained "mode X" VGA, and the
   640×480 16-colour GUI.
-- Windows 98 reaches its **desktop**: Explorer, the taskbar and Start button,
-  the tray clock and the "Welcome to Windows 98" screen.
+- Windows 98 reaches its **desktop**: Explorer, the taskbar and a working
+  **Start menu**, Quick Launch, the tray clock and the "Welcome to Windows 98"
+  screen, driven with the emulated **PS/2 mouse**.
 
 See [status](#status) for what is left.
 
@@ -88,11 +89,11 @@ test (full write-ups in the [engineering log](docs/ENGINEERING-LOG.md)):
 | SeaBIOS boot, FreeDOS 1.3 install | ✅ working |
 | Win98 SE Setup: wizard, file copy, first reboot, hardware detection | ✅ working |
 | Win98 kernel boot (VMM32, VxDs, ESDI_506, GUI) | ✅ working |
-| Win98 Setup final stage | ✅ completes; browseui/shdocvw shell registration failed on builds before the XLAT fix and was re-run by hand (see the engineering log) |
+| Win98 Setup final stage | ✅ completes; the IE4 shell registration (RunOnceEx) failed on builds before the XLAT fix and was replayed from SYSTEM.1ST (see the engineering log) |
 | Reboot through the keyboard controller | ✅ working |
 | Windows' own shutdown | ✅ the stall was REBOOT's fallback after the old KBC reset bug; the restart now reboots |
 | First boot after Setup | ✅ RunOnce steps, hardware wizards, Active Setup |
-| Windows 98 desktop | ✅ Explorer, taskbar, Start button, Welcome screen |
+| Windows 98 desktop | ✅ Explorer, taskbar, Start menu, Quick Launch, Welcome screen |
 | Windows 98 mouse | ✅ PS/2 mouse detected and installed; pointer and clicks work |
 | Speed | ~0.5M guest instructions/s headless — a full install is many hours |
 
